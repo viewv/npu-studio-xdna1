@@ -21,6 +21,8 @@ class Segmenter:
         so = ort.SessionOptions()
         so.intra_op_num_threads = threads
         so.inter_op_num_threads = 1
+        # 默认工作线程会空转等待下一次推理, 白占 CPU; 每帧只推理一次, 关掉空转
+        so.add_session_config_entry("session.intra_op.allow_spinning", "0")
         self.sess = ort.InferenceSession(str(MODELS / f"{model}.onnx"), so,
                                          providers=["CPUExecutionProvider"])
         inp = self.sess.get_inputs()[0]

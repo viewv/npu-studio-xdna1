@@ -68,10 +68,12 @@ class VirtualCamera:
         fcntl.ioctl(self.fd, VIDIOC_S_FMT, fmt)
         self.device = device
 
-    def send(self, frame_bgr: np.ndarray) -> None:
-        if frame_bgr.shape[1] != self.width or frame_bgr.shape[0] != self.height:
-            frame_bgr = cv2.resize(frame_bgr, (self.width, self.height))
-        os.write(self.fd, cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2YUV_I420).tobytes())
+    def send(self, frame: np.ndarray) -> None:
+        """frame: BGR 或 BGRA (NPU 路径输出 BGRA)"""
+        if frame.shape[1] != self.width or frame.shape[0] != self.height:
+            frame = cv2.resize(frame, (self.width, self.height))
+        code = cv2.COLOR_BGRA2YUV_I420 if frame.shape[2] == 4 else cv2.COLOR_BGR2YUV_I420
+        os.write(self.fd, cv2.cvtColor(frame, code).tobytes())
 
     def close(self) -> None:
         if self.fd is not None:

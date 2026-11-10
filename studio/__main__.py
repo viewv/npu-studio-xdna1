@@ -84,14 +84,24 @@ def main() -> None:
     ap.add_argument("--threads", default=2, type=int, help="分割模型 CPU 线程数")
     ap.add_argument("--bench", type=int, metavar="N", help="处理 N 帧后输出性能统计并退出")
     ap.add_argument("--snapshot", metavar="PNG", help="处理一帧并保存 (原图|结果 并排) 后退出")
+    ap.add_argument("--npu", action="store_true",
+                    help="全分辨率的放大/遮罩/合成交给 NPU (需先 source npu/env.sh)")
+    ap.add_argument("--npu-cols", default=4, type=int, help="NPU 并行列数 (默认4)")
+    ap.add_argument("--cv-threads", default=1, type=int,
+                    help="OpenCV 线程数 (默认1; 这种小图运算多线程只会白白占满所有核)")
     a = ap.parse_args()
+    cv2.setNumThreads(a.cv_threads)
 
     seg = Segmenter(threads=a.threads)
-    fx = BackgroundFx(a.mode, a.blur, a.smooth, a.feather, a.threshold, a.bg, a.quality)
     cam = Camera(a.camera, *a.size, a.fps)
     w, h = cam.size
-    print(f"[studio] 摄像头 {a.camera} {w}x{h}@{cam.fps:.0f}  模型 {seg.w}x{seg.h}  模式 {a.mode}",
-          file=sys.stderr)
+    if a.npu:
+        from .npu_fx import NpuBackgroundFx
+        fx = NpuBackgroundFx(w, h, a.mode, a.blur, a.smooth, a.threshold, a.bg, n_cols=a.npu_cols)
+    else:
+        fx = BackgroundFx(a.mode, a.blur, a.smooth, a.feather, a.threshold, a.bg, a.quality)
+    print(f"[studio] 摄像头 {a.camera} {w}x{h}@{cam.fps:.0f}  模型 {seg.w}x{seg.h}  模式 {a.mode}  "
+          f"后端 {'NPU ×' + str(a.npu_cols) + '列' if a.npu else 'CPU'}", file=sys.stderr)
 
     out = None
     if not (a.bench or a.snapshot) and a.output != "none":
@@ -113,8 +123,9 @@ def main() -> None:
     signal.signal(signal.SIGTERM, stop)
 
     seq, n = 0, 0
-    t_seg = t_fx = t_out = 0.0
+    t_seg = t_fx = t_out = t_prep = t_npu = 0.0
     t_start = t_report = time.perf_counter()
+    cpu_start = time.process_time()
     try:
         while running:
             frame, seq = cam.read(seq)
@@ -133,9 +144,13 @@ def main() -> None:
             t_seg += t1 - t0
             t_fx += t2 - t1
             t_out += t3 - t2
+            if a.npu:
+                t_prep += fx.t_prep
+                t_npu += fx.t_npu
 
             if a.snapshot and n >= 15:   # 跳过前几帧, 等自动曝光和时间平滑稳定
-                cv2.imwrite(a.snapshot, np.hstack([frame, result]))
+                shown = cv2.cvtColor(result, cv2.COLOR_BGRA2BGR) if result.shape[2] == 4 else result
+                cv2.imwrite(a.snapshot, np.hstack([frame, shown]))
                 print(f"[studio] 已保存 {a.snapshot}  人物占比 {float(alpha.mean())*100:.0f}%",
                       file=sys.stderr)
                 break
@@ -153,9 +168,12 @@ def main() -> None:
 
     if n and (a.bench or not a.snapshot):
         el = time.perf_counter() - t_start
+        cpu = time.process_time() - cpu_start
+        detail = f" [CPU准备 {t_prep/n*1000:.1f} + NPU {t_npu/n*1000:.1f}]" if a.npu else ""
         print(f"[studio] 共 {n} 帧, {n/el:.1f} fps  "
-              f"(分割 {t_seg/n*1000:.1f} ms, 合成 {t_fx/n*1000:.1f} ms, 输出 {t_out/n*1000:.1f} ms; "
-              f"每帧处理合计 {(t_seg+t_fx+t_out)/n*1000:.1f} ms)", file=sys.stderr)
+              f"(分割 {t_seg/n*1000:.1f} ms, 合成 {t_fx/n*1000:.1f} ms{detail}, 输出 {t_out/n*1000:.1f} ms; "
+              f"每帧处理合计 {(t_seg+t_fx+t_out)/n*1000:.1f} ms)  "
+              f"CPU 时间 {cpu/n*1000:.1f} ms/帧 (约 {cpu/el*100:.0f}% 单核)", file=sys.stderr)
 
 
 if __name__ == "__main__":

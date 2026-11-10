@@ -8,8 +8,48 @@ Linux 上的「Windows Studio Effects」：摄像头背景虚化 / 替换，输�
 | 阶段 | 内容 | 状态 |
 |---|---|---|
 | 1 | 人像分割 (MediaPipe ONNX) + 背景模糊/合成, 全部 CPU | ✅ 可用 |
-| 2 | 背景模糊与合成换成 NPU (IRON / mlir-aie filter2D) | 计划中 |
+| 2 | 全分辨率的 放大 + 导向滤波遮罩 + 合成 换成 NPU 融合内核 (IRON) | ✅ 可用 (`--npu`) |
 | 3 | 分割模型 INT8 量化后整体搬到 NPU | 计划中 |
+
+## NPU 后端 (`--npu`)
+
+CPU 只做 1/4 分辨率 (320×180) 的计算：遮罩平滑、导向滤波系数、无光晕模糊；
+全分辨率 (1280×720) 的逐像素工作由一个 NPU 融合内核
+[`npu/kernels/fused_composite.cc`](npu/kernels/fused_composite.cc) 一次完成：
+
+```
+原图一行 (BGRA) + 低分辨率 A/B/背景行
+  → 拆通道算灰度 → A、B、背景水平 ×4 双线性放大 → 遮罩 = A·(I−128)+B (定点)
+  → 遮罩扩展到 4 通道 → alpha 合成 → 输出一行
+```
+
+全部用 2 路 `interleave_zip/unzip` 向量操作, 每次迭代 32 像素; 4 列 NPU 并行, 每列处理 180 行。
+
+| 实测 (7840HS, 720p) | CPU 后端 | NPU 后端 |
+|---|---|---|
+| 全分辨率阶段 | ~10 ms | **1.6 ms** (NPU, 含同步) |
+| 合成总计 (含 CPU 低分辨率准备) | 10.3 ms | 8.0 ms (CPU 5.6 + NPU 2.0) |
+| **进程 CPU 时间 / 帧** | 122 ms | **70 ms (−43%)** |
+| 与 CPU 版输出差异 | — | 平均 1.2/255, PSNR 46 dB |
+
+NPU 版的主要收益是**省 CPU**（OpenCV 在全分辨率上的多线程运算被整段卸掉了），帧率仍受摄像头限制。
+
+### 环境
+
+```bash
+uv venv --python /usr/bin/python3.14 --system-site-packages .venv-iron   # 需要系统 pyxrt (Arch: xrt 包)
+uv pip install --python .venv-iron/bin/python -r requirements.txt mlir_aie \
+    -f https://github.com/Xilinx/mlir-aie/releases/expanded_assets/latest-wheels-4
+# Peano (llvm-aie): 直接装与 mlir_aie 1.3.4 配套的 nightly wheel
+uv pip install --python .venv-iron/bin/python \
+    'llvm-aie @ https://github.com/Xilinx/llvm-aie/releases/download/nightly/llvm_aie-21.0.0.2026062301%2Bcb664e8c-py3-none-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl'
+
+source npu/env.sh
+python3 -m npu.fused --selftest         # NPU 与 numpy 参考逐字节对比
+python3 -m studio --npu                  # NPU 后端虚拟摄像头
+```
+
+首次运行会 JIT 编译 NPU 程序（约 2 秒），结果缓存后再启动很快。
 
 ## 安装
 

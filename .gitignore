@@ -3,3 +3,5 @@ __pycache__/
 snapshot*.png
 *.pyc
 compare/
+third_party/
+.venv-iron/
