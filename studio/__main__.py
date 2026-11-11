@@ -142,6 +142,8 @@ def _main(status: Status) -> None:
                          "CPU 上约 19 ms/帧 (4 线程)")
     ap.add_argument("--threads", default=2, type=int, help="分割模型 CPU 线程数")
     ap.add_argument("--rvm-threads", default=4, type=int, help="RVM 的 CPU 线程数")
+    ap.add_argument("--rvm-gpu", action="store_true",
+                    help="RVM 跑在核显上 (ncnn+Vulkan), CPU 只剩缩放和合成; 需要先转换模型并编译 worker")
     ap.add_argument("--bench", type=int, metavar="N", help="处理 N 帧后输出性能统计并退出")
     ap.add_argument("--snapshot", metavar="PNG", help="处理一帧并保存 (原图|结果 并排) 后退出")
     ap.add_argument("--npu", action="store_true",
@@ -169,14 +171,21 @@ def _main(status: Status) -> None:
 
     status.emit("starting", backend="npu" if a.npu else (f"gpu-{a.gpu}" if a.gpu else "cpu"))
     if a.matting == "rvm":
-        from .rvm import RvmMatting
-        seg = RvmMatting(threads=a.rvm_threads)
+        if a.rvm_gpu:
+            from .rvm_gpu import RvmGpuMatting
+            seg = RvmGpuMatting()
+            seg_desc = "RVM (GPU, ncnn+Vulkan)"
+        else:
+            from .rvm import RvmMatting
+            seg = RvmMatting(threads=a.rvm_threads)
+            seg_desc = f"RVM (CPU ×{a.rvm_threads})"
         if "--smooth" not in sys.argv:
             a.smooth = 0.0          # RVM 自带时序记忆, 再叠 EMA 只会拖影
         if "--threshold" not in sys.argv:
             a.threshold = 0.0       # 遮罩已经很准, 再软阈值会把头发丝切掉
     else:
         seg = Segmenter(threads=a.threads)
+        seg_desc = "MediaPipe 分割"
     cam = Camera(a.camera, *a.size, a.fps)
     dynfps = DynamicFramerate(a.camera) if a.high_fps else None   # 摄像头打开成功后再改设置
     w, h = cam.size
@@ -193,8 +202,8 @@ def _main(status: Status) -> None:
         fx = BackgroundFx(a.mode, a.blur, a.smooth, a.feather, a.threshold, a.bg, a.quality)
         backend = "CPU"
     accel = "NPU" if a.npu else ("GPU" if a.gpu else None)
-    print(f"[studio] 摄像头 {a.camera} {w}x{h}@{cam.fps:.0f}  模型 {seg.w}x{seg.h}  模式 {a.mode}  "
-          f"后端 {backend}", file=sys.stderr)
+    print(f"[studio] 摄像头 {a.camera} {w}x{h}@{cam.fps:.0f}  模型 {seg.w}x{seg.h} {seg_desc}  "
+          f"模式 {a.mode}  后端 {backend}", file=sys.stderr)
 
     out = None
     if not (a.bench or a.snapshot) and a.output != "none":
