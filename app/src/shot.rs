@@ -19,7 +19,9 @@ impl Platform for ShotPlatform {
 }
 
 pub fn run(path: &str, running: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let (w, h) = (1060u32, 760u32);
+    // 额外参数: rvm = 选中 RVM · 核显; tall = 画高一点 (看左栏下半部分)
+    let args: Vec<String> = std::env::args().collect();
+    let (w, h) = (1060u32, if args.iter().any(|a| a == "tall") { 1500u32 } else { 760u32 });
     let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
     slint::platform::set_platform(Box::new(ShotPlatform { window: window.clone() }))
         .map_err(|e| format!("{e:?}"))?;
@@ -30,6 +32,9 @@ pub fn run(path: &str, running: bool) -> Result<(), Box<dyn std::error::Error>> 
         FeatureData { id: "b".into(), title: "自动构图".into(), description: "跟踪人脸位置, 自动裁剪让你保持在画面中央".into(), tag: "即将推出".into(), available: false, enabled: false },
     ];
     ui.set_features(ModelRc::new(VecModel::from(feats)));
+    if args.iter().any(|a| a == "rvm") {
+        ui.set_matting(1);
+    }
     ui.set_vcam_device("/dev/video2".into());
     if running {
         ui.set_run_state(2);
