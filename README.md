@@ -9,7 +9,7 @@ Linux 上的「Windows Studio Effects」：摄像头背景虚化 / 替换，输�
 |---|---|---|
 | 1 | 人像分割 (MediaPipe ONNX) + 背景模糊/合成, 全部 CPU | ✅ 可用 |
 | 2 | 全分辨率的 放大 + 导向滤波遮罩 + 合成 换成 NPU 融合内核 (IRON) | ✅ 可用 (`--npu`) |
-| 3 | 分割模型 INT8 量化后整体搬到 NPU | 计划中 |
+| 3 | 抠像换成 RVM（时序记忆、头发丝边缘），全分辨率部分仍在 NPU | 计划中 |
 
 ## NPU 后端 (`--npu`)
 
@@ -34,7 +34,120 @@ CPU 只做 1/4 分辨率 (320×180) 的计算：遮罩平滑、导向滤波系�
 
 NPU 版的主要收益是**省 CPU**（OpenCV 在全分辨率上的多线程运算被整段卸掉了），帧率仍受摄像头限制。
 
-### 环境
+### 分辨率
+
+NPU 合成内核**只在 1280×720 做过逐字节验证**（`--npu` 默认就是这个尺寸）。
+
+| 分辨率 | NPU 合成 |
+|---|---|
+| 1280×720 | ✅ 1.3 ms，与 numpy 参考逐字节一致 |
+| 1920×1080 | ❌ 23% 像素错，且错法固定（x%4∈{0,1} 的那些 lane）|
+
+1080p 的错是 AIE 编译器的问题，不是内核算法：1280 过、1920 挂；改 `LOW_STRIDE`（512/544/576）、
+去掉流水线 pragma、加软件流水，结果都一样或更糟。同样的坑也在 RVM 尾部内核上出现过（见下）。
+
+所以 720p 是当前的支持范围：`--size 1920x1080 --npu` 会**直接报错**并建议 `--gpu`
+（`NPU_ALLOW_UNVERIFIED=1` 可绕过，仅限实验）。720p 也正好是会议软件的主流发送分辨率，
+而且让 RVM 的 180×320 → 720p 恰好是 ×4，与内核里写死的倍率一致。
+
+**规则**：改内核、改分辨率、换编译器版本之后，都要在目标分辨率上跑
+`python -m npu.fused --selftest --width W --height H` 再发布——"上次是好的"不算数。
+
+## 可复用的内核骨架
+
+阶段 2 的融合内核被拆成了三块，后面任何"逐行"的 NPU 内核都直接复用：
+
+| 文件 | 作用 |
+|---|---|
+| [`npu/harness.py`](npu/harness.py) | `RowPipeline`：把行内核铺到 n_cols 个 core 上，负责 FIFO、按列切段、fill/drain、`stack_size` |
+| [`npu/lib/row_ops.h`](npu/lib/row_ops.h) | 设备端算子：×4 水平放大（int16 / BGRA）、通道拆分与重组、灰度、mask 扩展、alpha 合成 |
+| [`npu/kernels/fused_composite.cc`](npu/kernels/fused_composite.cc) | 消费者 1：全分辨率合成（与 numpy 参考逐字节一致） |
+| [`npu/kernels/rvm_tail.cc`](npu/kernels/rvm_tail.cc) | 消费者 2：RVM 尾部融合（实验，见下） |
+
+新增一个行内核只需要：
+
+1. 在 `npu/kernels/` 写一个 `void myLine(输入行..., 输出行, 标量...)`，开头 `rowops::init()`；
+2. 用 `external_row_kernel("myLine", SRC, [in_row_ty...], out_row_ty, scalars=[np.int32], include_dirs=[KERNEL_INC, LIB])` 建 `ExternalFunction`；
+3. `pl = RowPipeline(kern, [输入行字节...], 输出行字节, height=H, n_cols=4, extra_args=[width]); pl.build()`；
+4. `with rt.sequence(*pl.tensor_types()) as bufs: pl.stream(rt, bufs)`；
+5. 主机侧仿照 `FusedCompositor` 管理缓冲区（直接 `iron.zeros(...).data.reshape(...)` 拿 numpy 视图，零拷贝写入）。
+
+两个必须知道的坑：
+
+- **JIT 缓存**：缓存键只看内核 `.cc` 的 mtime 和编译参数，改 `row_ops.h` / `harness.py` 不会失效，会静默跑旧二进制。改完执行 `rm -rf ~/.npu/cache/*`。症状是"改了代码结果不变"。
+- **Worker 栈**：默认只有 1 KB。内核里同时活着的向量多（比如 8 个 int16 平面）会溢出，而且不报错，只是结果错乱。用 `RowPipeline(..., stack_size=8192)`。上限大约 16 KB（再大资源分配会失败）。
+
+## RVM 尾部融合（实验，未接入）
+
+`npu/rvm/tail.py` 把 RVM ONNX 图最后一段（两个 4 通道全分辨率 `Resize` + 乘加 + `Split`/`Clip`）
+压成一个 NPU 行扫描，输入只有 1/4 分辨率的两个 4 通道张量（720p 每帧 ~1.8 MB，而不是 ~24 MB fp32）：
+
+```
+fgr_c = clamp((P_c·src_c + Q_c·255) >> 8 + src_c)
+pha   = clamp((P_3·g     + Q_3·255) >> 8)          g = (B+G+R)/3
+out   = (fgr·pha + up(bg)·(255-pha)) >> 8
+```
+
+当前状态：**编译、运行、接口都通了，但结果不对**——每 4 个输出像素里第 0、1 个错（`x % 4 ∈ {0,1}`），
+`python -m npu.rvm.tail` 会报告不一致。
+
+定位过程（每一步都用随机数据，常量数据复现不出来）：
+
+| 试验 | 结果 |
+|---|---|
+| `up4_i16` 单独输出（含负数、斜坡） | 与参考逐元素相等 ✅ |
+| `mul(P,u) >> 8` 单独转 uint8 | 每一 lane 都对 ✅ |
+| `u` 单独输出（P=0） | 与源图逐像素相等 ✅ |
+| 累加器上再做**一次**运算（`mac` 或 `add` 都一样） | lane ≡0 (mod 4) 恒 +95、≡1 (mod 4) 恒 +31 ❌ |
+| 权重按值传参 / 权重改局部数组 / 结果过一遍本地内存 / 换 `u` 的宽化方式 | 无效 ❌ |
+| 把 `+u·256` 折进 P（等价变换）/ `mac` 换 `add` / 加或去流水线 pragma | 无效 ❌ |
+
+也就是说：同一个 32 lane 的 `acc32`，`mul` 之后直接 `to_vector<uint8_t>` 是对的，
+但只要中间多一次累加，转换出来两个 lane 类的值就整体偏移——偏移量只跟 lane 位置有关，跟数据无关。
+所以是 AIE 编译器的 `acc32 → uint8` 规约问题，不是算法、打包或量化。
+
+**已找到一个能修好的做法，但有容量上限。** 把放大结果做成**跨迭代存活**的变量（手工软件流水：
+本轮用上一轮算好的值，同时把下一轮算好），编译器就没法重算那一份，结果就对了：
+
+| 试验 | 结果 |
+|---|---|
+| 单通道 + 2 个跨迭代向量 | **最大差 0** ✅ |
+| 两通道 + 4 个跨迭代向量 | **最大差 0**（通道 0 验证）✅ |
+| 本内核需要的 8 个跨迭代向量（32 lane） | 仍错 ❌ |
+| 同样 8 个，改成 16 lane 向量（每个只占一半寄存器） | 仍错 ❌ |
+
+所以不是寄存器宽度问题，是"跨迭代存活向量"的个数上限在 4 左右。
+**下一步（明确）**：把内核拆成每遍 ≤4 个跨迭代向量的多遍实现——第一遍算 B/G，
+第二遍算 R/alpha，第三遍合成，中间结果存一行 scratch。代价是多一遍行扫描和 2–4 W 字节的行缓冲。
+
+在解决之前**不要接进 studio**。给这件事定个上限：即使全部修好，收益是 ~2 ms NPU 时间
+换掉主机侧 30–90 mJ 的搬运，值钱但不是无底洞。
+
+
+### 功耗测量
+
+两把尺子，都以**整包 PPT**（`amdgpu/power1_average`，含 CPU+iGPU+NPU）为准：
+
+```bash
+python powerbench.py  --backends cpu,npu --secs 60     # 端到端: 各后端的整机瓦数
+python powerbench_conv.py --secs 20 --rounds 2          # 微基准: 同一份卷积的 ms / W / J/帧
+```
+
+`powerbench_conv.py` 会直接算出 **J/帧**，以及"NPU 要做到多少 ms 才能在能量上打平 CPU"。
+判据是 `E = (P_空闲 + ΔP) × t`。7840HS 上实测（720p，Conv_290 0.29 GMAC）：
+
+| | ms/帧 | 整包 W | 边际 W | J/帧 |
+|---|---|---|---|---|
+| CPU ×2 | 4.1 | 34.6 | +13.4 | 0.143 |
+| NPU ×4 | 11.1 | 22.7 | +1.4 | 0.252 |
+
+NPU 的**边际**功率只有 1.4 W（CPU 13.4 W），但慢 2.7 倍，整机每帧能量反而高 76%。
+打平线是 6.7 ms —— 也就是内核效率再提 1.7 倍。
+
+⚠ 这台机器的 `BAT0` 没有 `power_now`，`current_now` 的量纲是坏的（1.2 W vs 整包 19 W），
+所以脚本以 PPT 为准、电池值只做交叉验证。
+
+## 环境
 
 ```bash
 uv venv --python /usr/bin/python3.14 --system-site-packages .venv-iron   # 需要系统 pyxrt (Arch: xrt 包)
