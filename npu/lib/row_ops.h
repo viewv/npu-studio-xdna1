@@ -14,6 +14,12 @@
 //   blend_u8        (fg·m + bg·(255-m)) >> 8
 //
 // 新增逐行内核时: #include "row_ops.h", 开头 rowops::init(), 然后按上面的约定写循环。
+//
+// ⚠ 编译器坑 (llvm-aie 21.0.0.2026062301, AIE2): "基址 + 编译期常量偏移" 的非对齐向量加载,
+//   偏移 >= 1024 字节时会被折成 post-increment 形式 (`vlda wl, [p], #off+32`), 先用基址加载、
+//   后加偏移, 读到的是错误平面 (实测 992 B 正确, 1024 B 起错)。表现为 up4_* 的 v[j-1]
+//   来自另一个平面, 即 x%4∈{0,1} 的 lane 出错。
+//   规则: 一行里多个平面的偏移一律用 plane_stride() 取成运行时值, 不要写 base + CONST。
 #ifndef NPU_ROW_OPS_H
 #define NPU_ROW_OPS_H
 
@@ -27,6 +33,12 @@ namespace rowops {
 using v32u8 = ::aie::vector<uint8_t, 32>;
 using v32i16 = ::aie::vector<int16_t, 32>;
 using v16i16 = ::aie::vector<int16_t, 16>;
+
+/// 把编译期的平面步长变成编译器看不穿的运行时值 (绕开上面的 post-increment 错折)
+inline int32_t plane_stride(int32_t n) {
+  volatile int32_t v = n;
+  return v;
+}
 
 /// 每个行内核开头调用一次
 inline void init() {

@@ -16,10 +16,10 @@ from npu.fused import FusedCompositor
 
 from .lowres import LowResPrep
 
-# NPU 合成内核做过逐字节验证的尺寸。别的尺寸在有些宽度上会踩到 AIE 编译器的
-# 问题（1280 过、1920 算错, 见 README「分辨率」），所以在这里挡住,
-# 而不是让用户拿到一帧一帧的错像素。确要实验请设 NPU_ALLOW_UNVERIFIED=1。
-VERIFIED_SIZES = {(1280, 720)}
+# NPU 合成内核做过逐字节验证的尺寸。别的尺寸没验证过 (内核和 AIE 编译器都可能有坑,
+# 见 README「分辨率」), 所以在这里挡住, 而不是让用户拿到一帧一帧的错像素。
+# 确要实验请设 NPU_ALLOW_UNVERIFIED=1。
+VERIFIED_SIZES = {(1280, 720), (1920, 1080)}
 
 
 class NpuBackgroundFx:
@@ -30,8 +30,8 @@ class NpuBackgroundFx:
         if (width, height) not in VERIFIED_SIZES and not os.environ.get("NPU_ALLOW_UNVERIFIED"):
             ok = ", ".join(f"{w}x{h}" for w, h in sorted(VERIFIED_SIZES))
             raise ValueError(
-                f"NPU 合成只在 {ok} 上逐字节验证过；{width}x{height} 会算错"
-                f"（AIE 编译器问题，见 README）。换成 --gpu 用核显合成，"
+                f"NPU 合成只在 {ok} 上逐字节验证过；{width}x{height} 没验证过"
+                f"（见 README「分辨率」）。换成 --gpu 用核显合成，"
                 f"或设 NPU_ALLOW_UNVERIFIED=1 只做实验。")
         self.prep = LowResPrep(width, height, mode, blur, smooth, threshold, bg_image)
         self.h = height

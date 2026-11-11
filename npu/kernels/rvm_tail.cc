@@ -20,15 +20,9 @@
 //   m     = clamp_u8( (P_3·g + Q_3·255) >> 8 )
 //   out   = (fgr·m + up(bg)·(255-m)) >> 8
 //
-// ⚠ 一个必须绕开的编译器坑: 如果在本轮里"算完放大结果 → 立刻送进 16 位 MAC",
-//   第 0、1 (mod 4) lane 的累加器会被多加一个常数 (实测 +95 / +31, 与数据无关),
-//   相当于同一个 up4 结果在"转 uint8"和"送 MAC"两条路上拿到了不同的值。
-//   已排除: 权重按值传参 / 权重改局部数组 / 结果过一遍本地内存 / 拆 16 lane 累加器 /
-//           换 u 的宽化方式 / mac 换 add / 折项 / 流水线 pragma。
-//   解法(已验证到一半): 手工软件流水 —— 把放大结果做成跨迭代存活的变量, 下一轮的
-//   提前算好。单通道/两通道(<=4 个跨迭代向量)能做到逐字节正确;
-//   8 个(本内核需要 4 个 P + 4 个 Q)仍然错 —— 16 lane 也一样, 所以不是寄存器宽度问题。
-//   下一步: 把本内核拆成每遍 <=4 个跨迭代向量的多遍实现 (中间结果存一行 scratch)。
+// ⚠ 曾经结果错 (x%4∈{0,1} 的 lane): 不是规约/寄存器问题, 是 llvm-aie 把 >=1024 B 的
+//   常量平面偏移丢掉, P2 以后的平面读到了 P0 (见 row_ops.h 文件头)。平面偏移改成
+//   运行时值 (plane_stride) 之后 1280×720 / 1920×1080 都与整数参考逐字节一致。
 //
 // 公共算子见 npu/lib/row_ops.h。
 
@@ -67,9 +61,10 @@ extern "C" {
 void rvmTailLine(uint8_t *src, uint8_t *low, uint8_t *out, int32_t width) {
   init();
 
+  const int32_t LS = plane_stride(LOW_STRIDE);       // 必须是运行时值, 见文件头
   const int16_t *P = (const int16_t *)low;            // 4 个平面
-  const int16_t *Q = P + 4 * LOW_STRIDE;              // 4 个平面
-  const uint8_t *bgl = low + 16 * LOW_STRIDE;         // BGRA
+  const int16_t *Q = P + 4 * LS;                      // 4 个平面
+  const uint8_t *bgl = low + 16 * LS;                 // BGRA
   const Up4 w16 = Up4::make();
   const W8x4 w8 = W8x4::make();
   const v32u8 a255 = ::aie::broadcast<uint8_t, 32>(255);
@@ -78,10 +73,10 @@ void rvmTailLine(uint8_t *src, uint8_t *low, uint8_t *out, int32_t width) {
   AIE_LOOP_MIN_ITERATION_COUNT(4)
   for (int x = 0; x < width; x += 32) {
     const int j0 = x >> 2;
-    v32i16 p0 = up4_i16(P, j0, w16), p1 = up4_i16(P + LOW_STRIDE, j0, w16);
-    v32i16 p2 = up4_i16(P + 2 * LOW_STRIDE, j0, w16), p3 = up4_i16(P + 3 * LOW_STRIDE, j0, w16);
-    v32i16 q0 = up4_i16(Q, j0, w16), q1 = up4_i16(Q + LOW_STRIDE, j0, w16);
-    v32i16 q2 = up4_i16(Q + 2 * LOW_STRIDE, j0, w16), q3 = up4_i16(Q + 3 * LOW_STRIDE, j0, w16);
+    v32i16 p0 = up4_i16(P, j0, w16), p1 = up4_i16(P + LS, j0, w16);
+    v32i16 p2 = up4_i16(P + 2 * LS, j0, w16), p3 = up4_i16(P + 3 * LS, j0, w16);
+    v32i16 q0 = up4_i16(Q, j0, w16), q1 = up4_i16(Q + LS, j0, w16);
+    v32i16 q2 = up4_i16(Q + 2 * LS, j0, w16), q3 = up4_i16(Q + 3 * LS, j0, w16);
 
     // ---- 原图 32 像素 → B/G/R 平面 ----
     v32u8 s0 = ::aie::load_v<32>(src);

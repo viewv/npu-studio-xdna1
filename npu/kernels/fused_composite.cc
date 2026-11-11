@@ -38,8 +38,11 @@ void fusedCompositeLine(uint8_t *px, uint8_t *low, uint8_t *out,
   init();
 
   const int16_t *aq = (const int16_t *)low;
-  const int16_t *bq = aq + LOW_STRIDE;
-  const uint8_t *bgl = (const uint8_t *)(bq + LOW_STRIDE);
+  // 平面偏移必须是运行时值: llvm-aie 会把 >=1024 B 的常量偏移错折成 post-increment,
+  // 丢掉偏移 (见 row_ops.h 文件头 / README「分辨率」)。
+  const int32_t ls = plane_stride(LOW_STRIDE);
+  const int16_t *bq = aq + ls;
+  const uint8_t *bgl = (const uint8_t *)(bq + ls);
 
   const Up4 w16 = Up4::make();
   const W8x4 w8 = W8x4::make();

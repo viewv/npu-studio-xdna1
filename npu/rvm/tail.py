@@ -1,8 +1,8 @@
 """RVM 尾部融合: 1/4 分辨率的 (refiner 残差, alpha) → 全分辨率 fgr/pha + 合成
 
-⚠ 实验状态: 接口、编译、运行都通了, 但 selftest 不一致 (每 4 像素的第 0、1 个错)。
-   原因已定位到内核侧 (见 kernels/rvm_tail.cc 的文件头), 不是这里的打包或参考实现。
-   在修好之前不要接进 studio。
+实验状态: selftest 在 1280×720 / 1920×1080 与整数参考逐字节一致 (曾因 llvm-aie 丢掉
+   >=1024 B 的常量平面偏移而错, 见 kernels/rvm_tail.cc 文件头)。还没接进 studio:
+   需要带 refiner 的 RVM 部署, 且主机侧 8 个平面的垂直插值太贵, 见 README。
 
 对应 ONNX 图的最后一段 (Resize_332 / Resize_346 之后):
 
