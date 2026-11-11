@@ -1,6 +1,9 @@
 """微基准: 同一份卷积在 CPU / NPU 上的 时间 + 整包功率 + J/帧
 
-  source npu/env.sh && python powerbench_conv.py [--secs 20] [--rounds 2] [--threads 2] [--cols 4]
+  source npu/env.sh && python powerbench_conv.py [--secs 20] [--rounds 2] [--threads 2] [--kernel new|old]
+
+  --kernel new  自写内核 npu/conv3x3.py (默认, 4 core)
+  --kernel old  上游 conv2dk3 修补版 npu/rvm/conv_npu.py (--cols 列)
 
 用来回答"这个内核到底省不省电": NPU 的边际功率低, 但慢会把省下的电吃掉。
 能量判据:  E = (P_idle + ΔP) × t      →  NPU 打平 CPU 的条件  t_npu < E_cpu / (P_idle + ΔP_npu)
@@ -23,6 +26,7 @@ SECS = int(sys.argv[sys.argv.index("--secs") + 1]) if "--secs" in sys.argv else 
 ROUNDS = int(sys.argv[sys.argv.index("--rounds") + 1]) if "--rounds" in sys.argv else 2
 THREADS = int(sys.argv[sys.argv.index("--threads") + 1]) if "--threads" in sys.argv else 2
 COLS = int(sys.argv[sys.argv.index("--cols") + 1]) if "--cols" in sys.argv else 4
+KERNEL = sys.argv[sys.argv.index("--kernel") + 1] if "--kernel" in sys.argv else "new"
 WARM = 8.0
 
 
@@ -98,21 +102,30 @@ def main():
     xi = x[None].astype(np.float32)
     sess.run(None, {"x": xi})
 
-    # NPU: 现有的 conv2dk3 (修补版), n_cols 列
     import aie.iron as iron
-    from npu.rvm.conv_npu import TILE, conv3x3_relu
-    t_act = iron.tensor(q.pack_input_tiles(xq, n_tiles).reshape(-1), dtype=np.int8, device="npu")
-    t_w = iron.tensor(q.pack_weights(), dtype=np.int8, device="npu")
-    t_out = iron.zeros(n_tiles * h * q.oc * TILE, dtype=np.uint8, device="npu")
-    kw = dict(height=h, n_tiles=n_tiles, ic=q.icp, oc=q.oc, shift=q.shift, n_cols=COLS)
-    conv3x3_relu(t_act, t_w, t_out, **kw)     # 预热 / JIT
+    if KERNEL == "new":
+        from npu.conv3x3 import Conv3x3, conv3x3_relu as conv_new
+        conv = Conv3x3(q, h, w)
+        conv.set_input(xq)
+        kw = dict(height=h, wt=conv.wt, n_tw=conv.n_tw, n_bands=conv.n_bands, icb=conv.icb, shift=q.shift)
+        run_npu = lambda: conv_new(conv.t_act, conv.t_w, conv.t_out, **kw)
+        npu_name = "npu-new×4"
+    else:   # 上游 conv2dk3 (修补版), n_cols 列
+        from npu.rvm.conv_npu import TILE, conv3x3_relu
+        t_act = iron.tensor(q.pack_input_tiles(xq, n_tiles).reshape(-1), dtype=np.int8, device="npu")
+        t_w = iron.tensor(q.pack_weights(), dtype=np.int8, device="npu")
+        t_out = iron.zeros(n_tiles * h * q.oc * TILE, dtype=np.uint8, device="npu")
+        kw = dict(height=h, n_tiles=n_tiles, ic=q.icp, oc=q.oc, shift=q.shift, n_cols=COLS)
+        run_npu = lambda: conv3x3_relu(t_act, t_w, t_out, **kw)
+        npu_name = f"npu-old×{COLS}"
+    run_npu()     # 预热 / JIT
 
     print(f"顺序: 空闲 → (CPU×{THREADS} / NPU×{COLS}) × {ROUNDS} → 空闲\n")
     r = {"idle": [], f"cpu": [], "npu": []}
     r["idle"].append(phase("idle", lambda: time.sleep(0.05), secs=SECS, warm=4))
     for _ in range(ROUNDS):
         r["cpu"].append(phase(f"cpu×{THREADS}", lambda: sess.run(None, {"x": xi})))
-        r["npu"].append(phase(f"npu×{COLS}", lambda: conv3x3_relu(t_act, t_w, t_out, **kw)))
+        r["npu"].append(phase(npu_name, run_npu))
     r["idle"].append(phase("idle", lambda: time.sleep(0.05), secs=max(8, SECS // 2), warm=4))
 
     def mean(k, f):

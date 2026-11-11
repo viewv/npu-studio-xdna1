@@ -1,4 +1,4 @@
-"""NPU 一键回归: 清 JIT 缓存 → 跑全部内核的逐字节自检 + 编译器探针 → 汇总
+"""NPU 一键回归: 清 JIT 缓存 → 跑全部内核 (合成 / RVM 尾部 / 3×3 卷积) 的逐字节自检 + 编译器探针 → 汇总
 
   source npu/env.sh && python -m npu.check [--quick] [--keep-cache] [-v]
 
@@ -33,6 +33,8 @@ def _cases(quick: bool):
         yield f"fused-v   {f"{w}×{h}":<9}", lambda w=w, h=h, c=cols: fused.selftest_v(w, h, c, 10)
     for w, h in sizes:
         yield f"rvm_tail  {f"{w}×{h}":<9}", lambda w=w, h=h: tail.selftest(w, h, 4, 10)
+    from . import conv3x3
+    yield "conv3x3   Conv_290 ", lambda: conv3x3.selftest(2, 2, 10)
 
 
 def _probe():
