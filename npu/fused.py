@@ -18,85 +18,68 @@ from pathlib import Path
 import numpy as np
 
 import aie.iron as iron
-from aie.iron import CompileTime, In, ObjectFifo, Out, Program, Runtime, Worker
-from aie.iron.kernel import ExternalFunction
+from aie.iron import CompileTime, In, Out, Program, Runtime
+
+from .harness import RowPipeline, external_row_kernel
 
 HERE = Path(__file__).resolve().parent
 KERNEL = str(HERE / "kernels" / "fused_composite.cc")
+LIB = str(HERE / "lib")                 # npu/lib/row_ops.h — 各逐行内核共用
 MLIR_AIE = Path(os.environ["MLIR_AIE_INSTALL_DIR"]) if os.environ.get("MLIR_AIE_INSTALL_DIR") \
     else Path(iron.__file__).resolve().parents[2]
 KERNEL_INC = str(MLIR_AIE / "include" / "aie_kernels")
 
-LOW_STRIDE = 352                       # 每段元素数, >= W/4 + 2
-LOW_ROW = LOW_STRIDE * 2 * 2 + LOW_STRIDE * 4   # Aq + Bq (int16) + bg (BGRA) 字节数
+def low_stride(width: int) -> int:
+    """低分辨率行每段的元素数: 留出内核会读的尾巴, 并按 64 字节对齐 (int16 平面 2*LS)
+
+    可以用 NPU_LOW_STRIDE 覆盖 (调参用: 某些取值会触发 AIE 编译器的问题, 见 README)。
+    """
+    v = os.environ.get("NPU_LOW_STRIDE")
+    return int(v) if v else -(-(width // 4 + 16) // 32) * 32
+
+
+def low_row_bytes(ls: int) -> int:
+    """Aq + Bq (int16) + bg (BGRA) 一行字节数"""
+    return ls * 2 * 2 + ls * 4
 
 WP = np.array([3, 1, 0, 0]); WC = np.array([5, 7, 7, 5]); WN = np.array([0, 0, 1, 3])
 
 
-def _slice(n_total: int, offset: int, size: int):
-    from aie.helpers.taplib import TensorAccessPattern
-    return TensorAccessPattern((1, n_total), offset, [1, 1, 1, size], [0, 0, 0, 1])
-
-
 @iron.jit(aiecc_flags=["--alloc-scheme=basic-sequential"])
 def fused_composite(px: In, low: In, out: Out, *,
-                    width: CompileTime[int], height: CompileTime[int], n_cols: CompileTime[int] = 4):
+                    width: CompileTime[int], height: CompileTime[int],
+                    low_stride: CompileTime[int], n_cols: CompileTime[int] = 4):
     row = width * 4
-    rows_per_col = height // n_cols
+    low_row = low_stride * 2 * 2 + low_stride * 4
     row_ty = np.ndarray[(row,), np.dtype[np.uint8]]
-    low_ty = np.ndarray[(LOW_ROW,), np.dtype[np.uint8]]
+    low_ty = np.ndarray[(low_row,), np.dtype[np.uint8]]
 
-    kern = ExternalFunction(
-        "fusedCompositeLine", source_file=KERNEL,
-        arg_types=[row_ty, low_ty, row_ty, np.int32],
-        include_dirs=[KERNEL_INC], compile_flags=[f"-DLOW_STRIDE={LOW_STRIDE}"])
+    kern = external_row_kernel(
+        "fusedCompositeLine", KERNEL, [row_ty, low_ty], row_ty,
+        scalars=[np.int32], include_dirs=[KERNEL_INC, LIB],
+        compile_flags=[f"-DLOW_STRIDE={low_stride}"])
 
-    def core(of_px, of_low, of_out, k):
-        e_px = of_px.acquire(1)
-        e_low = of_low.acquire(1)
-        e_out = of_out.acquire(1)
-        k(e_px, e_low, e_out, width)
-        of_px.release(1)
-        of_low.release(1)
-        of_out.release(1)
-
-    fifos, workers = [], []
-    for c in range(n_cols):
-        f_px = ObjectFifo(row_ty, depth=2, name=f"px{c}")
-        f_low = ObjectFifo(low_ty, depth=2, name=f"low{c}")
-        f_out = ObjectFifo(row_ty, depth=2, name=f"out{c}")
-        fifos.append((f_px, f_low, f_out))
-        workers.append(Worker(core, [f_px.cons(), f_low.cons(), f_out.prod(), kern]))
-
-    n_px, n_low = row * height, LOW_ROW * height
-    px_ty = np.ndarray[(n_px,), np.dtype[np.uint8]]
-    low_t = np.ndarray[(n_low,), np.dtype[np.uint8]]
-    c_px, c_low = row * rows_per_col, LOW_ROW * rows_per_col
+    pl = RowPipeline(kern, [row, low_row], row, height=height, n_cols=n_cols,
+                     extra_args=[width], prefix="fx")
+    pl.build()
 
     rt = Runtime()
-    with rt.sequence(px_ty, low_t, px_ty) as (a, l, b):
-        rt.start(*workers)
-        tg = rt.task_group()
-        for c, (f_px, f_low, _) in enumerate(fifos):
-            rt.fill(f_px.prod(), a, tap=_slice(n_px, c * c_px, c_px), task_group=tg)
-            rt.fill(f_low.prod(), l, tap=_slice(n_low, c * c_low, c_low), task_group=tg)
-        for c, (_, _, f_out) in enumerate(fifos):
-            rt.drain(f_out.cons(), b, tap=_slice(n_px, c * c_px, c_px), wait=True, task_group=tg)
-        rt.finish_task_group(tg)
+    with rt.sequence(*pl.tensor_types()) as bufs:
+        pl.stream(rt, bufs)
     return Program(iron.get_current_device(), rt).resolve_program()
 
 
 # ---------------------------------------------------------------- 主机端封装
 
 class LowRowViews:
-    """把 (H, LOW_ROW) 字节缓冲区按段切成 Aq / Bq / bg 的 numpy 视图 (含左右各 1 个填充)"""
+    """把 (H, low_row) 字节缓冲区按段切成 Aq / Bq / bg 的 numpy 视图 (含左右各 1 个填充)"""
 
-    def __init__(self, buf: np.ndarray, lw: int):
+    def __init__(self, buf: np.ndarray, lw: int, ls: int):
         h = buf.shape[0]
-        self.lw = lw
-        self.aq = buf[:, : LOW_STRIDE * 2].view(np.int16)          # (H, LOW_STRIDE)
-        self.bq = buf[:, LOW_STRIDE * 2: LOW_STRIDE * 4].view(np.int16)
-        self.bg = buf[:, LOW_STRIDE * 4:].reshape(h, LOW_STRIDE, 4)
+        self.lw, self.ls = lw, ls
+        self.aq = buf[:, : ls * 2].view(np.int16)          # (H, ls)
+        self.bq = buf[:, ls * 2: ls * 4].view(np.int16)
+        self.bg = buf[:, ls * 4:].reshape(h, ls, 4)
 
     def set(self, aq: np.ndarray, bq: np.ndarray, bg: np.ndarray) -> None:
         """aq/bq: (H, LW) int16, bg: (H, LW, 4) uint8 — 写入并做左右复制填充"""
@@ -109,14 +92,16 @@ class LowRowViews:
 
 class FusedCompositor:
     def __init__(self, width: int, height: int, n_cols: int = 4):
-        if width % 32 or height % n_cols or width // 4 + 2 > LOW_STRIDE:
+        if width % 32 or height % n_cols:
             raise ValueError(f"不支持的尺寸 {width}x{height} (宽需为32的倍数, 高需能被 {n_cols} 整除)")
         self.w, self.h, self.n_cols = width, height, n_cols
+        self.ls = low_stride(width)
+        lr = low_row_bytes(self.ls)
         self.t_px = iron.zeros(width * height * 4, dtype=np.uint8, device="npu")
-        self.t_low = iron.zeros(LOW_ROW * height, dtype=np.uint8, device="npu")
+        self.t_low = iron.zeros(lr * height, dtype=np.uint8, device="npu")
         self.t_out = iron.zeros(width * height * 4, dtype=np.uint8, device="npu")
         self.px = self.t_px.data.reshape(height, width, 4)        # 直接写进 NPU 缓冲区
-        self.low = LowRowViews(self.t_low.data.reshape(height, LOW_ROW), width // 4)
+        self.low = LowRowViews(self.t_low.data.reshape(height, lr), width // 4, self.ls)
         t0 = time.perf_counter()
         self.run()                       # 预热: 触发 JIT 编译 / 加载 xclbin (首次约 2 s)
         self.warmup_s = time.perf_counter() - t0
@@ -125,7 +110,7 @@ class FusedCompositor:
         self.t_px._sync_to_device()
         self.t_low._sync_to_device()
         fused_composite(self.t_px, self.t_low, self.t_out,
-                        width=self.w, height=self.h, n_cols=self.n_cols)
+                        width=self.w, height=self.h, low_stride=self.ls, n_cols=self.n_cols)
         return self.t_out.numpy().reshape(self.h, self.w, 4)
 
 
@@ -184,5 +169,7 @@ def selftest(width=1280, height=720, n_cols=4, iters=30):
 
 
 if __name__ == "__main__":
-    cols = int(sys.argv[sys.argv.index("--cols") + 1]) if "--cols" in sys.argv else 4
-    sys.exit(0 if selftest(n_cols=cols) else 1)
+    def arg(name, default):
+        return int(sys.argv[sys.argv.index(name) + 1]) if name in sys.argv else default
+    sys.exit(0 if selftest(arg("--width", 1280), arg("--height", 720),
+                            arg("--cols", 4), arg("--iters", 30)) else 1)
