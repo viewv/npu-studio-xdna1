@@ -17,7 +17,13 @@
       权重元素 = 64 + 最大层权重字节, 各层在主机侧补齐到同样大小。
   · 激活仍是整幅带边布局 [H+2][ICB][PAD+W+PAD][8]; 每种形状两个 scratch 槽乒乓 (不同形状不能共用槽,
     否则上一层写的内部像素会落在下一种形状的"边"上)。
-  · core 侧: 相邻、行数和 stride 相同的层合成一个 range_ 循环 (acquire 3 行, release stride 行);
+  · core 侧 (MODE, --mode):
+      class  (默认) 描述符驱动: 每个 (每 core 行数, stride) 类别在 core 上只有一段静态行循环, 每层从权重头读
+             一个 0/1 选择字节当 range_ 的次数, 决定走哪段 → core 代码大小只和类别数有关, 与层数/顺序无关
+             (实测 3 个类别 .text 6672 B, 3 层到 85 层不变)。
+      static 相邻、行数和 stride 相同的层合成一个 range_ 循环; 代码随层组数增长 (每组 0.7–1.5 KB)。
+      dyn    行数也从描述符读: 编译器拒绝 ("cannot statically analyze cyclostatic acquire pattern"),
+             滑窗的 acquire/release 不能放进运行时次数的循环 → 行数必须是编译期常量, 所以用 class。
     1×1 层也按 3 行窗口喂 (多读上下两行), 这样所有层同一种 fifo 用法。
 
 层间激活约定与 chain_spike 相同: 内核输出 uint8 (饱和=ReLU), 下一层把同一字节当 int8 读。
@@ -42,9 +48,11 @@ from .harness import SelfTestResult
 
 SRC = str(Path(__file__).resolve().parent / "kernels" / "conv_generic.cc")
 PAD, HDR = 4, 64
+SEL_OFF, ROWS_OFF = 32, 48     # 描述符里给 core 读的字节 (前 24 字节给内核)
 N_TW, N_BANDS = 2, 2           # 每层都是 宽 2 条 × 高 2 段 = 4 个 core
 IN_DEPTH = 4                   # 输入 fifo 深度
 GROUP = 1                      # 0 = core 上每层单独展开 (调试用)
+MODE = "class"                 # core 循环: static = 按层组展开 / class = 描述符选类别 / dyn = 行数也读描述符
 
 
 @dataclass(frozen=True)
@@ -178,6 +186,29 @@ class Plan:
         return base + (1 + l.rows * b) * full_row + (PAD + t * l.wt) * 8
 
 
+def layer_classes(layers):
+    """core 上的代码段类别 = 链里出现过的 (每 core 行数, stride), 排好序"""
+    return sorted({(l.rows, l.s) for l in layers})
+
+
+def _hdr_byte(buf, off):
+    """core 里读权重块的一个字节 (0..127) → index, 用作 range_ 的运行时次数"""
+    from aie.dialects import arith, memref
+    from aie.ir import IndexType
+    v = memref.load(buf, [arith.constant(IndexType.get(), off)])
+    return arith.index_cast(IndexType.get(), v)
+
+
+def _hdr_u16(buf, off):
+    from aie.dialects import arith, memref
+    from aie.ir import IndexType, IntegerType
+    i32 = IntegerType.get_signless(32)
+    lo = arith.extui(i32, memref.load(buf, [arith.constant(IndexType.get(), off)]))
+    hi = arith.extui(i32, memref.load(buf, [arith.constant(IndexType.get(), off + 1)]))
+    v = arith.addi(lo, arith.shli(hi, arith.constant(i32, 8)))
+    return arith.index_cast(IndexType.get(), v)
+
+
 def _tap(n_total, off, sizes, strides):
     from aie.helpers.taplib import TensorAccessPattern
     return TensorAccessPattern((1, n_total), off, sizes, strides)
@@ -185,7 +216,8 @@ def _tap(n_total, off, sizes, strides):
 
 @iron.jit(aiecc_flags=["--alloc-scheme=basic-sequential"])
 def conv_hetero(act: In, wts: In, scratch: InOut, out: Out, *, spec: CompileTime[str],
-                reps: CompileTime[int] = 1, group: CompileTime[int] = 1):
+                reps: CompileTime[int] = 1, group: CompileTime[int] = 1,
+                mode: CompileTime[str] = "static"):
     layers = from_spec_str(spec)
     P = Plan(layers)
     n = len(layers)
@@ -209,6 +241,40 @@ def conv_hetero(act: In, wts: In, scratch: InOut, out: Out, *, spec: CompileTime
     # stride 2 不用 acquire 3 / release 2 的滑窗: IRON 1.3.4 的 ObjectFifo 下降在这种循环前面还有别的
     # range_(≥2) 循环时 (如 A,A,B), 不剥第一次迭代, 每次迭代都按"再取 3 个"上锁 → 多等 1 个对象 → 挂死
     # (ERT_CMD_STATE_TIMEOUT)。改成每行由 DMA 发完整 3 行、core acquire 3 / release 3, 循环边界持有数恒为 0。
+    classes = layer_classes(layers)
+
+    def row_block(f_in, f_out, k, wv, rows, s):
+        """一层的行循环; 进出时 f_in 持有数都是 0。rows 可以是 int 或运行时 Value"""
+        for _ in range_(rows):
+            win = f_in.acquire(3)
+            o = f_out.acquire(1)
+            for _ in range(reps):        # reps>1 只用于测纯计算时间
+                k(win[0], win[1], win[2], wv, o)
+            f_in.release(1 if s == 1 else 3)
+            f_out.release(1)
+        if s == 1:
+            f_in.release(2)
+
+    def core_class(f_in, f_w, f_out, k):
+        # 描述符驱动: core 代码里每个 (行数, stride) 类别只有一段, 每层读选择字节决定走哪段
+        # (range_(0 或 1)); 代码大小只和类别数有关, 和层数、层的顺序无关。
+        for _ in range_(n):
+            wv = f_w.acquire(1)
+            for c, (rows, s) in enumerate(classes):
+                for _ in range_(_hdr_byte(wv, SEL_OFF + c)):
+                    row_block(f_in, f_out, k, wv, rows, s)
+            f_w.release(1)
+
+    def core_dyn(f_in, f_w, f_out, k):
+        # 更激进: 行数也从描述符读, 只按 stride 分两段
+        for _ in range_(n):
+            wv = f_w.acquire(1)
+            rows = _hdr_u16(wv, ROWS_OFF)
+            for s in (1, 2):
+                for _ in range_(_hdr_byte(wv, SEL_OFF + 8 + s)):
+                    row_block(f_in, f_out, k, wv, rows, s)
+            f_w.release(1)
+
     def core(f_in, f_w, f_out, k):
         for (rows, s), cnt in groups:
             for _ in range_(cnt):
@@ -230,7 +296,8 @@ def conv_hetero(act: In, wts: In, scratch: InOut, out: Out, *, spec: CompileTime
         f_w = ObjectFifo(w_ty, depth=1, name=f"hx{t}_{b}w")
         f_out = ObjectFifo(out_ty, depth=2, name=f"hx{t}_{b}o")
         fifos.append((t, b, f_in, f_w, f_out))
-        workers.append(Worker(core, [f_in.cons(), f_w.cons(), f_out.prod(), kern]))
+        body = {"static": core, "class": core_class, "dyn": core_dyn}[mode]
+        workers.append(Worker(body, [f_in.cons(), f_w.cons(), f_out.prod(), kern]))
 
     rt = Runtime()
     with rt.sequence(np.ndarray[(P.size["act"],), i8], np.ndarray[(n * P.e_w,), i8],
@@ -280,8 +347,12 @@ def from_layout(buf: np.ndarray, shape) -> np.ndarray:
     return b[:, 1:-1, PAD:PAD + w]
 
 
-def pack_weights(l: Layer, Wq: np.ndarray, shift: int, e_w: int) -> np.ndarray:
-    """(OC, IC, k, k) → [描述符 64 B][权重], 补齐到 e_w 字节"""
+def pack_weights(l: Layer, Wq: np.ndarray, shift: int, e_w: int, classes=()) -> np.ndarray:
+    """(OC, IC, k, k) → [描述符 64 B][权重], 补齐到 e_w 字节
+
+    描述符: int32 [ICB, OCB, WT, stride, k, shift] (内核读);
+            字节 SEL_OFF+c = 1 若本层属于类别 c (core 读, mode=class);
+            字节 SEL_OFF+8+s = 1 若 stride = s, ROWS_OFF 起 u16 = 行数 (core 读, mode=dyn)"""
     ocp, icb = l.oc // 16, l.icb
     if l.k == 3:   # → [ocp][ky][icb][kx][ob][ic8][oc8]
         w = Wq.reshape(ocp, 2, 8, icb, 8, 3, 3).transpose(0, 5, 3, 6, 1, 4, 2)
@@ -291,6 +362,11 @@ def pack_weights(l: Layer, Wq: np.ndarray, shift: int, e_w: int) -> np.ndarray:
     hdr[:6] = [l.icb, l.ocb, l.wt, l.s, l.k, shift]
     buf = np.zeros(e_w, np.int8)
     buf[:HDR] = hdr.view(np.int8)
+    for c, key in enumerate(classes):
+        buf[SEL_OFF + c] = int(key == (l.rows, l.s))
+    buf[SEL_OFF + 8 + l.s] = 1
+    buf[ROWS_OFF] = l.rows & 0xFF
+    buf[ROWS_OFF + 1] = l.rows >> 8
     buf[HDR:HDR + l.n_w] = np.ascontiguousarray(w).reshape(-1)
     return buf
 
@@ -336,7 +412,8 @@ class HeteroChain:
         self.P = P = Plan(layers)
         self.spec = spec_str(layers)
         self.t_act = iron.zeros(P.size["act"], dtype=np.int8, device="npu")
-        self.t_w = iron.tensor(np.concatenate([pack_weights(l, Wq, s, P.e_w)
+        cls = layer_classes(layers)
+        self.t_w = iron.tensor(np.concatenate([pack_weights(l, Wq, s, P.e_w, cls)
                                                for l, (Wq, s) in zip(layers, params)]),
                                dtype=np.int8, device="npu")
         self.t_s = iron.zeros(P.size["s"], dtype=np.int8, device="npu")      # 边永远为零
@@ -348,7 +425,7 @@ class HeteroChain:
 
     def call(self):
         conv_hetero(self.t_act, self.t_w, self.t_s, self.t_out, spec=self.spec, reps=self.reps,
-                    group=GROUP)
+                    group=GROUP, mode=MODE)
 
     def result(self):
         return from_layout(self.t_out.numpy(), self.layers[-1].out_shape)
@@ -444,6 +521,7 @@ if __name__ == "__main__":
     def arg(name, default):
         return sys.argv[sys.argv.index(name) + 1] if name in sys.argv else default
     iters = int(arg("--iters", 50))
+    MODE = arg("--mode", MODE)
     if "--compute" in sys.argv:
         compute_split(arg("--compute", "A,B,C,D"), iters=iters)
         sys.exit(0)
