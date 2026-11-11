@@ -471,6 +471,13 @@ def compute_split(spec, reps=(1, 2, 3), iters=50):
               f"{(icpt - 0.25) / n:.3f} ms (固定按 0.25)", file=sys.stderr)
 
 
+def selftest(spec="enc", iters=10) -> SelfTestResult:
+    """npu.check 用: 一条链逐字节一致 (含补宽列为零), 返回中位耗时"""
+    r = run_one(spec, iters)
+    report(r)
+    return SelfTestResult(r["max_diff"] == 0, r["max_diff"], r["med"])
+
+
 def main(iters=50):
     ok = True
     for i, spec in enumerate(["e1", "e1,e2", "head", "enc", "low"]):

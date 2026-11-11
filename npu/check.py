@@ -1,4 +1,4 @@
-"""NPU 一键回归: 清 JIT 缓存 → 跑全部内核 (合成 / RVM 尾部 / 3×3 卷积) 的逐字节自检 + 编译器探针 → 汇总
+"""NPU 一键回归: 清 JIT 缓存 → 跑全部内核 (合成 / RVM 尾部 / 3×3 卷积 / 整网串联框架) 的逐字节自检 + 编译器探针 → 汇总
 
   source npu/env.sh && python -m npu.check [--quick] [--keep-cache] [-v]
 
@@ -35,6 +35,11 @@ def _cases(quick: bool):
         yield f"rvm_tail  {f"{w}×{h}":<9}", lambda w=w, h=h: tail.selftest(w, h, 4, 10)
     from . import conv3x3
     yield "conv3x3   Conv_290 ", lambda: conv3x3.selftest(2, 2, 10)
+    # RVM 整网串联框架 (一次调用多层; 覆盖 s2 滑窗绕法、描述符驱动循环、不均分行、补宽写零)
+    from . import chain_c16
+    yield "chain_c16 enc 13 层", lambda: chain_c16.selftest("enc", 10)
+    if not quick:
+        yield "chain_c16 low 25 层", lambda: chain_c16.selftest("low", 10)
 
 
 def _probe():
