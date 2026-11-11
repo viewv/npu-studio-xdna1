@@ -9,7 +9,7 @@ Linux 上的「Windows Studio Effects」：摄像头背景虚化 / 替换，输�
 |---|---|---|
 | 1 | 人像分割 (MediaPipe ONNX) + 背景模糊/合成, 全部 CPU | ✅ 可用 |
 | 2 | 全分辨率的 放大 + 导向滤波遮罩 + 合成 换成 NPU 融合内核 (IRON) | ✅ 可用 (`--npu`) |
-| 3 | 抠像换成 RVM（时序记忆、头发丝边缘），全分辨率部分仍在 NPU | 计划中 |
+| 3 | 抠像换成 RVM（时序记忆、头发丝边缘）：RVM 跑在 780M，合成仍在 NPU | ✅ 可用 (`--matting rvm --rvm-gpu --npu`) |
 
 ## NPU 后端 (`--npu`)
 
@@ -174,16 +174,43 @@ python3 -m studio --npu                  # NPU 后端虚拟摄像头
 正好是下游需要的 1/4 分辨率遮罩。所以不用截断 ONNX 图，也不用把全分辨率 `fgr`/`pha`
 传回来（那会是每帧 15–33 MB）。只用 `pha`，前景仍然取原始画面。
 
-实测（7840HS，720p，ORT CPU 4 线程 + NPU 合成）：
+**RVM 跑在 780M 核显上（ncnn + Vulkan）**，CPU 只剩缩放、1/4 准备和合成：
 
-| | 墙钟 | CPU |
+```bash
+# 一次性准备（产物已在仓库里，换机器才需要重跑）
+.venv/bin/python studio/native/convert_rvm.py --pnnx <pnnx> --onnxsim <onnxsim>
+bash studio/native/build_rvm_worker.sh      # 用 Arch 仓库的 ncnn，不需要 sudo/编译 ncnn
+
+# 跑
+source npu/env.sh
+python -m studio --matting rvm --rvm-gpu --npu --high-fps
+```
+
+实测（7840HS，1280×720，RVM@780M + NPU 合成，实测 2291 帧）：
+
+| | 每帧 |
+|---|---|
+| RVM（320×180，Vulkan） | 18.8 ms |
+| 合成（CPU 准备 4.6 + NPU 1.7） | 6.4 ms |
+| 输出 | 0.8 ms |
+| **合计 / 帧率** | **26.1 ms → 30.0 fps** |
+| **CPU 时间** | **10.0 ms/帧（0.30 核）** |
+
+对比同一台机器上的三种抠像方案：
+
+| | 帧率 | CPU |
 |---|---|---|
-| RVM（320×180） | 19.3 ms | 55 ms（2.9 核） |
-| **整条流水线** | **25.6 ms（39 fps）** | **61 ms（2.4 核）** |
+| MediaPipe 分割（阶段 1/2） | 30 fps | ~17 ms（0.5 核） |
+| RVM，CPU 4 线程 | 39 fps | 61 ms（2.4 核） |
+| **RVM，780M** | **30 fps** | **10 ms（0.30 核）** |
 
-够 30 fps，但 CPU 要 2.4 个核 —— 这就是下一步把 RVM 挪到 780M 核显的理由。
-想直观看效果：`snapshot_rvm.png`（原图 | RVM 遮罩 | 合成），跑一次
-`python -c "from studio.rvm import ..."` 或直接 `--snapshot` 即可。
+两个实现都保留：`studio/rvm.py` 是 ORT 版（有 ROCm 时自动走核显，否则 CPU），
+`studio/rvm_gpu.py` 是 ncnn+Vulkan 版（`--rvm-gpu`）。
+
+模型转换是这条路上最麻烦的一步：RVM 的 ONNX 是动态形状（内部尺寸由 `Shape(src)` +
+`downsample_ratio` 运行时算出来），ncnn/pnnx 处理不了。做法是把部署分辨率彻底焊死
+（ratio 变常量 → onnxsim 折叠形状链 → Expand 换 Identity → ORT 逐字节验证 → pnnx），
+全部封装在 `studio/native/convert_rvm.py` 里。
 
 ## 安装
 
