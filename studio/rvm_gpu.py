@@ -47,9 +47,12 @@ class RvmGpuMatting:
                 "  bash studio/native/build_rvm_worker.sh")
         self.w, self.h = width, height
         self.device = "VULKAN"
+        # start_new_session: 让 worker 自己成一组, 终端 Ctrl-C 只打主进程;
+        # 退出时由 close() 负责收掉
         self.proc = subprocess.Popen(
             [str(WORKER), str(param), str(model_bin)],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0)
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0,
+            start_new_session=True)
         self._run(np.zeros((height, width, 3), np.uint8))     # 预热: Vulkan 初始化 + 首帧
 
     def reset(self) -> None:
@@ -60,7 +63,9 @@ class RvmGpuMatting:
         while len(out) < n:
             chunk = self.proc.stdout.read(n - len(out))
             if not chunk:
-                raise RuntimeError("RVM worker 退出了 (检查 third_party/rvm_worker)")
+                raise RuntimeError(
+                    "RVM GPU worker 退出了 (third_party/rvm_worker); "
+                    "看终端上面有没有 Vulkan 报错")
             out += chunk
         return bytes(out)
 

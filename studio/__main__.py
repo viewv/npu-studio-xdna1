@@ -245,7 +245,12 @@ def _main(status: Status) -> None:
                 print("[studio] 摄像头没有新画面", file=sys.stderr)
                 continue
             t0 = time.perf_counter()
-            alpha = seg(frame)
+            try:
+                alpha = seg(frame)
+            except RuntimeError as e:          # 抠像后端挂了 (GPU worker 退出等)
+                print(f"[studio] 抠像后端出错: {e}", file=sys.stderr)
+                status.emit("error", message=str(e))
+                break
             t1 = time.perf_counter()
             result = fx.apply(frame, alpha)
             t2 = time.perf_counter()
@@ -299,6 +304,9 @@ def _main(status: Status) -> None:
                 t_report = now
     finally:
         cam.close()
+        close = getattr(seg, "close", None)    # RVM GPU 后端要收掉 worker 进程
+        if close:
+            close()
         if out:
             out.close()
         if dynfps:
