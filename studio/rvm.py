@@ -37,16 +37,25 @@ class RvmMatting:
     model:      onnx 文件 (fp32 或 fp16 都行, ORT 会在内部转换)
     width/height: 工作分辨率 (默认 320x180, 对应 720p 输出的 1/4)
     threads:    ORT 线程数; CPU 上这个模型相当重, 建议 2-4
+    providers:  显式指定 ORT provider; 默认有 ROCm 就用核显, 否则 CPU
+
+    self.device 会告诉你是哪个后端在跑 ("ROCM" / "CPU")。
     """
 
     def __init__(self, width: int = 320, height: int = 180,
-                 model: str = "rvm_mobilenetv3_fp32.onnx", threads: int = 4):
+                 model: str = "rvm_mobilenetv3_fp32.onnx", threads: int = 4,
+                 providers: list[str] | None = None):
         so = ort.SessionOptions()
         so.intra_op_num_threads = threads
         so.inter_op_num_threads = 1
         so.add_session_config_entry("session.intra_op.allow_spinning", "0")
-        self.sess = ort.InferenceSession(str(MODELS / model), so,
-                                         providers=["CPUExecutionProvider"])
+        if providers is None:
+            # 有 ROCm 就走核显 (装 onnxruntime-rocm 之后会自动出现), 否则 CPU
+            providers = (["ROCMExecutionProvider"]
+                         if "ROCMExecutionProvider" in ort.get_available_providers() else [])
+            providers.append("CPUExecutionProvider")
+        self.sess = ort.InferenceSession(str(MODELS / model), so, providers=providers)
+        self.device = self.sess.get_providers()[0].replace("ExecutionProvider", "")
         self.w, self.h = width, height
         self.inputs = [i.name for i in self.sess.get_inputs()]
         self.outputs = [o.name for o in self.sess.get_outputs()]
