@@ -20,7 +20,7 @@ import numpy as np
 import aie.iron as iron
 from aie.iron import CompileTime, In, Out, Program, Runtime
 
-from .harness import RowPipeline, external_row_kernel
+from .harness import RowPipeline, SelfTestResult, external_row_kernel
 
 HERE = Path(__file__).resolve().parent
 KERNEL = str(HERE / "kernels" / "fused_composite.cc")
@@ -281,7 +281,7 @@ def selftest_v(width=1280, height=720, n_cols=4, iters=30):
     times.sort()
     print(f"[fused-v] {width}x{height} n_cols={n_cols}: 中位数 {times[len(times) // 2] * 1000:.2f} ms, "
           f"最快 {times[0] * 1000:.2f} ms (含同步)", file=sys.stderr)
-    return diff.max() == 0
+    return SelfTestResult(diff.max() == 0, diff.max(), times[len(times) // 2] * 1000)
 
 
 def selftest(width=1280, height=720, n_cols=4, iters=30):
@@ -314,7 +314,7 @@ def selftest(width=1280, height=720, n_cols=4, iters=30):
     times.sort()
     print(f"[fused] {width}x{height} n_cols={n_cols}: 中位数 {times[len(times) // 2] * 1000:.2f} ms, "
           f"最快 {times[0] * 1000:.2f} ms (含同步)", file=sys.stderr)
-    return diff.max() <= 1
+    return SelfTestResult(diff.max() <= 1, diff.max(), times[len(times) // 2] * 1000)
 
 
 if __name__ == "__main__":

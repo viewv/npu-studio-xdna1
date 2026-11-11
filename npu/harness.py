@@ -45,6 +45,19 @@ _HARNESS = os.path.abspath(__file__)
 # 表现为"改了代码但结果不变"或结果诡异时, 先清缓存再查。
 
 
+class SelfTestResult:
+    """selftest 的结果: 真值 = 是否通过 (兼容旧的 `sys.exit(0 if selftest() else 1)`)"""
+
+    def __init__(self, ok: bool, max_diff: int, ms: float):
+        self.ok, self.max_diff, self.ms = bool(ok), int(max_diff), float(ms)
+
+    def __bool__(self) -> bool:
+        return self.ok
+
+    def __repr__(self) -> str:
+        return f"SelfTestResult(ok={self.ok}, max_diff={self.max_diff}, ms={self.ms:.2f})"
+
+
 def _slice(n_total: int, offset: int, size: int):
     from aie.helpers.taplib import TensorAccessPattern
     return TensorAccessPattern((1, n_total), offset, [1, 1, 1, size], [0, 0, 0, 1])

@@ -59,8 +59,15 @@ Aq 平面。v[j-1] 只在权重 wp={3,1,0,0} 的 lane 0、1 起作用，所以�
 [`npu/lib/row_ops.h`](npu/lib/row_ops.h) 文件头。720p 仍是默认：它是会议软件的主流发送分辨率，
 而且 1080p 下 CPU 侧的解码/准备也更贵。`NPU_ALLOW_UNVERIFIED=1` 可放行未验证的尺寸，仅限实验。
 
-**规则**：改内核、改分辨率、换编译器版本之后，都要在目标分辨率上跑
-`python -m npu.fused --selftest --width W --height H` 再发布——"上次是好的"不算数。
+**规则**：改内核、改 `npu/lib/*.h`、改 harness、改分辨率、换编译器版本之后，都要跑一键回归再发布——"上次是好的"不算数：
+
+```bash
+source npu/env.sh && python -m npu.check        # 约 20 s; --quick 只测 720p
+```
+
+它会清 JIT 缓存，逐字节自检 fused / fused-v / rvm_tail 在 720p 与 1080p 上的结果，
+再跑编译器探针（`npu/offset_probe.py`）：报告常量偏移 bug 是否仍在、`plane_stride` 绕过是否有效。
+全部 ✅ 退出码为 0。
 
 ## 可复用的内核骨架
 
