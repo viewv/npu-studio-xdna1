@@ -164,6 +164,27 @@ python3 -m studio --npu                  # NPU 后端虚拟摄像头
 
 首次运行会 JIT 编译 NPU 程序（约 2 秒），结果缓存后再启动很快。
 
+### RVM 抠像 (`--matting rvm`)
+
+默认是轻量的 MediaPipe 分割。加 `--matting rvm` 换成 RVM（Robust Video Matting）：
+头发丝级边缘 + 自带时序记忆（r1..r4 循环状态），所以不再需要 `--smooth` 的 EMA（那反而会拖影），
+`--threshold` 也自动关掉，免得把细发丝切掉。
+
+实现上**不碰合成内核**：摄像头帧直接缩到 320×180 喂给模型，它的 `pha` 天然就是 320×180 ——
+正好是下游需要的 1/4 分辨率遮罩。所以不用截断 ONNX 图，也不用把全分辨率 `fgr`/`pha`
+传回来（那会是每帧 15–33 MB）。只用 `pha`，前景仍然取原始画面。
+
+实测（7840HS，720p，ORT CPU 4 线程 + NPU 合成）：
+
+| | 墙钟 | CPU |
+|---|---|---|
+| RVM（320×180） | 19.3 ms | 55 ms（2.9 核） |
+| **整条流水线** | **25.6 ms（39 fps）** | **61 ms（2.4 核）** |
+
+够 30 fps，但 CPU 要 2.4 个核 —— 这就是下一步把 RVM 挪到 780M 核显的理由。
+想直观看效果：`snapshot_rvm.png`（原图 | RVM 遮罩 | 合成），跑一次
+`python -c "from studio.rvm import ..."` 或直接 `--snapshot` 即可。
+
 ## 安装
 
 ```bash

@@ -137,7 +137,11 @@ def _main(status: Status) -> None:
     ap.add_argument("--smooth", default=0.5, type=float, help="遮罩时间平滑 0-0.95 (越大越稳但越拖影)")
     ap.add_argument("--threshold", default=0.15, type=float, help="遮罩软阈值 0-0.4 (越大边缘越硬)")
     ap.add_argument("--feather", default=5, type=int, help="边缘羽化像素 (basic 模式)")
+    ap.add_argument("--matting", default="mediapipe", choices=["mediapipe", "rvm"],
+                    help="抠像模型: mediapipe=轻量分割 (默认); rvm=RVM, 头发丝级 + 时序记忆, "
+                         "CPU 上约 19 ms/帧 (4 线程)")
     ap.add_argument("--threads", default=2, type=int, help="分割模型 CPU 线程数")
+    ap.add_argument("--rvm-threads", default=4, type=int, help="RVM 的 CPU 线程数")
     ap.add_argument("--bench", type=int, metavar="N", help="处理 N 帧后输出性能统计并退出")
     ap.add_argument("--snapshot", metavar="PNG", help="处理一帧并保存 (原图|结果 并排) 后退出")
     ap.add_argument("--npu", action="store_true",
@@ -164,7 +168,15 @@ def _main(status: Status) -> None:
     cv2.setNumThreads(a.cv_threads)
 
     status.emit("starting", backend="npu" if a.npu else (f"gpu-{a.gpu}" if a.gpu else "cpu"))
-    seg = Segmenter(threads=a.threads)
+    if a.matting == "rvm":
+        from .rvm import RvmMatting
+        seg = RvmMatting(threads=a.rvm_threads)
+        if "--smooth" not in sys.argv:
+            a.smooth = 0.0          # RVM 自带时序记忆, 再叠 EMA 只会拖影
+        if "--threshold" not in sys.argv:
+            a.threshold = 0.0       # 遮罩已经很准, 再软阈值会把头发丝切掉
+    else:
+        seg = Segmenter(threads=a.threads)
     cam = Camera(a.camera, *a.size, a.fps)
     dynfps = DynamicFramerate(a.camera) if a.high_fps else None   # 摄像头打开成功后再改设置
     w, h = cam.size
