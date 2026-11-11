@@ -7,3 +7,4 @@ third_party/
 .venv-iron/
 app/target/
 npu/rvm/*.npz
+models/*.ncnn.*

@@ -143,6 +143,9 @@ def _main(status: Status) -> None:
     ap.add_argument("--threads", default=2, type=int, help="分割模型 CPU 线程数")
     ap.add_argument("--rvm-threads", default=4, type=int,
                     help="RVM 在 CPU 上的线程数 (有 ROCm 时自动走核显, 这个就不用了)")
+    ap.add_argument("--rvm-gpu", action="store_true",
+                    help="RVM 跑在核显上 (ncnn+Vulkan), CPU 只剩缩放和合成; "
+                         "需要先跑 studio/native/convert_rvm.py + build_rvm_worker.sh")
     ap.add_argument("--bench", type=int, metavar="N", help="处理 N 帧后输出性能统计并退出")
     ap.add_argument("--snapshot", metavar="PNG", help="处理一帧并保存 (原图|结果 并排) 后退出")
     ap.add_argument("--npu", action="store_true",
@@ -170,8 +173,12 @@ def _main(status: Status) -> None:
 
     status.emit("starting", backend="npu" if a.npu else (f"gpu-{a.gpu}" if a.gpu else "cpu"))
     if a.matting == "rvm":
-        from .rvm import RvmMatting
-        seg = RvmMatting(threads=a.rvm_threads)
+        if a.rvm_gpu:
+            from .rvm_gpu import RvmGpuMatting
+            seg = RvmGpuMatting()
+        else:
+            from .rvm import RvmMatting
+            seg = RvmMatting(threads=a.rvm_threads)
         seg_desc = f"RVM on {seg.device}"
         if "--smooth" not in sys.argv:
             a.smooth = 0.0          # RVM 自带时序记忆, 再叠 EMA 只会拖影
