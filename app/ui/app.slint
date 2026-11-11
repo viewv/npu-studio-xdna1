@@ -1,0 +1,648 @@
+// NPU Studio — 主界面
+import { Button, Switch, ComboBox, Slider, ScrollView, Palette } from "std-widgets.slint";
+
+export struct FeatureData {
+    id: string,
+    title: string,
+    description: string,
+    tag: string,          // 例如 "NPU"、"即将推出"
+    available: bool,
+    enabled: bool,
+}
+
+// 运行状态: 0 已停止, 1 启动中, 2 运行中, 3 停止中, 4 出错
+export global Theme {
+    out property <color> npu: #7c5cff;
+    out property <color> ok: #2fbf71;
+    out property <color> warn: #e5a50a;
+    out property <color> err: #e5484d;
+    out property <color> muted: Palette.foreground.with-alpha(0.6);
+    out property <color> card: Palette.color-scheme == ColorScheme.dark ? #ffffff0d : #0000000a;
+    out property <color> card-border: Palette.color-scheme == ColorScheme.dark ? #ffffff1a : #00000014;
+}
+
+component Card inherits Rectangle {
+    in property <string> title;
+    in property <string> subtitle;
+    background: Theme.card;
+    border-radius: 12px;
+    border-width: 1px;
+    border-color: Theme.card-border;
+    VerticalLayout {
+        padding: 14px;
+        spacing: 10px;
+        if root.title != "": VerticalLayout {
+            spacing: 2px;
+            Text { text: root.title; font-size: 14px; font-weight: 700; }
+            if root.subtitle != "": Text {
+                text: root.subtitle;
+                font-size: 11px;
+                color: Theme.muted;
+                wrap: word-wrap;
+            }
+        }
+        @children
+    }
+}
+
+component Tag inherits Rectangle {
+    in property <string> text;
+    in property <color> tint: Theme.npu;
+    border-radius: 6px;
+    background: root.tint.with-alpha(0.18);
+    height: 18px;
+    width: label.preferred-width + 12px;
+    label := Text {
+        text: root.text;
+        font-size: 10px;
+        font-weight: 700;
+        color: root.tint;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+component BackendOption inherits Rectangle {
+    in property <string> label;
+    in property <string> hint;
+    in property <string> tag;
+    in property <bool> selected;
+    in property <bool> available: true;
+    in property <bool> locked;       // 运行中只能先停止再切换
+    callback clicked;
+    min-height: 50px;
+    border-radius: 10px;
+    border-width: root.selected ? 2px : 1px;
+    border-color: root.selected ? Theme.npu : Theme.card-border;
+    background: root.selected ? Theme.npu.with-alpha(0.12)
+        : (touch.has-hover && root.available && !root.locked ? Theme.card : transparent);
+    opacity: root.available ? 1.0 : 0.45;
+    HorizontalLayout {
+        padding: 10px;
+        spacing: 10px;
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 16px;
+                height: 16px;
+                border-radius: 8px;
+                border-width: 2px;
+                border-color: root.selected ? Theme.npu : Theme.muted;
+                Rectangle {
+                    visible: root.selected;
+                    width: 8px;
+                    height: 8px;
+                    border-radius: 4px;
+                    background: Theme.npu;
+                }
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            spacing: 1px;
+            HorizontalLayout {
+                spacing: 6px;
+                Text { text: root.label; font-weight: 600; vertical-alignment: center; }
+                if root.tag != "": Tag { text: root.tag; y: 1px; }
+                Rectangle { }
+            }
+            Text { text: root.hint; font-size: 11px; color: Theme.muted; wrap: word-wrap; }
+        }
+    }
+    touch := TouchArea {
+        enabled: root.available && !root.locked;
+        mouse-cursor: self.enabled ? pointer : default;
+        clicked => { root.clicked(); }
+    }
+}
+
+component Segment inherits Rectangle {
+    in property <string> text;
+    in property <bool> selected;
+    callback clicked;
+    height: 32px;
+    border-radius: 8px;
+    background: root.selected ? Theme.npu : (touch.has-hover ? Theme.card : transparent);
+    Text {
+        text: root.text;
+        color: root.selected ? white : Palette.foreground;
+        font-weight: root.selected ? 700 : 400;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+component FeatureRow inherits Rectangle {
+    in property <FeatureData> data;
+    callback toggled(bool);
+    min-height: 48px;
+    HorizontalLayout {
+        spacing: 10px;
+        VerticalLayout {
+            alignment: center;
+            spacing: 2px;
+            HorizontalLayout {
+                spacing: 6px;
+                Text {
+                    text: root.data.title;
+                    font-weight: 600;
+                    color: root.data.available ? Palette.foreground : Theme.muted;
+                }
+                if root.data.tag != "": Tag {
+                    text: root.data.tag;
+                    tint: root.data.available ? Theme.npu : Theme.muted;
+                }
+                Rectangle { }
+            }
+            Text {
+                text: root.data.description;
+                font-size: 11px;
+                color: Theme.muted;
+                wrap: word-wrap;
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            Switch {
+                enabled: root.data.available;
+                checked: root.data.enabled;
+                toggled => { root.toggled(self.checked); }
+            }
+        }
+    }
+}
+
+component StatTile inherits Rectangle {
+    in property <string> label;
+    in property <string> value;
+    in property <string> unit;
+    in property <color> accent: Palette.foreground;
+    background: Theme.card;
+    border-radius: 10px;
+    border-width: 1px;
+    border-color: Theme.card-border;
+    min-height: 62px;
+    VerticalLayout {
+        padding: 10px;
+        spacing: 2px;
+        Text { text: root.label; font-size: 11px; color: Theme.muted; }
+        HorizontalLayout {
+            spacing: 4px;
+            alignment: start;
+            Text { text: root.value; font-size: 20px; font-weight: 700; color: root.accent; }
+            Text { text: root.unit; font-size: 11px; color: Theme.muted; vertical-alignment: bottom; }
+        }
+    }
+}
+
+component StartButton inherits Rectangle {
+    in property <int> state;
+    callback clicked;
+    height: 48px;
+    border-radius: 12px;
+    property <bool> busy: root.state == 1 || root.state == 3;
+    property <bool> running: root.state == 2;
+    background: root.running ? (touch.has-hover ? Theme.err.darker(0.1) : Theme.err)
+        : (touch.has-hover ? Theme.npu.darker(0.1) : Theme.npu);
+    opacity: root.busy ? 0.6 : 1.0;
+    animate background { duration: 150ms; }
+    Text {
+        text: root.state == 1 ? "正在启动…" : root.state == 3 ? "正在停止…" : root.running ? "■  停止" : "▶  开启";
+        color: white;
+        font-size: 16px;
+        font-weight: 700;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    touch := TouchArea {
+        enabled: !root.busy;
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+export component AppWindow inherits Window {
+    title: "NPU Studio";
+    icon: @image-url("../assets/npu-studio.svg");
+    preferred-width: 1060px;
+    preferred-height: 760px;
+    min-width: 860px;
+    min-height: 600px;
+
+    // ---- 后端 ----
+    in-out property <int> backend: 0;     // 0 NPU, 1 GPU rusticl, 2 GPU ROCm, 3 CPU
+    in property <bool> npu-available: true;
+    in property <bool> rusticl-available: true;
+    in property <bool> rocm-available: true;
+
+    // ---- 抠像模型 ----
+    in-out property <int> matting: 0;      // 0 MediaPipe, 1 RVM 核显, 2 RVM CPU
+    in property <bool> rvm-gpu-available: true;
+    in property <bool> rvm-cpu-available: true;
+
+    // ---- 背景效果 ----
+    in-out property <int> bg-mode: 0;      // 0 虚化, 1 图片, 2 绿幕
+    in-out property <float> blur-strength: 61;
+    in-out property <float> smoothing: 0.5;
+    in property <string> bg-image-name;
+
+    // ---- 摄像头 ----
+    in property <[string]> cameras;
+    in-out property <int> camera-index: 0;
+    in-out property <bool> high-fps: false;
+
+    // ---- 其他功能 (由 Rust 端注册) ----
+    in property <[FeatureData]> features;
+
+    // ---- 运行状态 ----
+    in property <int> run-state: 0;
+    in property <string> status-text: "未运行";
+    in property <string> error-text;
+    in property <string> backend-name;
+    in property <image> preview;
+    in property <bool> has-preview: false;
+    in property <float> fps;
+    in property <float> seg-ms;
+    in property <float> fx-ms;
+    in property <float> prep-ms;
+    in property <float> accel-ms;
+    in property <float> cpu-pct;
+    in property <float> person-pct;
+
+    // ---- 虚拟摄像头 ----
+    in property <string> vcam-device;      // 空 = 未加载
+    in property <bool> vcam-autoload;
+    in property <bool> vcam-busy;
+
+    callback start-stop();
+    callback settings-changed();
+    callback pick-image();
+    callback load-vcam();
+    callback setup-autoload();
+    callback feature-toggled(int, bool);
+
+    property <bool> locked: root.run-state == 1 || root.run-state == 3;
+    property <bool> running: root.run-state == 2;
+
+    HorizontalLayout {
+        padding: 16px;
+        spacing: 16px;
+
+        // ================= 左栏: 设置 =================
+        ScrollView {
+            width: 400px;
+            VerticalLayout {
+                spacing: 12px;
+                padding-right: 8px;
+
+                // 标题 + 开关
+                HorizontalLayout {
+                    spacing: 10px;
+                    Image {
+                        source: @image-url("../assets/npu-studio.svg");
+                        width: 36px;
+                        height: 36px;
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        Text { text: "NPU Studio"; font-size: 20px; font-weight: 800; }
+                        Text { text: "Ryzen AI 背景虚化虚拟摄像头"; font-size: 11px; color: Theme.muted; }
+                    }
+                }
+                StartButton {
+                    state: root.run-state;
+                    clicked => { root.start-stop(); }
+                }
+
+                Card {
+                    title: "计算后端";
+                    subtitle: "全分辨率的遮罩与合成在哪里计算。运行中切换会自动重启。";
+                    BackendOption {
+                        label: "NPU";
+                        tag: "推荐";
+                        hint: "Ryzen AI 融合内核 · 最快 · 不占用 GPU";
+                        selected: root.backend == 0;
+                        available: root.npu-available;
+                        locked: root.locked;
+                        clicked => { root.backend = 0; root.settings-changed(); }
+                    }
+                    BackendOption {
+                        label: "GPU · Mesa";
+                        hint: "Radeon 780M · OpenCL (rusticl)";
+                        selected: root.backend == 1;
+                        available: root.rusticl-available;
+                        locked: root.locked;
+                        clicked => { root.backend = 1; root.settings-changed(); }
+                    }
+                    BackendOption {
+                        label: "GPU · ROCm";
+                        hint: "Radeon 780M · OpenCL (ROCm)";
+                        selected: root.backend == 2;
+                        available: root.rocm-available;
+                        locked: root.locked;
+                        clicked => { root.backend = 2; root.settings-changed(); }
+                    }
+                    BackendOption {
+                        label: "CPU";
+                        hint: "无需加速器 · 兼容性最好";
+                        selected: root.backend == 3;
+                        locked: root.locked;
+                        clicked => { root.backend = 3; root.settings-changed(); }
+                    }
+                }
+
+                Card {
+                    title: "抠像模型";
+                    subtitle: "决定人物边缘的精细程度。运行中切换会自动重启。";
+                    BackendOption {
+                        label: "RVM · 核显";
+                        tag: "推荐";
+                        hint: root.rvm-gpu-available ? "头发丝级边缘 · 不拖影 · 在 780M 上跑, CPU 占用与 MediaPipe 相当"
+                            : "需要先生成 worker 和模型 (见 README「RVM 抠像」)";
+                        selected: root.matting == 1;
+                        available: root.rvm-gpu-available;
+                        locked: root.locked;
+                        clicked => { root.matting = 1; root.settings-changed(); }
+                    }
+                    BackendOption {
+                        label: "MediaPipe";
+                        hint: "很轻, 边缘一般 · 动作大时会有拖影";
+                        selected: root.matting == 0;
+                        locked: root.locked;
+                        clicked => { root.matting = 0; root.settings-changed(); }
+                    }
+                    BackendOption {
+                        label: "RVM · CPU";
+                        hint: "效果同上, 但要占用 2 个多 CPU 核";
+                        selected: root.matting == 2;
+                        available: root.rvm-cpu-available;
+                        locked: root.locked;
+                        clicked => { root.matting = 2; root.settings-changed(); }
+                    }
+                }
+
+                Card {
+                    title: "背景";
+                    subtitle: "人物之外的部分怎么处理。";
+                    HorizontalLayout {
+                        spacing: 4px;
+                        Segment {
+                            text: "虚化";
+                            selected: root.bg-mode == 0;
+                            clicked => { root.bg-mode = 0; root.settings-changed(); }
+                        }
+                        Segment {
+                            text: "替换图片";
+                            selected: root.bg-mode == 1;
+                            clicked => { root.bg-mode = 1; root.settings-changed(); }
+                        }
+                        Segment {
+                            text: "绿幕";
+                            selected: root.bg-mode == 2;
+                            clicked => { root.bg-mode = 2; root.settings-changed(); }
+                        }
+                    }
+                    if root.bg-mode == 0: VerticalLayout {
+                        spacing: 2px;
+                        HorizontalLayout {
+                            Text { text: "模糊强度"; font-size: 12px; }
+                            Rectangle { }
+                            Text { text: round(root.blur-strength); font-size: 12px; color: Theme.muted; }
+                        }
+                        Slider {
+                            minimum: 21;
+                            maximum: 151;
+                            value <=> root.blur-strength;
+                            released => { root.settings-changed(); }
+                        }
+                    }
+                    if root.bg-mode == 1: HorizontalLayout {
+                        spacing: 8px;
+                        Text {
+                            text: root.bg-image-name == "" ? "还没有选择图片" : root.bg-image-name;
+                            color: root.bg-image-name == "" ? Theme.warn : Palette.foreground;
+                            vertical-alignment: center;
+                            overflow: elide;
+                            horizontal-stretch: 1;
+                        }
+                        Button {
+                            text: "选择图片…";
+                            clicked => { root.pick-image(); }
+                        }
+                    }
+                    if root.matting == 0: VerticalLayout {
+                        spacing: 2px;
+                        HorizontalLayout {
+                            Text { text: "边缘稳定 (时间平滑)"; font-size: 12px; }
+                            Rectangle { }
+                            Text { text: round(root.smoothing * 100) + "%"; font-size: 12px; color: Theme.muted; }
+                        }
+                        Slider {
+                            minimum: 0;
+                            maximum: 0.9;
+                            value <=> root.smoothing;
+                            released => { root.settings-changed(); }
+                        }
+                    }
+                    if root.matting != 0: Text {
+                        text: "RVM 自带时序记忆, 不需要额外的边缘平滑 (加了反而会拖影)";
+                        font-size: 11px;
+                        color: Theme.muted;
+                        wrap: word-wrap;
+                    }
+                }
+
+                Card {
+                    title: "摄像头";
+                    ComboBox {
+                        model: root.cameras;
+                        current-index <=> root.camera-index;
+                        selected => { root.settings-changed(); }
+                    }
+                    HorizontalLayout {
+                        VerticalLayout {
+                            alignment: center;
+                            Text { text: "高帧率模式"; font-weight: 600; }
+                            Text {
+                                text: "关闭动态帧率, 稳定 30 fps (光线暗时画面会变暗)";
+                                font-size: 11px;
+                                color: Theme.muted;
+                                wrap: word-wrap;
+                            }
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            Switch {
+                                checked <=> root.high-fps;
+                                toggled => { root.settings-changed(); }
+                            }
+                        }
+                    }
+                }
+
+                Card {
+                    title: "更多功能";
+                    subtitle: "后续会陆续加入更多在 NPU 上运行的功能。";
+                    for f[i] in root.features: FeatureRow {
+                        data: f;
+                        toggled(v) => { root.feature-toggled(i, v); }
+                    }
+                }
+            }
+        }
+
+        // ================= 右栏: 预览与状态 =================
+        VerticalLayout {
+            spacing: 12px;
+
+            // 状态条
+            HorizontalLayout {
+                spacing: 8px;
+                Rectangle {
+                    width: 10px;
+                    height: 10px;
+                    y: (parent.height - self.height) / 2;
+                    border-radius: 5px;
+                    background: root.run-state == 2 ? Theme.ok : root.run-state == 4 ? Theme.err
+                        : root.locked ? Theme.warn : Theme.muted;
+                }
+                Text { text: root.status-text; font-weight: 600; vertical-alignment: center; }
+                Rectangle { }
+                Text { text: root.backend-name; font-size: 11px; color: Theme.muted; vertical-alignment: center; }
+            }
+
+            // 预览
+            Rectangle {
+                background: #000;
+                border-radius: 12px;
+                clip: true;
+                min-height: 240px;
+                vertical-stretch: 1;
+                Image {
+                    visible: root.has-preview;
+                    source: root.preview;
+                    width: parent.width;
+                    height: parent.height;
+                    image-fit: contain;
+                }
+                if !root.has-preview: VerticalLayout {
+                    alignment: center;
+                    spacing: 6px;
+                    Text {
+                        text: root.running ? "等待画面…" : "点击「开启」后在这里预览";
+                        color: #ffffffaa;
+                        font-size: 15px;
+                        horizontal-alignment: center;
+                    }
+                    Text {
+                        text: "会议软件里选择摄像头「NPU Studio Camera」";
+                        color: #ffffff66;
+                        font-size: 11px;
+                        horizontal-alignment: center;
+                    }
+                }
+            }
+
+            // 错误
+            if root.error-text != "": Rectangle {
+                background: Theme.err.with-alpha(0.12);
+                border-radius: 10px;
+                border-width: 1px;
+                border-color: Theme.err.with-alpha(0.5);
+                VerticalLayout {
+                    padding: 10px;
+                    Text { text: root.error-text; color: Theme.err; wrap: word-wrap; font-size: 12px; }
+                }
+            }
+
+            // 数字
+            GridLayout {
+                spacing: 8px;
+                Row {
+                    StatTile {
+                        label: "帧率";
+                        value: root.running ? round(root.fps * 10) / 10 : "–";
+                        unit: "fps";
+                        accent: root.running ? Theme.ok : Palette.foreground;
+                    }
+                    StatTile {
+                        label: "人像分割";
+                        value: root.running ? round(root.seg-ms * 10) / 10 : "–";
+                        unit: "ms";
+                    }
+                    StatTile {
+                        label: "遮罩与合成";
+                        value: root.running ? round(root.fx-ms * 10) / 10 : "–";
+                        unit: "ms";
+                    }
+                }
+                Row {
+                    StatTile {
+                        label: root.backend == 0 ? "其中 NPU" : root.backend == 3 ? "其中加速器" : "其中 GPU";
+                        value: root.running && root.backend != 3 ? round(root.accel-ms * 10) / 10 : "–";
+                        unit: "ms";
+                        accent: root.backend == 0 && root.running ? Theme.npu : Palette.foreground;
+                    }
+                    StatTile {
+                        label: "进程 CPU";
+                        value: root.running ? round(root.cpu-pct) : "–";
+                        unit: "% 单核";
+                    }
+                    StatTile {
+                        label: "画面中人物";
+                        value: root.running ? round(root.person-pct) : "–";
+                        unit: "%";
+                    }
+                }
+            }
+
+            // 虚拟摄像头
+            Card {
+                HorizontalLayout {
+                    spacing: 10px;
+                    VerticalLayout {
+                        alignment: center;
+                        spacing: 2px;
+                        horizontal-stretch: 1;
+                        HorizontalLayout {
+                            spacing: 6px;
+                            Text { text: "虚拟摄像头"; font-weight: 700; }
+                            Tag {
+                                text: root.vcam-device != "" ? "已就绪 " + root.vcam-device : "未加载";
+                                tint: root.vcam-device != "" ? Theme.ok : Theme.warn;
+                            }
+                            Rectangle { }
+                        }
+                        Text {
+                            text: root.vcam-autoload ? "开机会自动加载 (v4l2loopback)" : "每次开机需要加载一次 (v4l2loopback)";
+                            font-size: 11px;
+                            color: Theme.muted;
+                        }
+                    }
+                    if root.vcam-device == "": VerticalLayout {
+                        alignment: center;
+                        horizontal-stretch: 0;
+                        Button {
+                            text: "加载";
+                            enabled: !root.vcam-busy;
+                            clicked => { root.load-vcam(); }
+                        }
+                    }
+                    if !root.vcam-autoload: VerticalLayout {
+                        alignment: center;
+                        horizontal-stretch: 0;
+                        Button {
+                            text: "开机自动加载";
+                            enabled: !root.vcam-busy;
+                            clicked => { root.setup-autoload(); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
