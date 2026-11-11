@@ -77,7 +77,13 @@ def on_battery(bat: str) -> bool:
 
 SECS = int(sys.argv[sys.argv.index("--secs") + 1]) if "--secs" in sys.argv else 60
 WARM = int(sys.argv[sys.argv.index("--warmup") + 1]) if "--warmup" in sys.argv else 15
-BACKENDS = {"cpu": [], "npu": ["--npu"], "rusticl": ["--gpu", "rusticl"], "rocm": ["--gpu", "rocm"]}
+_RVM = ["--matting", "rvm", "--rvm-gpu", "--high-fps"]
+BACKENDS = {"cpu": [], "npu": ["--npu"], "rusticl": ["--gpu", "rusticl"], "rocm": ["--gpu", "rocm"],
+            # RVM@780M + NPU 合成 (产品默认配置)
+            "rvm-npu": _RVM + ["--npu"],
+            # 同上, 但 CPU 侧的低分辨率准备只做第一帧 (之后复用): "准备全部搬走"的功耗上限实验
+            "rvm-npu-noprep": _RVM + ["--npu"]}
+ENVS = {"rvm-npu-noprep": {"NPU_PREP_ORACLE": "1"}}
 _order = sys.argv[sys.argv.index("--backends") + 1].split(",") if "--backends" in sys.argv else ["cpu", "npu"]
 for _b in _order:
     if _b not in BACKENDS:
@@ -89,7 +95,8 @@ def phase(name: str) -> tuple[list[float], list[float], list[float]]:
     proc = None
     if name != "idle":
         cmd = [sys.executable, "-m", "studio", "--output", "none"] + BACKENDS[name]
-        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        env = {**os.environ, **ENVS.get(name, {})}
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
     ppt, bat, fps = [], [], []
     t0 = time.monotonic()
     try:

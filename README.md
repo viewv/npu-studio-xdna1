@@ -25,6 +25,11 @@ CPU 只做 1/4 分辨率 (320×180) 的计算：遮罩平滑、导向滤波系�
 
 全部用 2 路 `interleave_zip/unzip` 向量操作, 每次迭代 32 像素; 4 列 NPU 并行, 每列处理 180 行。
 
+垂直方向的 ×4 也在 NPU 上（`fusedCompositeLineV`）：CPU 只写 H/4 + 2 行低分辨率数据，
+每列一个 core 用 3 行滑动窗口的 ObjectFifo（acquire 3 / release 1），一个窗口产出 4 行输出。
+720p 4 列、1080p 3 列（每列行数要是 4 的倍数），与 numpy 参考逐字节一致。
+实测只省 ~0.3 ms/帧 CPU（cv2 的垂直 resize 本来就便宜），NPU 时间 +0.4 ms。
+
 | 实测 (7840HS, 720p) | CPU 后端 | NPU 后端 |
 |---|---|---|
 | 全分辨率阶段 | ~10 ms | **1.6 ms** (NPU, 含同步) |
@@ -113,7 +118,23 @@ out   = (fgr·pha + up(bg)·(255-pha)) >> 8
 ```bash
 python powerbench.py  --backends cpu,npu --secs 60     # 端到端: 各后端的整机瓦数
 python powerbench_conv.py --secs 20 --rounds 2          # 微基准: 同一份卷积的 ms / W / J/帧
+python powerbench.py --backends rvm-npu,rvm-npu-noprep  # RVM@780M + NPU, 以及"CPU 准备全部去掉"的上限
 ```
+
+`rvm-npu-noprep` 设了 `NPU_PREP_ORACLE=1`：低分辨率准备只算第一帧、之后复用（画面会冻住），
+用来量"把准备全部搬走最多能省多少"。桌面在用时 PPT 漂移很大（同一配置前后差 5 W），
+分开跑的几分钟对比不可信；要用同一进程内每 15 s 交替开关、成对相减的办法。
+在 performance 调度下实测（16 对）：去掉准备 CPU 11.3 → 6.8 ms/帧，整包 **−1.5 W（中位 −1.9 W，标准误 0.5 W）**。
+
+据此做了两处 CPU 侧精简（不用 NPU）：
+
+- RVM 为喂模型已经把帧缩到 320×180（INTER_AREA），低分辨率准备直接复用，不再缩第二次（−0.7 ms）；
+- 无光晕背景模糊在再降一半的分辨率（160×90）上做、再放大回来（模糊核 ≥ 9 时）：1.3–2.3 ms → ~0.5 ms，
+  背景区域与原版平均差 0.26/255（95% 的像素 ≤ 1）。
+
+同进程 15 s 交替、16 对：CPU 准备 4.8 → 3.0 ms/帧，整包 **−2.7 W（中位 −2.7，标准误 0.16 W，16 对全为正）**；
+同样方法的 A/A 对照为 −0.57 ± 0.29 W，说明没有偏向"后跑的那个"。这个降幅比上面"去掉全部准备"的上限还大，
+两次是在不同的桌面负载下测的，绝对值只能当量级看：结论是省下来的 CPU 毫秒在 performance 调度下非常值钱。
 
 `powerbench_conv.py` 会直接算出 **J/帧**，以及"NPU 要做到多少 ms 才能在能量上打平 CPU"。
 判据是 `E = (P_空闲 + ΔP) × t`。7840HS 上实测（720p，Conv_290 0.29 GMAC）：

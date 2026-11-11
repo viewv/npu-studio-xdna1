@@ -193,7 +193,7 @@ def _main(status: Status) -> None:
     if a.npu:
         from .npu_fx import NpuBackgroundFx
         fx = NpuBackgroundFx(w, h, a.mode, a.blur, a.smooth, a.threshold, a.bg, n_cols=a.npu_cols)
-        backend = f"NPU ×{a.npu_cols}列"
+        backend = f"NPU ×{fx.n_cols}列"
     elif a.gpu:
         from .gpu_fx import GpuBackgroundFx
         fx = GpuBackgroundFx(w, h, a.mode, a.blur, a.smooth, a.threshold, a.bg)
@@ -260,7 +260,10 @@ def _main(status: Status) -> None:
                 status.emit("error", message=str(e))
                 break
             t1 = time.perf_counter()
-            result = fx.apply(frame, alpha)
+            if a.npu:      # RVM 已经把这一帧缩到 320×180 了, 低分辨率准备直接复用
+                result = fx.apply(frame, alpha, getattr(seg, "last_small", None))
+            else:
+                result = fx.apply(frame, alpha)
             t2 = time.perf_counter()
             if out:
                 out.send(result)

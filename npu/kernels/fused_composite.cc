@@ -31,19 +31,9 @@
 
 using namespace rowops;
 
-extern "C" {
-
-void fusedCompositeLine(uint8_t *px, uint8_t *low, uint8_t *out,
-                        int32_t width) {
-  init();
-
-  const int16_t *aq = (const int16_t *)low;
-  // 平面偏移必须是运行时值: llvm-aie 会把 >=1024 B 的常量偏移错折成 post-increment,
-  // 丢掉偏移 (见 row_ops.h 文件头 / README「分辨率」)。
-  const int32_t ls = plane_stride(LOW_STRIDE);
-  const int16_t *bq = aq + ls;
-  const uint8_t *bgl = (const uint8_t *)(bq + ls);
-
+// 一行全分辨率合成; aq / bq / bgl 是已经垂直插值好的低分辨率行 (各自独立的缓冲区)
+static inline void compose_row(const uint8_t *px, const int16_t *aq, const int16_t *bq,
+                               const uint8_t *bgl, uint8_t *out, int32_t width) {
   const Up4 w16 = Up4::make();
   const W8x4 w8 = W8x4::make();
   const v32i16 one = ::aie::broadcast<int16_t, 32>(1);
@@ -87,6 +77,68 @@ void fusedCompositeLine(uint8_t *px, uint8_t *low, uint8_t *out,
     ::aie::store_v(out + 96, blend_u8(p3, up4_px(sp3, sc3, sn3, w8), mq3));
     out += 128;
   }
+}
+
+// 垂直插值后的低分辨率行 (每个 core 一份, 在 tile 本地内存里)
+alignas(64) static int16_t g_aq[LOW_STRIDE];
+alignas(64) static int16_t g_bq[LOW_STRIDE];
+alignas(64) static uint8_t g_bg[4 * LOW_STRIDE];
+
+// 垂直 ×4: dst = (wp·r0 + wc·r1 + wn·r2) >> 3   (与水平方向同一套权重, 向下取整)
+static inline void vert_i16(const int16_t *r0, const int16_t *r1, const int16_t *r2,
+                            int16_t *dst, int n, int16_t wp, int16_t wc, int16_t wn) {
+  AIE_PREPARE_FOR_PIPELINING
+  AIE_LOOP_MIN_ITERATION_COUNT(4)
+  for (int k = 0; k < n; k += 32) {
+    ::aie::accum<acc32, 32> a = ::aie::mul(::aie::load_v<32>(r0 + k), wp);
+    a = ::aie::mac(a, ::aie::load_v<32>(r1 + k), wc);
+    a = ::aie::mac(a, ::aie::load_v<32>(r2 + k), wn);
+    ::aie::store_v(dst + k, a.template to_vector<int16_t>(3));
+  }
+}
+
+static inline void vert_u8(const uint8_t *r0, const uint8_t *r1, const uint8_t *r2,
+                           uint8_t *dst, int n, uint8_t wp, uint8_t wc, uint8_t wn) {
+  AIE_PREPARE_FOR_PIPELINING
+  AIE_LOOP_MIN_ITERATION_COUNT(4)
+  for (int k = 0; k < n; k += 32) {
+    ::aie::accum<acc32, 32> a = ::aie::mul(::aie::load_v<32>(r0 + k), wp);
+    a = ::aie::mac(a, ::aie::load_v<32>(r1 + k), wc);
+    a = ::aie::mac(a, ::aie::load_v<32>(r2 + k), wn);
+    ::aie::store_v(dst + k, a.template to_vector<uint8_t>(3));
+  }
+}
+
+extern "C" {
+
+// 旧接口: low 已由 CPU 垂直插值到全高度
+void fusedCompositeLine(uint8_t *px, uint8_t *low, uint8_t *out,
+                        int32_t width) {
+  init();
+  // 平面偏移必须是运行时值: llvm-aie 会把 >=1024 B 的常量偏移错折成 post-increment,
+  // 丢掉偏移 (见 row_ops.h 文件头 / README「分辨率」)。
+  const int32_t ls = plane_stride(LOW_STRIDE);
+  const int16_t *aq = (const int16_t *)low;
+  const int16_t *bq = aq + ls;
+  const uint8_t *bgl = (const uint8_t *)(bq + ls);
+  compose_row(px, aq, bq, bgl, out, width);
+}
+
+// 新接口: 垂直插值也在 NPU 上做。l0/l1/l2 是低分辨率 (未插值) 的第 j-1/j/j+1 行,
+// r = 输出行号 % 4 (决定垂直权重)。每个低分辨率行窗口被调用 4 次。
+void fusedCompositeLineV(uint8_t *px, uint8_t *l0, uint8_t *l1, uint8_t *l2,
+                         uint8_t *out, int32_t width, int32_t r) {
+  init();
+  const int32_t ls = plane_stride(LOW_STRIDE);
+  const int16_t wp = r == 0 ? 3 : (r == 1 ? 1 : 0);
+  const int16_t wc = (r == 0 || r == 3) ? 5 : 7;
+  const int16_t wn = r == 3 ? 3 : (r == 2 ? 1 : 0);
+  const int16_t *a0 = (const int16_t *)l0, *a1 = (const int16_t *)l1, *a2 = (const int16_t *)l2;
+  vert_i16(a0, a1, a2, g_aq, LOW_STRIDE, wp, wc, wn);
+  vert_i16(a0 + ls, a1 + ls, a2 + ls, g_bq, LOW_STRIDE, wp, wc, wn);
+  const int32_t bo = 4 * ls;   // bg 段的字节偏移
+  vert_u8(l0 + bo, l1 + bo, l2 + bo, g_bg, 4 * LOW_STRIDE, (uint8_t)wp, (uint8_t)wc, (uint8_t)wn);
+  compose_row(px, g_aq, g_bq, g_bg, out, width);
 }
 
 } // extern "C"

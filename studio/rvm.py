@@ -87,6 +87,7 @@ class RvmMatting:
         """frame_bgr: 任意分辨率的 BGR 帧 -> (h, w) float32 遮罩 (1=人物)"""
         if frame_bgr.shape[1] != self.w or frame_bgr.shape[0] != self.h:
             frame_bgr = cv2.resize(frame_bgr, (self.w, self.h), interpolation=cv2.INTER_AREA)
+        self.last_small = frame_bgr      # 低分辨率准备可以直接复用这张 (省一次 720p 缩放)
         return self._run(frame_bgr)
 
 

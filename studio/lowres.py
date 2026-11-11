@@ -49,6 +49,7 @@ class LowResPrep:
         self.threshold = threshold
         self.r, self.eps = r, eps
         self._prev = None
+        self._erode_k = np.ones((3, 3), np.uint8)
         self.bg_const = None
         if mode == "image":
             img = cv2.imread(bg_image) if bg_image else None
@@ -70,26 +71,44 @@ class LowResPrep:
         return alpha
 
     def _blur_bg(self, small: np.ndarray, ms: np.ndarray) -> np.ndarray:
-        """低分辨率无光晕模糊; 返回 (lh, lw, 4) uint8 BGRA"""
+        """低分辨率无光晕模糊; 返回 (lh, lw, 4) BGRA
+
+        归一化卷积: out = blur(f·w) / blur(w), 背景像素少的地方逐渐退回普通模糊。
+        模糊够强时 (k >= 9) 在再降一半的分辨率上做, 然后放大回来: CPU 从 ~1.3–2.3 ms
+        降到 ~0.5 ms, 与全分辨率版在背景区域平均差 0.26/255 (95% 的像素 ≤1), 看不出来。
+        """
         k = max(3, (self.blur // SCALE) | 1)
-        f = small.astype(np.float32)
+        if k >= 9:
+            h2, w2 = self.lh // 2, self.lw // 2
+            src = cv2.resize(small, (w2, h2), interpolation=cv2.INTER_AREA)
+            ms = cv2.resize(ms, (w2, h2), interpolation=cv2.INTER_AREA)
+            k = max(3, (k // 2) | 1)
+        else:
+            src = small
+        f = src.astype(np.float32)
         wgt = np.clip(1.0 - ms * 1.5, 0.0, 1.0)
-        wgt = cv2.erode(wgt, np.ones((3, 3), np.uint8))
+        wgt = cv2.erode(wgt, self._erode_k)
         num = cv2.GaussianBlur(f * wgt[..., None], (k, k), 0)
         den = cv2.GaussianBlur(wgt, (k, k), 0)[..., None]
         plain = cv2.GaussianBlur(f, (k, k), 0)
         t = np.clip(den * 8.0, 0.0, 1.0)
         out = t * (num / np.maximum(den, 1e-4)) + (1.0 - t) * plain
+        if src is not small:
+            out = cv2.resize(out, (self.lw, self.lh), interpolation=cv2.INTER_LINEAR)
         bgra = np.empty((self.lh, self.lw, 4), np.uint8)
         bgra[..., :3] = np.clip(out, 0, 255)
         bgra[..., 3] = 255
         return bgra
 
-    def compute(self, frame: np.ndarray, alpha_small: np.ndarray):
-        """返回 (a, b, bg): a/b 为 (lh, lw) float32 导向滤波系数, bg 为 (lh, lw, 4) BGRA"""
+    def compute(self, frame: np.ndarray, alpha_small: np.ndarray, small: np.ndarray | None = None):
+        """返回 (a, b, bg): a/b 为 (lh, lw) float32 导向滤波系数, bg 为 (lh, lw, 4) BGRA
+
+        small: 可选, 已经缩好的 (lh, lw, 3) 原图 (RVM 为了喂模型已经算过同一张 INTER_AREA 缩放)
+        """
         lw, lh = self.lw, self.lh
         alpha = self._alpha(alpha_small)
-        small = cv2.resize(frame, (lw, lh), interpolation=cv2.INTER_AREA)
+        if small is None or small.shape[:2] != (lh, lw):
+            small = cv2.resize(frame, (lw, lh), interpolation=cv2.INTER_AREA)
         I = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY).astype(np.float32) * (1.0 / 255.0)
         p = cv2.resize(alpha, (lw, lh), interpolation=cv2.INTER_LINEAR)
 
