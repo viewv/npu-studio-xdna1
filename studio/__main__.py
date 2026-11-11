@@ -220,7 +220,7 @@ def _main(status: Status) -> None:
         from .preview import PreviewShm
         preview = PreviewShm(a.preview_shm)
     status.emit("ready", device=out.device if out else None, backend=backend,
-                width=w, height=h, camera_fps=round(cam.fps), mode=a.mode)
+                width=w, height=h, camera_fps=round(cam.fps), mode=a.mode, matting=seg_desc)
 
     running = True
 
@@ -231,13 +231,21 @@ def _main(status: Status) -> None:
     signal.signal(signal.SIGINT, stop)
     signal.signal(signal.SIGTERM, stop)
 
+    child_cpu = getattr(seg, "child_cpu_time", None)
+
+    def cpu_total() -> float:
+        """本进程 + 抠像子进程 (rvm_worker) 的 CPU 时间; process_time() 不含子进程"""
+        t = time.process_time()
+        return t + child_cpu() if child_cpu else t
+
     seq, n = 0, 0
     t_seg = t_fx = t_out = t_prep = t_npu = 0.0
     t_start = t_report = time.perf_counter()
-    cpu_start = time.process_time()
+    cpu_start = cpu_total()
+    cpu_end = None
     # 每秒一个窗口的统计 (给前端的实时数字)
     win = dict(n=0, seg=0.0, fx=0.0, out=0.0, prep=0.0, accel=0.0)
-    win_t, win_cpu = time.perf_counter(), time.process_time()
+    win_t, win_cpu = time.perf_counter(), cpu_start
     try:
         while running:
             frame, seq = cam.read(seq)
@@ -277,7 +285,7 @@ def _main(status: Status) -> None:
                 now = time.perf_counter()
                 if now - win_t >= 1.0:
                     k = max(1, win["n"])
-                    cpu_now = time.process_time()
+                    cpu_now = cpu_total()
                     status.emit("stats", fps=round(win["n"] / (now - win_t), 1),
                                 seg_ms=round(win["seg"] / k * 1000, 2),
                                 fx_ms=round(win["fx"] / k * 1000, 2),
@@ -303,6 +311,7 @@ def _main(status: Status) -> None:
                       f"合成 {t_fx/n*1000:5.1f} ms | 输出 {t_out/n*1000:4.1f} ms", file=sys.stderr)
                 t_report = now
     finally:
+        cpu_end = cpu_total()                  # 必须在收掉 worker 之前读, 之后 /proc 就没了
         cam.close()
         close = getattr(seg, "close", None)    # RVM GPU 后端要收掉 worker 进程
         if close:
@@ -317,12 +326,13 @@ def _main(status: Status) -> None:
 
     if n and (a.bench or not a.snapshot):
         el = time.perf_counter() - t_start
-        cpu = time.process_time() - cpu_start
+        cpu = (cpu_end if cpu_end is not None else cpu_total()) - cpu_start
         detail = f" [CPU准备 {t_prep/n*1000:.1f} + {accel} {t_npu/n*1000:.1f}]" if accel else ""
         print(f"[studio] 共 {n} 帧, {n/el:.1f} fps  "
               f"(分割 {t_seg/n*1000:.1f} ms, 合成 {t_fx/n*1000:.1f} ms{detail}, 输出 {t_out/n*1000:.1f} ms; "
               f"每帧处理合计 {(t_seg+t_fx+t_out)/n*1000:.1f} ms)  "
-              f"CPU 时间 {cpu/n*1000:.1f} ms/帧 (约 {cpu/el*100:.0f}% 单核)", file=sys.stderr)
+              f"CPU 时间 {cpu/n*1000:.1f} ms/帧 (约 {cpu/el*100:.0f}% 单核"
+              f"{', 含抠像子进程' if child_cpu else ''})", file=sys.stderr)
 
 
 if __name__ == "__main__":

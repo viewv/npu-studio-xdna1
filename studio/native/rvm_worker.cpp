@@ -39,7 +39,8 @@ int main(int argc, char **argv) {
   net.opt.use_vulkan_compute = true;
   net.opt.num_threads = 1;
   // 780M 的 Vulkan 支持 fp16 存储/算术 (fp16-p/s/u/a=1/1/1/1)。实测比纯 fp32
-  // 快约 7%, 且输出与 fp32 完全一致; 不支持 fp16 的设备 ncnn 会自动退化。
+  // 快约 7%。输出不是逐位相同: 与 ORT fp32 比 pha 平均差 ~5e-4、最大 ~0.12 (个别
+  // 边缘像素), 肉眼看不出。不支持 fp16 的设备 ncnn 会自动退化。
   net.opt.use_fp16_packed = true;
   net.opt.use_fp16_storage = true;
   net.opt.use_fp16_arithmetic = true;
@@ -61,7 +62,6 @@ int main(int argc, char **argv) {
   std::vector<ncnn::Mat> state(4);
   std::uint32_t w = 0, h = 0;
   std::vector<unsigned char> frame;
-  double t_net = 0;
   int nf = 0;
 
   while (read_all(&w, 4) && read_all(&h, 4)) {
@@ -108,7 +108,6 @@ int main(int argc, char **argv) {
     if (!write_all(out.data(), out.size() * sizeof(float))) break;
     std::fflush(stdout);
     nf++;
-    (void)t_net;
   }
   if (nf) std::fprintf(stderr, "frames=%d\n", nf);
   return 0;

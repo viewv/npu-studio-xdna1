@@ -177,7 +177,8 @@ python3 -m studio --npu                  # NPU 后端虚拟摄像头
 **RVM 跑在 780M 核显上（ncnn + Vulkan）**，CPU 只剩缩放、1/4 准备和合成：
 
 ```bash
-# 一次性准备（产物已在仓库里，换机器才需要重跑）
+# 一次性准备。产物 (models/*.ncnn.*、third_party/rvm_worker) 在 .gitignore 里、只存在本机,
+# 新克隆或换机器后需要重跑这两步
 .venv/bin/python studio/native/convert_rvm.py --pnnx <pnnx> --onnxsim <onnxsim>
 bash studio/native/build_rvm_worker.sh      # 用 Arch 仓库的 ncnn，不需要 sudo/编译 ncnn
 
@@ -194,7 +195,7 @@ python -m studio --matting rvm --rvm-gpu --npu --high-fps
 | 合成（CPU 准备 4.6 + NPU 1.7） | 6.4 ms |
 | 输出 | 0.8 ms |
 | **合计 / 帧率** | **26.1 ms → 30.0 fps** |
-| **CPU 时间** | **10.0 ms/帧（0.30 核）** |
+| **CPU 时间** | **13 ms/帧（0.39 核，含 rvm_worker 子进程约 0.08 核）** |
 
 对比同一台机器上的三种抠像方案：
 
@@ -202,7 +203,13 @@ python -m studio --matting rvm --rvm-gpu --npu --high-fps
 |---|---|---|
 | MediaPipe 分割（阶段 1/2） | 30 fps | ~17 ms（0.5 核） |
 | RVM，CPU 4 线程 | 39 fps | 61 ms（2.4 核） |
-| **RVM，780M** | **30 fps** | **10 ms（0.30 核）** |
+| **RVM，780M** | **30 fps** | **13 ms（0.39 核）** |
+
+> CPU 时间口径：引擎统计 = 主进程 `process_time()` + 抠像子进程（`rvm_worker`）的 utime+stime。
+> 早期版本只算了主进程，少算了 worker 的 ~0.08 核，报成了 0.30 核。
+>
+> 精度：worker 打开了 ncnn 的 fp16 路径（快 ~7%）。与 ORT fp32 相比，`pha` 平均差 ~5e-4、
+> 最大 ~0.12（个别边缘像素），量化到 8 位后约 2% 像素差几级 —— 看不出来，但**不是逐位相同**。
 
 两个实现都保留：`studio/rvm.py` 是 ORT 版（有 ROCm 时自动走核显，否则 CPU），
 `studio/rvm_gpu.py` 是 ncnn+Vulkan 版（`--rvm-gpu`）。

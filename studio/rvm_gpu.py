@@ -11,8 +11,12 @@
     # 2) worker (用 Arch 仓库里带 Vulkan 的 ncnn, 不需要 sudo)
     bash studio/native/build_rvm_worker.sh
 
-实测 (7840HS, 720p): RVM 11.6 ms/帧; 整条流水线 26 ms / 8.3 ms CPU (0.32 核),
-对比 CPU 版 RVM 的 25.6 ms / 61 ms (2.4 核)。
+实测 (7840HS, 720p, 摄像头 30fps, 与 NPU 合成同时运行): RVM 约 19 ms/帧 (单独跑约 12 ms);
+整条流水线 30 fps, CPU 约 0.40 核 (其中 worker 自己约 0.08 核, 已计入引擎统计),
+对比 CPU 版 RVM 的 61 ms CPU (2.4 核)。
+
+精度: worker 打开了 ncnn 的 fp16 存储/运算, 与 ORT fp32 相比 pha 平均差约 5e-4,
+最大约 0.12 (个别边缘像素), 量化到 8 位后约 2% 像素差 1~几级 —— 肉眼看不出, 但不是逐位相同。
 
   from studio.rvm_gpu import RvmGpuMatting
   m = RvmGpuMatting()
@@ -20,6 +24,7 @@
 """
 from __future__ import annotations
 
+import os
 import struct
 import subprocess
 from pathlib import Path
@@ -57,6 +62,15 @@ class RvmGpuMatting:
 
     def reset(self) -> None:
         raise NotImplementedError("worker 的状态常驻进程; 要重置请重新构造")
+
+    def child_cpu_time(self) -> float:
+        """worker 子进程累计用掉的 CPU 秒数 (time.process_time() 不包含子进程)"""
+        try:
+            with open(f"/proc/{self.proc.pid}/stat") as f:
+                fields = f.read().rsplit(")", 1)[1].split()
+            return (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")   # utime + stime
+        except (OSError, ValueError, IndexError):
+            return 0.0
 
     def _read_exact(self, n: int) -> bytes:
         out = bytearray()
