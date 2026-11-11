@@ -5,3 +5,5 @@ snapshot*.png
 compare/
 third_party/
 .venv-iron/
+app/target/
+npu/rvm/*.npz
