@@ -70,6 +70,7 @@ def main():
     ap.add_argument("--pnnx", default="pnnx", help="pnnx 可执行文件")
     ap.add_argument("--onnxsim", default="onnxsim")
     ap.add_argument("--src", default=str(SRC))
+    ap.add_argument("--fp16", action="store_true", help="权重存 fp16 (Vulkan 上用, 更省带宽)")
     a = ap.parse_args()
     src = Path(a.src)
     tmp = Path(tempfile.mkdtemp(prefix="rvm_conv_"))
@@ -116,15 +117,18 @@ def main():
         raise SystemExit("形状冻结改变了输出, 停止")
 
     # 4) ncnn
-    run([a.pnnx, p3, "fp16=0"])
+    run([a.pnnx, p3, "fp16=1" if a.fp16 else "fp16=0"])
     param = tmp / "3_noexpand.ncnn.param"
     binf = tmp / "3_noexpand.ncnn.bin"
     if not param.exists():
         raise SystemExit("pnnx 没产出 .ncnn.param")
-    OUT_PARAM.write_bytes(param.read_bytes())
-    OUT_BIN.write_bytes(binf.read_bytes())
-    print(f"已生成 {OUT_PARAM.name} ({OUT_PARAM.stat().st_size} B) / "
-          f"{OUT_BIN.name} ({OUT_BIN.stat().st_size / 1e6:.1f} MB)")
+    tag = "fp16" if a.fp16 else "fp32"
+    out_param = OUT_PARAM.with_name(f"rvm_mobilenetv3_{tag}.ncnn.param")
+    out_bin = OUT_BIN.with_name(f"rvm_mobilenetv3_{tag}.ncnn.bin")
+    out_param.write_bytes(param.read_bytes())
+    out_bin.write_bytes(binf.read_bytes())
+    print(f"已生成 {out_param.name} ({out_param.stat().st_size} B) / "
+          f"{out_bin.name} ({out_bin.stat().st_size / 1e6:.1f} MB)")
     print("下一步: bash studio/native/build_rvm_worker.sh")
 
 
