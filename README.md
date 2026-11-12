@@ -156,6 +156,24 @@ python powerbench.py --backends rvm-npu,rvm-npu-noprep  # RVM@780M + NPU, 以及
 打平线是 6.7 ms。换成自写的 [`npu/kernels/conv3x3.cc`](npu/kernels/conv3x3.cc) 之后 0.95 ms，
 **每次卷积的整机能量比 CPU 低 86%**（两次测量的 CPU 行分别是不同日期的底噪，看比例即可）。
 
+#### RVM 编码器：NPU vs CPU（`powerbench_enc.py`）
+
+```bash
+python powerbench_enc.py --secs 15 --rounds 6     # 定速 30 fps, 同一进程按轮交替, 和空闲成对相减
+```
+
+7840HS、performance 调度，6 轮 × 15 s，编码器 MobileNetV3 @ 320×180（不含前处理、不含解码器）：
+
+| 30 fps 定速 | 比空闲多（整包） | 每帧 CPU 时间 |
+|---|---|---|
+| **NPU**（`npu/rvm/encoder_npu`，int8，9.2–11 ms/帧） | **+1.1 W**（中位 +1.0，标准误 0.2） | 1.7 ms（一个核的 5%） |
+| onnxruntime CPU fp32，1 线程（8.5 ms/帧） | +3.9 W（标准误 0.1） | 9.2 ms |
+| onnxruntime CPU fp32，4 线程（4.0 ms/帧） | +4.1 W（标准误 0.1） | 13.2 ms |
+
+NPU 慢一点（单帧延迟高），但在摄像头帧率下每秒省约 **2.9 W**、每帧少 7.5 ms CPU。
+NPU 每帧那 1.7 ms CPU 是主机侧：输入换布局 + 同步到设备 + XRT 派发。
+（脚本的第二段"连续跑满"每轮只测一次空闲，底噪漂移时边际不可信，只看 ms/帧。）
+
 ### 自写 3×3 卷积（`npu/conv3x3.py`）
 
 替代有缺陷的上游 `conv2dk3`（宽度写死 32、int8 版漏声明、第一组输出通道算错）。

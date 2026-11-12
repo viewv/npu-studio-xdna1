@@ -43,6 +43,12 @@
 - shim 分配（看 `input_with_addresses.mlir`）：shim c 的 MM2S0 = core c 输入、MM2S1 = core c 权重；
   core 0/1 的输出在 shim 0 的两个 S2MM，core 2/3 在 shim 1。
 
+## 功耗（`powerbench_enc.py`，30 fps 定速，6 轮成对相减）
+
+NPU 比空闲 +1.1 W（标准误 0.2），每帧 CPU 1.7 ms；onnxruntime CPU 1 线程 +3.9 W / 9.2 ms，4 线程 +4.1 W / 13.2 ms。
+→ 速度虽然还比 CPU 单线程慢一点，**在摄像头帧率下 NPU 编码器每秒省约 2.9 W**。所以继续把整个 RVM（解码器）搬上 NPU 是值得的；
+压速度的优先级降低（30 fps 的预算是 33 ms）。主机侧 1.7 ms/帧（换布局 + 同步 + 派发）是下一个可以省的 CPU。
+
 ## 下一步
 
 - **倒残差块融合**（升维 1×1 → dw → 投影 1×1 一层做完、中间张量留在 core 里）：12×20 段一个块现在 3 层、~30 步、3 次层间屏障。
