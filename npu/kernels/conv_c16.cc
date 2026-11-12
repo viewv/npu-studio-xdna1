@@ -42,6 +42,7 @@ namespace {
 
 struct Desc {
   int icp, ocp, wt, stride, k, shift, nxc, plane;
+  int sgn; // 输出 int8 饱和 (非 ReLU 激活; HardSigmoid / hardswish 由 post_act 接着做)
 };
 
 // 4 像素 × 16 通道 → (低 8 通道 A, 高 8 通道 A)
@@ -61,21 +62,13 @@ inline void mac2(MM &c0, MM &c1, const V64 &a, const int8_t *w) {
   c1.mac(hi, ::aie::load_v<64>(w + 192));
 }
 
-// 输出 4 像素 × 16 通道 (64 B); 超出真实宽度写 0
-// HardSigmoid: int8 饱和, 再 +128 (异或 0x80) → uint8, 128 = 0.5。nv = 这 4 个像素里有几个在真实宽度内
-// (HardSigmoid(0) ≠ 0, 宽度外的像素要另外清零)。只有 SE 的 FC2 用, 不内联省程序内存
-// (按值传向量: 传累加器引用会让调用方把累加器放到栈上, 1 KB 的栈就溢出了)
-__attribute__((noinline)) void store4h(uint8_t *o, V32 v0, V32 v1, int nv) {
-  auto [p, q] = ::aie::interleave_zip(v0, v1, 8);
-  const auto m = ::aie::broadcast<uint8, 32>(0x80);
-  ::aie::store_v(o, ::aie::bit_xor(p.template cast_to<uint8>(), m));
-  ::aie::store_v(o + 32, ::aie::bit_xor(q.template cast_to<uint8>(), m));
-  for (int b = nv * 16; b < 64; b++) o[b] = 0;
-}
-
-inline void store4(uint8_t *o, MM &c0, MM &c1, int shift, bool valid, int act = 0, int nv = 4) {
-  if (valid && act) {
-    store4h(o, c0.template to_vector<int8>(shift), c1.template to_vector<int8>(shift), nv);
+// 输出 4 像素 × 16 通道 (64 B); 超出真实宽度写 0; sgn: int8 饱和 (否则 uint8 饱和 = ReLU)
+inline void store4(uint8_t *o, MM &c0, MM &c1, int shift, bool valid, int sgn) {
+  if (valid && sgn) {
+    auto [p, q] = ::aie::interleave_zip(c0.template to_vector<int8>(shift),
+                                        c1.template to_vector<int8>(shift), 8);
+    ::aie::store_v((int8_t *)o, p);
+    ::aie::store_v((int8_t *)o + 32, q);
   } else if (valid) {
     auto [p, q] = ::aie::interleave_zip(c0.template to_vector<uint8>(shift),
                                         c1.template to_vector<uint8>(shift), 8);
@@ -114,8 +107,8 @@ void conv3s1(int8_t **rows, const int8_t *w0, uint8_t *out, const Desc &d, int p
         w += 768;
       }
     }
-    store4(out + x * 16, c00, c01, d.shift, px0 + x < wvalid);
-    store4(out + (x + 4) * 16, c10, c11, d.shift, px0 + x + 4 < wvalid);
+    store4(out + x * 16, c00, c01, d.shift, px0 + x < wvalid, d.sgn);
+    store4(out + (x + 4) * 16, c10, c11, d.shift, px0 + x + 4 < wvalid, d.sgn);
   }
 }
 
@@ -151,8 +144,8 @@ void conv3s2(int8_t **rows, const int8_t *w0, uint8_t *out, const Desc &d, int p
         w += 768;
       }
     }
-    store4(out + x * 16, c00, c01, d.shift, px0 + x < wvalid);
-    store4(out + (x + 4) * 16, c10, c11, d.shift, px0 + x + 4 < wvalid);
+    store4(out + x * 16, c00, c01, d.shift, px0 + x < wvalid, d.sgn);
+    store4(out + (x + 4) * 16, c10, c11, d.shift, px0 + x + 4 < wvalid, d.sgn);
   }
 }
 
@@ -163,7 +156,7 @@ inline ::aie::accum<acc32, 32> ld_acc(const int32_t *p) {
 }
 
 void conv1(const int8_t *r1, const int8_t *w0, uint8_t *out, const Desc &d, int px0, int wvalid,
-           int32_t *acc, int first, int last, int act) {
+           int32_t *acc, int first, int last) {
   for (int x = 0; x < CW; x += 8) {
     if (px0 + x >= wvalid) { // 整组都是补出来的列 (acc 也不用管: 收尾步会写零)
       if (last) {
@@ -192,8 +185,8 @@ void conv1(const int8_t *r1, const int8_t *w0, uint8_t *out, const Desc &d, int 
       w += 256;
     }
     if (last) {
-      store4(out + x * 16, c00, c01, d.shift, px0 + x < wvalid, act, wvalid - (px0 + x));
-      store4(out + (x + 4) * 16, c10, c11, d.shift, px0 + x + 4 < wvalid, act, wvalid - (px0 + x + 4));
+      store4(out + x * 16, c00, c01, d.shift, px0 + x < wvalid, d.sgn);
+      store4(out + (x + 4) * 16, c10, c11, d.shift, px0 + x + 4 < wvalid, d.sgn);
     } else {
       ::aie::store_v(ap, c00.template to_vector<int32>(0));
       ::aie::store_v(ap + 32, c01.template to_vector<int32>(0));
@@ -230,9 +223,13 @@ inline void dw_row(ACC64 &a, const V64 &L, const V64 &C, const V64 &R, const int
   }
 }
 
+inline V64U cvt(const ACC64 &a, int shift, int sgn) {
+  return sgn ? a.template to_vector<int8>(shift).template cast_to<uint8>() : a.template to_vector<uint8>(shift);
+}
+
 template <int K, int D, int S>
 __attribute__((noinline)) void dwconv(const int8_t *elem, const int8_t *w0, uint8_t *out, int rstride, int shift,
-                                      int px0, int wvalid) {
+                                      int px0, int wvalid, int sgn) {
   for (int x = 0; x < CW; x += 8) {
     if (px0 + x >= wvalid) {
       ::aie::store_v(out + x * 16, ::aie::zeros<uint8, 64>());
@@ -253,12 +250,10 @@ __attribute__((noinline)) void dwconv(const int8_t *elem, const int8_t *w0, uint
         w += K * 64;
       }
       if constexpr (S == 1) {
-        ::aie::store_v(out + x * 16, px0 + x < wvalid ? a0.template to_vector<uint8>(shift) : ::aie::zeros<uint8, 64>());
-        ::aie::store_v(out + (x + 4) * 16,
-                       px0 + x + 4 < wvalid ? a1.template to_vector<uint8>(shift) : ::aie::zeros<uint8, 64>());
+        ::aie::store_v(out + x * 16, px0 + x < wvalid ? cvt(a0, shift, sgn) : ::aie::zeros<uint8, 64>());
+        ::aie::store_v(out + (x + 4) * 16, px0 + x + 4 < wvalid ? cvt(a1, shift, sgn) : ::aie::zeros<uint8, 64>());
       } else {
-        const V64U e = ::aie::filter_even(::aie::concat(a0.template to_vector<uint8>(shift),
-                                                        a1.template to_vector<uint8>(shift)), 16);
+        const V64U e = ::aie::filter_even(::aie::concat(cvt(a0, shift, sgn), cvt(a1, shift, sgn)), 16);
         ::aie::store_v(out + (x + 4 * h2) * 16, px0 + x + 4 * h2 < wvalid ? e : ::aie::zeros<uint8, 64>());
       }
     }
@@ -281,8 +276,8 @@ __attribute__((noinline)) void se_load(const uint8_t *e, uint8_t *sc, int r, int
 
 // SE 的逐通道乘折进这一步的 1×1 权重 (原地, 每步一次): W'[o][i] = (W[o][i]·s[i] + 128) >> 8。
 // 权重 [ocp][icp][h][ob][ic8][oc8]: 一个 64 B 块的第 i 个字节对应输入通道 h·8 + i/8 → 缩放模式 = 8 个 s 各重复 8 次
-__attribute__((noinline)) void se_wscale(int8_t *w, const uint8_t *sc, int nicp, int nocp) {
-  for (int icp = 0; icp < nicp; icp++) {
+__attribute__((noinline)) void se_wscale(int8_t *w, const uint8_t *sc, int n, int nicp, int nocp) {
+  for (int icp = 0; icp < n; icp++) {
     const V16U s16 = ::aie::load_v<16>(sc + icp * 16);
     const auto [a0, a1] = ::aie::interleave_zip(s16, s16, 1);       // s0 s0 s1 s1 … (每个 2 次)
     for (int h = 0; h < 2; h++) {
@@ -303,19 +298,21 @@ __attribute__((noinline)) void se_wscale(int8_t *w, const uint8_t *sc, int nicp,
   }
 }
 
-// 全局平均池化: 元素 = 一个通道组的 kr 行 (每行 X 字节, 前 nvec·64 字节是整行含零边);
-// r = 本组第几个元素; 16 个通道的和在 acc[0..15] (int32) 里跨调用累加, last 时出 640 B 块
-__attribute__((noinline)) void se_pool(const uint8_t *e, int32_t *acc, uint8_t *out, int r, int last,
+// 全局平均池化: 元素 = 一个通道组的 kr 行 (每行 X 字节, 前 nvec·64 字节是整行含零边), 是这个组的第 e 个元素;
+// 16 个通道的和在 acc[16·g ..] (int32) 里跨调用累加 (e == 0 时从零开始), last 时出 640 B 块
+__attribute__((noinline)) void se_pool(const uint8_t *e, int32_t *acc, uint8_t *out, int ei, int last,
                                        const int32_t *h) {
-  const int H = h[34], kr = h[35], X = h[36], nvec = h[37], M = h[38], S = h[39];
-  const V32U ones = ::aie::broadcast<uint8, 32>(1);
+  const int H = h[34], kr = h[35], X = h[36], nvec = h[37], M = h[38], S = h[39], sg = h[47];
   ACC32 a0 = ::aie::zeros<acc32, 32>(), a1 = ::aie::zeros<acc32, 32>();
-  int kv = H - r * kr;
+  int kv = H - ei * kr;
   if (kv > kr) kv = kr;
+  // 输入是 int8 (sg) 时异或 0x80 变成 uint8 (x + 128), 收尾时减掉 128 × 像素数 (零边也算在内, 0 → 128 → 0)
+  const V32U ones = ::aie::broadcast<uint8, 32>(1);
+  const V64U flip = ::aie::broadcast<uint8, 64>(sg ? 0x80 : 0);
   for (int i = 0; i < kv; i++) {
     const uint8_t *p = e + i * X;
     for (int v = 0; v < nvec; v++) {
-      const V64U x = ::aie::load_v<64>(p);
+      const V64U x = ::aie::bit_xor(::aie::load_v<64>(p), flip);
       a0 = ::aie::mac(a0, x.extract<32>(0), ones);
       a1 = ::aie::mac(a1, x.extract<32>(1), ones);
       p += 64;
@@ -323,16 +320,43 @@ __attribute__((noinline)) void se_pool(const uint8_t *e, int32_t *acc, uint8_t *
   }
   const ::aie::vector<int32, 32> t = ::aie::add(a0.template to_vector<int32>(0), a1.template to_vector<int32>(0));
   ::aie::vector<int32, 16> sum = ::aie::add(t.extract<16>(0), t.extract<16>(1));
-  if (r > 0) sum = ::aie::add(sum, ::aie::load_v<16>(acc));
+  if (ei > 0) sum = ::aie::add(sum, ::aie::load_v<16>(acc));
   if (!last) {
     ::aie::store_v(acc, sum);
     return;
   }
+  if (sg) sum = ::aie::sub(sum, 128 * 4 * H * nvec);
   for (int i = 64; i < CW * 16; i += 64) ::aie::store_v(out + i, ::aie::zeros<uint8, 64>());
-  // (Σ·M + 2^(S-1)) >> S, 饱和到 uint8 (M < 2^15)
+  // (Σ·M + 2^(S-1)) >> S, 饱和到 uint8 / int8 (M < 2^15)
   const ::aie::accum<acc64, 16> m = ::aie::mul(sum, ::aie::broadcast<int16, 16>((int16_t)M));
-  const V32U lo = ::aie::concat(m.template to_vector<uint8>(S), ::aie::zeros<uint8, 16>());
+  const V16U r = sg ? m.template to_vector<int8>(S).template cast_to<uint8>() : m.template to_vector<uint8>(S);
+  const V32U lo = ::aie::concat(r, ::aie::zeros<uint8, 16>());
   ::aie::store_v(out, ::aie::concat(lo, ::aie::zeros<uint8, 32>()));
+}
+
+// 输出块的后处理 (块里已经是 int8 饱和的 y): act 1 HardSigmoid = y + 128 (宽度外的像素清零, HardSigmoid(0) ≠ 0);
+// act 3 hardswish = sat8((y · clamp(y + q3, 0, q6) + 2^(s2-1)) >> s2) (q3 / q6 = 3 / 6 在 y 上的整数值)
+__attribute__((noinline)) void post_act(uint8_t *o, int act, int nv, int q3, int q6, int s2) {
+  if (act == 1) {
+    const auto m = ::aie::broadcast<uint8, 64>(0x80);
+#pragma clang loop unroll(disable)
+    for (int i = 0; i < CW * 16; i += 64) ::aie::store_v(o + i, ::aie::bit_xor(::aie::load_v<64>(o + i), m));
+#pragma clang loop unroll(disable)
+    for (int p = nv < 0 ? 0 : nv; p < CW; p++) ::aie::store_v(o + p * 16, ::aie::zeros<uint8, 16>());
+    return;
+  }
+  // 每轮 4 个互不依赖的 32 B (编译器不做软件流水; 一条链 load → … → mul → srs 约 22 个周期, 4 条交错着走)
+  int8_t *q = (int8_t *)o;
+  const ::aie::vector<int16, 32> c3 = ::aie::broadcast<int16, 32>((int16_t)q3);
+#pragma clang loop unroll(disable)
+  for (int i = 0; i < CW * 16; i += 128) {
+    ::aie::vector<int16, 32> y[4];
+    ::aie::accum<acc32, 32> m[4];
+    for (int u = 0; u < 4; u++) y[u] = ::aie::unpack(::aie::load_v<32>(q + i + 32 * u));
+    for (int u = 0; u < 4; u++)
+      m[u] = ::aie::mul(y[u], ::aie::min(::aie::max(::aie::add(y[u], c3), (int16_t)0), (int16_t)q6));
+    for (int u = 0; u < 4; u++) ::aie::store_v(q + i + 32 * u, m[u].template to_vector<int8>(s2));
+  }
 }
 
 } // namespace
@@ -343,21 +367,30 @@ extern "C" {
 //        int32[26] dilation  int32[27] depthwise  int32[28] depthwise 输入元素的行步长 (= m·PLANE)
 // 每个 core c 一段 (字节 32 + 16c 起, u16): [0] rows [1] sel_s1 [2] sel_s2 [3] wvalid [4] 每行块数
 //                                          [5] sel_acc [6] sel_fin
-//        int32[29] 输出激活 (0 ReLU, 1 HardSigmoid)  [30] 输入逐通道乘 sc  [31] 这一步的输入通道组起点
-//        [32] 层第一步之前装载 sc 的元素数 (core 程序读)  [33] 池化段 (core 程序读)  [34..39] 池化参数
-//        [40] 缩放张量每元素的组数  [41] 缩放张量的组步长
+//        int32[29] 输出激活 (0 ReLU, 1 HardSigmoid, 2 线性 int8, 3 hardswish)  [44..46] hardswish 的 q3 q6 s2  [30] 输入逐通道乘 sc  [31] 这一步的输入通道组起点
+//        [33] 池化 (1 累加步, 2 收尾步)  [34..39] 池化参数  [43] 池化每组元素数 ne  [47] 池化输入是 int8
+//        [40] 缩放张量每元素的组数  [41] 缩放张量的组步长  [42] 本步是"装 SE 缩放向量"  [48] SE 只乘前几个输入通道组
 // r = 本 core 这一步里的行号 (只有 IC 分块用来定位 acc)
 void convC16Chunk(int8_t *r0, int8_t *r1, int8_t *r2, int8_t *wts, uint8_t *out, int32_t *acc, uint8_t *sc,
                   int32_t j, int32_t r, int32_t core) {
   ::aie::set_saturation(::aie::saturation_mode::saturate);
   ::aie::set_rounding(::aie::rounding_mode::positive_inf);
   const int32_t *h = (const int32_t *)wts;
-  if (j < 0) { // 特殊调用: -1 装载 SE 缩放向量的第 r 个元素, -2 / -3 池化累加 / 池化收尾
-    if (j == -1) se_load((const uint8_t *)r0, sc, r, h[40], h[41]);
-    else se_pool((const uint8_t *)r0, acc, out, r, j == -3, h);
+  if (h[42]) { // 装 SE 缩放向量 (累加段, r = 第几个元素)
+    se_load((const uint8_t *)r0, sc, r, h[40], h[41]);
     return;
   }
-  const Desc d{h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]};
+  if (h[33]) { // 池化: 累加步 r = 组 · (ne-1) + 元素号; 收尾步 r = 组 (元素号 ne-1)
+    const int ne1 = h[43] - 1;
+    if (h[33] == 1) {
+      const int g = r / ne1;
+      se_pool((const uint8_t *)r0, acc + g * 16, out, r - g * ne1, 0, h);
+    } else {
+      se_pool((const uint8_t *)r0, acc + r * 16, out, ne1, 1, h);
+    }
+    return;
+  }
+  const Desc d{h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], h[29] != 0};
   const uint16_t *pc = (const uint16_t *)(wts + 32 + 16 * core);
   const int wvalid = pc[3];
   const int ocp = j / d.nxc, xc = j - ocp * d.nxc;
@@ -368,25 +401,28 @@ void convC16Chunk(int8_t *r0, int8_t *r1, int8_t *r2, int8_t *wts, uint8_t *out,
     const int8_t *e = r0 + ocp * d.plane;
     const int8_t *wd = w + ocp * (d.k * d.k * 64);
     const int key = d.k * 100 + h[26] * 10 + d.stride;      // RVM 用到的 5 种组合
-    if (key == 311) dwconv<3, 1, 1>(e, wd, out, h[28], d.shift, px0, wvalid);
-    else if (key == 312) dwconv<3, 1, 2>(e, wd, out, h[28], d.shift, px0, wvalid);
-    else if (key == 511) dwconv<5, 1, 1>(e, wd, out, h[28], d.shift, px0, wvalid);
-    else if (key == 512) dwconv<5, 1, 2>(e, wd, out, h[28], d.shift, px0, wvalid);
-    else if (key == 521) dwconv<5, 2, 1>(e, wd, out, h[28], d.shift, px0, wvalid);
+    if (key == 311) dwconv<3, 1, 1>(e, wd, out, h[28], d.shift, px0, wvalid, d.sgn);
+    else if (key == 312) dwconv<3, 1, 2>(e, wd, out, h[28], d.shift, px0, wvalid, d.sgn);
+    else if (key == 511) dwconv<5, 1, 1>(e, wd, out, h[28], d.shift, px0, wvalid, d.sgn);
+    else if (key == 512) dwconv<5, 1, 2>(e, wd, out, h[28], d.shift, px0, wvalid, d.sgn);
+    else if (key == 521) dwconv<5, 2, 1>(e, wd, out, h[28], d.shift, px0, wvalid, d.sgn);
   } else if (d.k == 1) {
     const int first = h[24], last = h[25];
     const int nch = pc[4];
     if (h[30]) { // SE: 这一步第一次调用时把缩放折进权重 (组 h[31].. 是这一步的输入通道组), 然后清掉标志
-      se_wscale(wts + HDR, sc + h[31] * 16, d.icp, d.ocp);
+      const int n = h[48] - h[31] < d.icp ? h[48] - h[31] : d.icp; // 拼进来的残差组不乘
+      if (n > 0) se_wscale(wts + HDR, sc + h[31] * 16, n, d.icp, d.ocp);
       ((int32_t *)wts)[30] = 0;
     }
     conv1(r1, w + ocp * (d.icp * 256), out, d, px0, wvalid, acc + (r * nch + j) * (CW * 16), first,
-          last, h[29]);
+          last);
   } else if (d.stride == 2) {
     conv3s2(rows, w + ocp * (9 * d.icp * 256), out, d, px0, wvalid);
   } else {
     conv3s1(rows, w + ocp * (9 * d.icp * 256), out, d, px0, wvalid);
   }
+  if ((h[29] == 1 || h[29] == 3) && h[25]) // IC 分块的中间步 (last = 0) 没有输出
+    post_act(out, h[29], wvalid - px0, h[44], h[45], h[46]);
 }
 
 } // extern "C"

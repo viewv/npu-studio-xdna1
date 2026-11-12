@@ -37,17 +37,20 @@ python -m npu.check --quick       # 只跑 720p 和较短的链, 快一半
 ## 整网串联框架一页纸（细节见 `references/chain-framework.md`）
 
 - 一次调用 = 一个 runtime sequence；每层一个或几个 task group，层间靠 drain `wait=True` 当屏障。激活全在 DDR，主机不参与。
-  层可以读任意更早的张量（`Layer.src`，SE 的投影层读 4 个张量之前的 dw 输出），每个中间张量一个自己的 scratch 槽。
+  层可以读任意更早的张量（`Layer.src`，SE 的投影层读 4 个张量之前的 dw 输出），每个存储张量一个自己的 scratch 槽。
+  **通道拼接**（`Layer.cat`）：两个张量放进同一块存储（后一个排在前一个的通道组后面），读的层把它们当一个更宽的输入。
 - 激活布局 **16 通道像素** `[H+2·BR][C/16][PAD + Ws + PAD][16]`，上下 BR=4 行零边、左右 PAD=4 像素零边，存储宽度 Ws 补到 40 的倍数；
   **边和补宽列永远是零、从不写**（内核把有效宽度外的输出写 0）。fill/drain 用 TAP 直接从整幅布局里切条带。
 - **ObjectFifo 元素大小对所有层固定**：输入 7680 B（多读的是垃圾，内核不看）、输出 640 B（1 个通道组 × 40 像素）、权重 e_w（补到 256 的倍数）。
 - **一个权重元素 = 一步**。权重头（128 B）写着这一步干什么：形状、每 core 的行数/有效宽度/选哪段循环。
-  core 程序与层的形状、层数都无关（`.text` ≈ 14 KB），6 段循环：装缩放向量、s1 滑窗、s2、累加、收尾、池化。
+  core 程序与层的形状、层数都无关（`.text` ≈ 14.4 KB，其中 core 程序 3.2 KB），只有 4 段循环：s1 滑窗、s2、累加、收尾。
+  池化、装 SE 缩放向量这类"不是卷积"的步也塞进累加 / 收尾段，靠权重头里的标志让内核分派——**加新步类型时先这么做，别加段**（每段约 0.6 KB）。
 - 层模式：`full`（整层一步）、`oc`（权重太大，按输出通道切块，输入用步长 0 重读）、`ict`（1×1 输入太宽，按输入通道切步，部分和在 core 本地 int32）、
   `dw`（depthwise，DMA 把每个输出行要的 k 行打进一个元素）、`pool`（全局平均池化，按通道组分 core）。
   低分辨率的 oc 层、以及 1 行的 FC 层（含 ict）用 **OC 并行**（每 core 不同通道块、全部行）。
 - 当前支持：普通 3×3（s1/s2）、1×1、depthwise 3×3/5×5（s1/s2、dilation 2）、**SE**（池化 → FC1 → FC2 HardSigmoid →
-  投影层逐通道乘，乘法折进投影层权重），ReLU / HardSigmoid 输出，per-layer shift 量化。
+  投影层逐通道乘，乘法折进投影层权重）、**残差加**（拼接 + 单位权重），输出激活 ReLU / HardSigmoid / 线性 / **hardswish**，
+  per-layer shift 量化。激活在入口函数末尾对整个输出块做（`post_act`），卷积内核只分 uint8 / int8 饱和两种存法。
 
 ## 硬规则（每条都踩过；症状和来龙去脉见 `references/pitfalls.md`）
 
@@ -62,9 +65,11 @@ python -m npu.check --quick       # 只跑 720p 和较短的链, 快一半
 6. **一行里多个平面的指针不能写 `base + 编译期常量`**（偏移 ≥ 1024 B 时 llvm-aie 读错地址）。用 `rowops::plane_stride(N)` 或运行时值。`npu.check` 的探针会告诉你 bug 还在不在。
 7. **`acquire(1)` 返回的是元素本身，不是列表**；`win[0]` 会变成取一个字节（编译报 operand type mismatch）。
 8. **JIT 缓存键不含头文件、`harness.py`、模块级常量和 Plan 逻辑**。改了这些（例如 `chain_c16.py` 里的 `E_IN`、`W_MAX`）必须 `rm -rf ~/.npu/cache/*`，否则静默跑旧二进制。
-9. **内存预算**：每 core 数据约 58.5/64 KB（输入 4×7.5 + 权重 18.3 + acc 7.5 + 输出/dummy 1.9 + SE 缩放 1），**程序 14.0/16 KB**（只剩 2 KB）。
+9. **内存预算**：每 core 数据约 58.5/64 KB（输入 4×7.5 + 权重 18.3 + acc 7.5 + 输出/dummy 1.9 + SE 缩放 1），**程序 14.4/16 KB**（只剩 1.6 KB）。
    加缓冲区、加内核分支前先算账；`llvm-nm --size-sort -S -C main_core_0_2.elf` 看是哪个函数涨了（`core_0_2` 是 core 程序，`convC16Chunk` 是入口）。
 10. **激活函数在 0 处不为 0 时（HardSigmoid、以后的 bias）要显式把有效宽度外的像素写 0**：ReLU 版靠"零输入 → 零输出"，换了激活就会把补宽列写脏（`check` 报 999）。
+11. **Peano 不给循环做软件流水**：短的逐元素循环（load → 几条运算 → mul → srs → store）每轮都串着等延迟（实测约 22 周期 / 32 B）。
+    手动每轮处理 4 个互不依赖的向量（小的定长数组、完全展开，会进寄存器——用 `llvm-objdump -d` 确认没有 sp 访问），快 2 倍。
 
 ## 加一个新算子 / 新层类型的流程
 
@@ -80,7 +85,8 @@ python -m npu.check --quick       # 只跑 720p 和较短的链, 快一半
 - 单层调用里固定成本（XRT 派发 + 流水线启停，0.25–0.4 ms）占大头，**会误导**。用 deep/mnv3 链按前缀逐层加，看边际。
 - 拆"纯计算 vs 额外开销"：内核每行重复调用 r = 1/2/3 次（`--compute`），对 r 的斜率是纯计算。
 - 中位数受机器负载影响很大，同时看最快值；判据"每层额外开销 ≤ 0.1 ms"。
-- 现在的数字：MobileNetV3 主干 27 层 ≈ 4.9–5.2 ms，加 4 个 SE（39 层）≈ 5.5–5.9 ms（每个 SE ≈ 0.14 ms）；12×20 高通道段 13 层 ≈ 2.4–2.6 ms；每层额外 ≈ 0.1–0.12 ms。
+- 现在的数字：MobileNetV3 主干 27 层 ≈ 4.9–5.2 ms，加 4 个 SE ≈ 5.5–5.8 ms，再换真实激活（hardswish）≈ 5.9–6.1，再加 4 个残差（`mnv3r`）≈ 6.2–6.3 ms；
+  12×20 高通道段 13 层 ≈ 2.4–2.6 ms；每层额外 ≈ 0.1–0.12 ms。
 
 ## 调试挂死 / 算错
 
@@ -94,8 +100,8 @@ python -m npu.check --quick       # 只跑 720p 和较短的链, 快一半
 
 ## 现状和待办（详见 `references/chain-framework.md` 末尾）
 
-- RVM 85 个卷积：普通 3×3、1×1、depthwise、SE 都能跑了；还缺 **hardswish / 残差加**（最好融进卷积尾部）、
-  解码器的 **Concat / Resize / ConvGRU**，以及接真实量化权重、对 onnxruntime 比精度、接入 studio。
-- 程序内存只剩约 2 KB：下一个算子之前先想办法省（合并 core 循环段、把少用的分支挪出入口函数）。
+- RVM 编码器的算子都有了：普通 3×3、1×1、depthwise、SE、hardswish、残差加（`mnv3r`：真实激活 + 4 个 SE + 4 个残差，39 层逐字节一致）。
+  还缺解码器的 **Concat（拼接视图已有）/ Resize / ConvGRU**，以及接真实量化权重、对 onnxruntime 比精度、接入 studio。
+- 程序内存只剩约 1.6 KB：再加内核分支之前先省（把少用的分支挪成 noinline、合并相似的 dw 模板）。
 - 已知性能债：12×20 的 IC 分块层（输入按 OC 份数重读）、12×20 的 5×5 dilation 2 depthwise（步数多）、通用 3×3 只有专用版 61% 的速度、宽 20 补成 40。
 - RVM 真实形状表：`docs/npu-spikes/rvm_convs_180x320.tsv`（onnxruntime 在工作分辨率 320×180 下跑出来的）。

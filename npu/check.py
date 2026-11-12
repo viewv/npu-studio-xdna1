@@ -39,6 +39,7 @@ def _cases(quick: bool):
     from . import chain_c16
     yield "chain_c16 enc 13 层", lambda: chain_c16.selftest("enc", 10)
     yield "chain_c16 se135 SE 块", lambda: chain_c16.selftest("se135", 10)       # 池化 / FC / HardSigmoid / 逐通道乘
+    yield "chain_c16 res144 残差", lambda: chain_c16.selftest("res144", 10)      # hardswish / 有符号池化 / 拼接残差 / IC 分块
     if not quick:
         yield "chain_c16 low 25 层", lambda: chain_c16.selftest("low", 10)
         yield "chain_c16 deep 13 层", lambda: chain_c16.selftest("deep", 10)   # OC / IC 分块
@@ -46,6 +47,8 @@ def _cases(quick: bool):
         yield "chain_c16 se39 SE 块", lambda: chain_c16.selftest("se39", 10)     # 投影层 full 模式
         yield "chain_c16 se95 SE 块", lambda: chain_c16.selftest("se95", 10)     # 投影层 IC 分块
         yield "chain_c16 mnv3se 39 层", lambda: chain_c16.selftest("mnv3se", 10)  # 主干 + 4 个 SE
+        yield "chain_c16 res24 残差", lambda: chain_c16.selftest("res24", 10)     # 45×80 残差 (full 模式)
+        yield "chain_c16 mnv3r 39 层", lambda: chain_c16.selftest("mnv3r", 10)    # 真实激活 + SE + 4 个残差 (含 IC 切行)
 
 
 def _probe():

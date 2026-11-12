@@ -15,6 +15,7 @@
 | 5 | `rvm-npu-tiling-spike.md` | 高通道层的 OC / IC 分块、OC 并行、补宽列不读；task group 里 fill 太多会挂死 | `npu/chain_c16.py` |
 | 6 | `rvm-npu-dw-spike.md` | depthwise 3×3/5×5、stride 2、dilation 2；栈溢出 | `npu/chain_c16.py`、`conv_c16.cc` |
 | 7 | `rvm-npu-se-spike.md` | SE：全局平均池化、FC、HardSigmoid、逐通道乘折进权重；层间分支 | `npu/chain_c16.py`、`conv_c16.cc` |
+| 8 | `rvm-npu-act-res-spike.md` | 省程序内存；hardswish / 线性输出；残差加 = 通道拼接 + 单位权重；IC 切行 | `npu/chain_c16.py`、`conv_c16.cc` |
 
 `rvm_convs_180x320.tsv`：RVM（MobileNetV3）85 个卷积在工作分辨率 320×180 下的实测形状和 MAC 数（onnxruntime 跑出来的）。
 
