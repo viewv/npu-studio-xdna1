@@ -1,0 +1,69 @@
+# 踩过的坑（症状 → 原因 → 怎么办）
+
+都是在这台机器、IRON 1.3.4 + llvm-aie 21.0.0.2026062301 上实测出来的。升级工具链后可能变化——
+`npu.check` 里的编译器探针和 `chain_c16` 的几条链就是用来发现这些变化的。
+
+## 编译器 / 工具链
+
+### llvm-aie：基址 + 编译期常量偏移 ≥ 1024 B 读错地址
+- **症状**：不报错，部分 lane 错（合成内核里 x%4 ∈ {0,1} 的像素错；1280 宽对、1920 宽错）。
+- **原因**：非对齐向量加载 `base + CONST`，CONST ≥ 1024 B 时被折成 post-increment 形式（`vlda wl, [p], #off`），先用基址加载、后加偏移。992 B 还是对的。
+- **办法**：一行里多个平面的偏移一律用运行时值：`rowops::plane_stride(N)`（`npu/lib/row_ops.h`，volatile 读一次）。`python -m npu.offset_probe` 会报告 bug 还在不在。
+- 详细定位过程（汇编对比、探针）在 `docs/npu-spikes/npu-roadmap-analysis.md` 和 `docs/npu-spikes/aie-compiler-bug/`。
+
+### IRON：运行时次数循环里的 acquire/release 不平衡 → 编译失败
+- **症状**：`'aie.objectfifo.acquire' op cannot statically analyze cyclostatic acquire pattern: acquire/release is inside a conditional`。
+- **原因**：ObjectFifo 下降要静态推算每次 acquire 时的持有数。循环次数是运行时值时，循环体必须"进入时持有 n、出来时还持有 n"。
+- **办法**：stride 1 滑窗在循环前 `acquire(2)`，循环体 `acquire(3) … release(1)`，循环后 `release(2)`。
+  这样行数、块数都能从描述符读（`range_` 接受 MLIR Value：`memref.load` → `arith.index_cast`，见 `chain_c16._u16`）。
+
+### IRON：`acquire(3)/release(2)` 的 stride 2 滑窗 → 挂死
+- **症状**：`ERT_CMD_STATE_TIMEOUT`，只在 stride 2 层前面有 `range_(≥2)` 的层循环时出现（如 A,A,B）。
+- **原因**：下降后的行循环没剥第一次迭代，每次迭代都按"再取 3 个"上锁（应为 2）→ 多等 1 个对象。`input_with_addresses.mlir` 里能看到循环体内的 `AcquireGreaterEqual, 3`。
+- **办法**：s2 不共享行：DMA 给每个输出行发完整 3 行（TAP `[R, 3, ICP, PLANE]`，步长 `[2·行, 行, 块, 1]`），core `acquire(3)/release(3)`。代价 DMA ×1.5。
+
+### `acquire(1)` 返回元素本身
+- **症状**：`'func.call' op operand type mismatch: expected 'memref<7680xi8>', but provided 'i8'`。
+- **办法**：`win = f.acquire(1)` 直接传 `win`；`acquire(n ≥ 2)` 才是可下标的列表。
+
+### 栈溢出（core 默认栈 1 KB）
+- **症状**：不报错，结果错乱；或者连普通层也挂死。dw spike 里一个只在 stride 2 分支用的 `ACC64 a[4]` + `V64 v[6]`，
+  因为函数被内联进入口，让**所有**调用都分了 1.4 KB 的栈帧。
+- **办法**：内核里不要放向量/累加器数组，按需重算或分批；大函数 `__attribute__((noinline))`；
+  确实要大栈就设 `stack_size`（`RowPipeline(..., stack_size=8192)` / Worker 参数），上限约 16 KB。
+
+### JIT 缓存不认头文件和 Python 模块常量
+- **症状**：改了代码结果不变（或者"修好了"其实没跑新代码）。
+- **原因**：缓存键看内核 `.cc` 的 mtime 和 `@iron.jit` 的编译参数；`row_ops.h`、`harness.py`、`chain_c16.py` 的模块级常量（`E_IN`、`W_MAX`、`ACC_CHUNKS`…）和 `Plan` 逻辑都不在里面。
+- **办法**：改完 `rm -rf ~/.npu/cache/*`（`npu.check` 默认会清）。做对照实验时每换一次常量都要清。
+
+### 资源分配失败
+- **症状**：`Error: Resource allocation pipeline failed`。
+- **原因**：通常是 core 数据内存超了 64 KB（比如权重 fifo 深度 1 → 2，18 KB × 2）。
+- **办法**：先算账（见 chain-framework.md §3），再减深度 / 减元素大小 / 把大权重拆步。
+
+## DMA / runtime sequence
+
+### shim BD 维度上限
+- 最高维（迭代维 / d3）≤ 64：`'aie.dma_bd' op Size 3 exceeds the [1:64] range` → 大的行数拆成多个 fill（每 64 行一个）。
+- 跳着读（不能当连续段）时最内维 ≤ 1023 个 32 位字：`Size 0 exceeds the [0:1023] range` → 把大块拆成 `[…, n/256, 256]`。
+- 纯线性的一段可以很长（几十 KB 的权重元素没问题），因为会被合并成一维。
+
+### 一个 task group 里同一 shim 通道排太多任务 → 挂死
+- **症状**：`ERT_CMD_STATE_TIMEOUT`。实测 5 个 fill 没事，7 个以上挂死（像是通道任务队列深度）。
+- **办法**：一层拆成多个 task group，每组每通道 ≤ 4 个 fill（`FILLS_PER_TG`），组之间是普通屏障。
+
+### fill/drain 字节数必须和 core 的消费/产出严格对上
+- 输入 fifo 元素固定大小 → 每个 fill 的总字节必须是元素大小的整数倍，且等于 core 要 acquire 的元素数 × 元素大小；
+  drain 同理（块数 × 640）。少一点就挂死，多一点下一层读到错位数据。
+- 输入可以多读（TAP 读超出真实条带的字节），但缓冲区尾部要留余量（`Plan.size` 按所有 TAP 的最远地址算）。
+
+## 量化 / 数值
+
+- 舍入 `(acc + 2^(s−1)) >> s` = `rounding_mode::positive_inf` + `saturation_mode::saturate`，`to_vector<uint8>(shift)` 一次完成舍入 + ReLU。参考实现必须一模一样。
+- 随机权重 ±12 时 shift 要按层自动选（输出均值 ~24），否则 10 层内就衰减成全零，逐字节比较变成平凡的 0 == 0。
+
+## 测量
+
+- 单层计时会骗人（固定成本盖住一切），见 perf.md。
+- 机器负载高时中位数能抖 30%，看最快值，或者多跑几遍。
