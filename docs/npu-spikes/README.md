@@ -14,6 +14,7 @@
 | 4 | `rvm-npu-c16-spike.md` | 16 通道像素布局 + 固定 640 B 输出块 + 每 core 行数；平衡循环规则 | `npu/chain_c16.py` |
 | 5 | `rvm-npu-tiling-spike.md` | 高通道层的 OC / IC 分块、OC 并行、补宽列不读；task group 里 fill 太多会挂死 | `npu/chain_c16.py` |
 | 6 | `rvm-npu-dw-spike.md` | depthwise 3×3/5×5、stride 2、dilation 2；栈溢出 | `npu/chain_c16.py`、`conv_c16.cc` |
+| 7 | `rvm-npu-se-spike.md` | SE：全局平均池化、FC、HardSigmoid、逐通道乘折进权重；层间分支 | `npu/chain_c16.py`、`conv_c16.cc` |
 
 `rvm_convs_180x320.tsv`：RVM（MobileNetV3）85 个卷积在工作分辨率 320×180 下的实测形状和 MAC 数（onnxruntime 跑出来的）。
 

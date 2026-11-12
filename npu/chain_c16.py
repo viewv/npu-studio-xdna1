@@ -38,7 +38,16 @@
           core 每行 acquire 1 / release 1 (复用 IC 分块的收尾段, core 代码不变); 每步 m 个通道组, 输入不重读。
           张量上下各留 BR=4 行零边 (5×5 dilation 2 要 4 行)。内核按 (k, d, s) 模板展开 (运行时版慢 2–3 倍)。
 
-还没做: SE、hardswish、Add、Concat、Resize、ConvGRU; 3×3 的 IC 分块 (RVM 里没有需要的层)。
+  · SE  (squeeze-excitation) = 三个普通"层" + 一个带逐通道乘的投影层, 层之间可以有分支 (Layer.src / Layer.sc):
+          - 池化 (Layer.op = 1): 按通道组分给 4 个 core (组 c, c+4, …), 每 core 读自己组的全部行, 不用跨 core 归约;
+            输入元素 = 一个组的 kr 行, int32 和在 acc 里跨元素累加, 均值 = (Σ·M + 2^21) >> 22 → C×1×1 张量。
+          - FC1 / FC2 = 1×1 图上的 1×1 卷积 (只有 1 行 → OC 并行; 960 通道输入走 IC 分块 + OC 并行);
+            FC2 的输出激活是 HardSigmoid (Layer.act = 1: int8 饱和后 +128)。
+          - 投影层 (Layer.sc): 层的第一步先从输入 fifo 收 n_pre 个元素的缩放向量放进 core 的 sc 缓冲区;
+            之后每步第一次调用时把缩放折进这一步的权重 (W' = (W·s + 128) >> 8, 原地), 和行数、输入重读次数无关。
+  · 每个中间张量一个自己的 scratch 槽 (有分支后不能再按形状乒乓)。
+
+还没做: hardswish、Add、Concat、Resize、ConvGRU; 3×3 的 IC 分块 (RVM 里没有需要的层)。
 层间激活约定同前: 内核输出 uint8 (饱和=ReLU), 下一层把同一字节当 int8 读。
 """
 from __future__ import annotations
@@ -60,7 +69,7 @@ from .fused import KERNEL_INC
 from .harness import SelfTestResult
 
 SRC = str(Path(__file__).resolve().parent / "kernels" / "conv_c16.cc")
-PAD, HDR, CW = 4, 128, 40
+PAD, HDR, CW = 4, 256, 40
 BR = 4                         # 张量上下各 BR 行零边 (5×5 dilation 2 的 depthwise 要 4 行)
 E_IN = 7680                    # 输入元素字节数 (所有层相同; = 10 组 × (40+8)·16)
 W_MAX = 18432                  # 一个权重元素里最多的权重字节 (= 3×3 128→16)
@@ -69,6 +78,7 @@ N_CORES = 4
 W_DEPTH = 1                    # 权重 fifo 深度 (2 = 算这一步时预取下一步)
 FILLS_PER_TG = 4               # 一个 task group 里同一个 shim 通道最多排几个 fill
 MAX_PLANE = 4064               # shim BD 最内维上限之内
+SC_BYTES = 1024                # 每 core 的 SE 缩放向量缓冲区 (≤ 64 个通道组)
 
 
 def cdiv(a, b):
@@ -85,21 +95,28 @@ class Layer:
     w: int
     dw: int = 0     # 1 = depthwise (逐通道, ic == oc)
     d: int = 1      # dilation
+    op: int = 0     # 0 = 卷积, 1 = 全局平均池化 (输出 C×1×1, ic == oc)
+    act: int = 0    # 输出激活: 0 = ReLU (uint8 饱和), 1 = HardSigmoid (int8 饱和 + 128 → uint8, 128 = 0.5)
+    src: int = -1   # 输入张量 (相对本层输出张量的偏移; -1 = 上一层的输出)
+    sc: int = 0     # ≠ 0: 输入逐通道乘这个 C×1×1 张量 (SE 的 Mul), 折进权重: W' = (W·s[ic] + 128) >> 8
 
     @property
-    def pad(self): return self.d * (self.k - 1) // 2
+    def pad(self): return 0 if self.op else self.d * (self.k - 1) // 2
     @property
-    def ho(self): return cdiv(self.h, self.s)
+    def ho(self): return 1 if self.op == 1 else cdiv(self.h, self.s)
     @property
-    def wo(self): return cdiv(self.w, self.s)
+    def wo(self): return 1 if self.op == 1 else cdiv(self.w, self.s)
     @property
     def icp(self): return self.ic // 16
     @property
     def ocp(self): return self.oc // 16
     @property
-    def n_w(self): return self.k * self.k * (self.oc if self.dw else self.ic * self.oc)
+    def n_w(self): return 0 if self.op else self.k * self.k * (self.oc if self.dw else self.ic * self.oc)
     @property
-    def macs(self): return self.ho * self.wo * self.oc * (1 if self.dw else self.ic) * self.k * self.k
+    def macs(self):
+        if self.op == 1:
+            return self.h * self.w * self.ic
+        return self.ho * self.wo * self.oc * (1 if self.dw else self.ic) * self.k * self.k
 
 
 # RVM 编码器形状 (通道补到 16 的倍数; dw 卷积暂时用普通 3×3 代替), 输入 16 通道 180×320
@@ -144,6 +161,33 @@ _M = [("Conv_8", 16, 16, 3, 2, 180, 320, 0, 1), ("Conv_11", 16, 16, 3, 1, 90, 16
 for _n, *_a in _M:
     R[_n] = Layer(*_a)
 MNV3 = [n for n, *_ in _M]
+
+
+# SE: dw 输出 → 全局平均池化 → FC1 (1×1@1×1, ReLU) → FC2 (HardSigmoid) → 投影 1×1 (输入 = dw 输出, 逐通道乘 FC2 输出)
+def _se(dw: str, fc1: str, fc2: str, proj: str, mid: int, oc: int):
+    l = R[dw]
+    c, h, w = l.oc, l.ho, l.wo
+    R[dw + ".pool"] = Layer(c, c, 1, 1, h, w, op=1)
+    R[fc1] = Layer(c, mid, 1, 1, 1, 1)
+    R[fc2] = Layer(mid, c, 1, 1, 1, 1, act=1)
+    R[proj] = Layer(c, oc, 1, 1, h, w, src=-4, sc=-1)
+    return [dw + ".pool", fc1, fc2, proj]
+
+
+SE = {   # dw 层 → SE 三层 + 带逐通道乘的投影层 (通道补到 16 的倍数: 24→32, 120→128)
+    "Conv_28": _se("Conv_28", "Conv_31", "Conv_33", "Conv_36se", 32, 48),
+    "Conv_39": _se("Conv_39", "Conv_42", "Conv_44", "Conv_47se", 32, 48),
+    "Conv_122": _se("Conv_122", "Conv_126", "Conv_128", "Conv_131se", 176, 160),
+    "Conv_135": _se("Conv_135", "Conv_139", "Conv_141", "Conv_144se", 240, 160),
+}
+R["Conv_95"] = Layer(480, 480, 3, 1, 12, 20, dw=1)
+SE["Conv_95"] = _se("Conv_95", "Conv_99", "Conv_101", "Conv_104se", 128, 112)
+MNV3SE = []
+for _n in MNV3:
+    if _n in ("Conv_36", "Conv_47", "Conv_131m", "Conv_144m"):
+        continue                                   # 换成 SE 版的投影层
+    MNV3SE.append(_n)
+    MNV3SE += SE.get(_n, [])
 ENC = ["e1", "e2", "e3", "e4", "e5", "e6", "e7", "e8", "e9", "e10", "e11", "e12", "e13"]
 DEEP = [n for *_, n in _T]
 CHAINS = {
@@ -152,6 +196,10 @@ CHAINS = {
     "low": ENC + ["e11", "e12", "e13"] * 4,           # 12×20 的三层重复
     "deep": DEEP,                                     # 12×20 高通道段 (OC / IC 分块)
     "mnv3": MNV3,                                     # 编码器主干, 含全部几种 depthwise
+    "mnv3se": MNV3SE,                                 # 主干 + 4 个 SE
+    "se39": ["Conv_37", "Conv_39"] + SE["Conv_39"],   # 一个 SE 块 (23×40, full 模式投影)
+    "se95": ["Conv_92", "Conv_95"] + SE["Conv_95"],   # 12×20, 投影层是 IC 分块
+    "se135": ["Conv_132m", "Conv_135"] + SE["Conv_135"],  # 960 通道, FC1 是 IC 分块
 }
 
 
@@ -162,7 +210,8 @@ def chain_layers(spec: str) -> list[Layer]:
 
 
 def spec_str(layers) -> str:
-    return ";".join(f"{l.ic},{l.oc},{l.k},{l.s},{l.h},{l.w},{l.dw},{l.d}" for l in layers)
+    return ";".join(f"{l.ic},{l.oc},{l.k},{l.s},{l.h},{l.w},{l.dw},{l.d},{l.op},{l.act},{l.src},{l.sc}"
+                    for l in layers)
 
 
 def from_spec_str(s: str) -> list[Layer]:
@@ -204,6 +253,8 @@ class Tiling:
 
     def cores(self):
         """[(core id, 条 t, 段 b)]"""
+        if self.mode == "pool":
+            return [(c, 0, 0) for c in range(min(N_CORES, self.nocp))]
         if self.ocpar:
             return [(c, 0, 0) for c in range(min(N_CORES, self.n_ob))]
         return [(t * self.n_bands + b, t, b) for t in range(self.n_tw) for b in range(self.n_bands)]
@@ -214,10 +265,15 @@ class Tiling:
 
     def slots(self):
         """core 外层循环的每一步 = 一个槽, 槽里每个 core 一个步骤 (None = 这个 core 这一步空闲)"""
+        if self.mode == "pool":
+            n = len(self.cores())
+            return [[self.steps[0] if c < n else None for c in range(N_CORES)]]
         if not self.ocpar:
             return [[st] * N_CORES for st in self.steps]
-        return [[self.steps[s * N_CORES + c] if s * N_CORES + c < self.n_ob else None for c in range(N_CORES)]
-                for s in range(cdiv(self.n_ob, N_CORES))]
+        spo = len(self.steps) // self.n_ob          # 每个 OC 块/份的步数 (ict 时 = IC 步数)
+        return [[self.steps[(g * N_CORES + c) * spo + i] if g * N_CORES + c < self.n_ob else None
+                 for c in range(N_CORES)]
+                for g in range(cdiv(self.n_ob, N_CORES)) for i in range(spo)]
 
     @property
     def nxc(self): return self.wt // CW
@@ -227,7 +283,22 @@ def _divisor_le(n, cap):
     return max(d for d in range(1, n + 1) if n % d == 0 and d <= cap)
 
 
-def choose_tiling(l: Layer) -> Tiling:
+def _pool_rows(cplane):
+    """池化: 一个输入元素放 kr 行 (每行 X = E_IN / kr 字节 ≥ 一个通道组平面)"""
+    return max(d for d in range(1, 64) if E_IN % d == 0 and cplane <= E_IN // d <= MAX_PLANE
+               and (E_IN // d) % 64 == 0)
+
+
+def choose_tiling(l: Layer, ws_in: int | None = None) -> Tiling:
+    if l.op == 1:
+        # 全局平均池化: 按通道组分给 4 个 core (组 c, c+4, …), 每 core 读自己的组的全部行, 不用跨 core 归约。
+        # 输入元素 = 一个通道组的 kr 行 (每行 X 字节); 每组 ne 个元素, 最后一个元素多出来的行内核不看。
+        cpl = ((ws_in or l.w) + 2 * PAD) * 16
+        kr = _pool_rows(cpl)
+        tl = Tiling(1, 1, CW, [0], [1], mode="pool", icp_pad=kr, plane=E_IN // kr, nocp=l.icp,
+                    n_ob=1, n_icb=cdiv(l.h, kr))
+        tl.steps = [(0, l.icp, 0, l.icp, 1, 1)]
+        return tl
     best = None
     for t in (4, 2, 1):
         wt = cdiv(cdiv(l.wo, t), CW) * CW
@@ -237,7 +308,10 @@ def choose_tiling(l: Layer) -> Tiling:
         score = (t * wt / l.wo, -t)
         if best is None or score < best[0]:
             best = (score, t, wt, bands)
-    _, t, wt, bands = best
+    if best is None:                                 # 行数不够 4 段 (FC: 1×1 图)
+        t, wt, bands = 1, cdiv(l.wo, CW) * CW, l.ho
+    else:
+        _, t, wt, bands = best
     q, r = divmod(l.ho, bands)
     rows = [q + (1 if b < r else 0) for b in range(bands)]
     tl = Tiling(t, bands, wt, [sum(rows[:b]) for b in range(bands)], rows)
@@ -288,54 +362,75 @@ def choose_tiling(l: Layer) -> Tiling:
     tl.n_ob = l.ocp // tl.nocp
     tl.steps = [(o * tl.nocp, tl.nocp, i * m, min(m, l.icp - i * m), int(i == 0), int(i == tl.n_icb - 1))
                 for o in range(tl.n_ob) for i in range(tl.n_icb)]
+    if l.ho == 1 and tl.n_tw == 1 and tl.n_ob > 1:
+        # FC (1×1 图): 只有 1 行, 按行切只能用 1 个 core → OC 并行, 每 core 算不同的份
+        tl.ocpar, tl.n_bands, tl.band_y0, tl.band_rows = True, 1, [0], [1]
     return tl
 
 
 class Plan:
     def __init__(self, layers: list[Layer]):
         self.layers = layers
-        self.tilings = [choose_tiling(l) for l in layers]
         l0 = layers[0]
-        cur = Tensor(l0.ic, l0.h, l0.w, l0.w)
-        self.tensors = [cur]
-        for l, tl in zip(layers, self.tilings):
+        self.tensors = [Tensor(l0.ic, l0.h, l0.w, l0.w)]
+        self.tilings, self.inp = [], []          # inp[k] = 层 k 的输入张量号 (输出是 k+1)
+        for k, l in enumerate(layers):
+            i = k + 1 + l.src
+            assert 0 <= i <= k, f"层 {k} 的输入 {l.src} 越界"
+            cur = self.tensors[i]
             assert l.ic == cur.c and l.h == cur.h and l.w == cur.w, f"接不上: {cur} → {l}"
             assert l.ic % 16 == 0 and l.oc % 16 == 0
-            cur = Tensor(l.oc, l.ho, l.wo, tl.n_tw * tl.wt)
-            self.tensors.append(cur)
+            if l.sc:
+                ts = self.tensors[k + 1 + l.sc]
+                assert l.k == 1 and l.s == 1 and not l.dw and (ts.c, ts.h, ts.w) == (l.ic, 1, 1), \
+                    f"层 {k} 的缩放张量 {ts} 不对"
+            tl = choose_tiling(l, cur.ws)
+            self.tilings.append(tl)
+            self.inp.append(i)
+            self.tensors.append(Tensor(l.oc, l.ho, l.wo, tl.n_tw * tl.wt))
         self.n_steps = sum(len(tl.slots()) for tl in self.tilings)       # core 外层循环次数
         # 补到 256 的倍数: 权重按 [槽][core] 交错存, fill 是跳着读的, 最内维不能超过 1023 个字
         self.e_w = cdiv(HDR + max(self._step_wbytes(l, st) for l, tl in zip(layers, self.tilings)
                                   for st in tl.steps), 256) * 256
         self.step0 = np.cumsum([0] + [len(tl.slots()) for tl in self.tilings]).tolist()
-        self.slot_off, off = {}, 0
+        # 每个中间张量一个自己的槽 (有分支: SE 的投影层读的是 3 层之前的张量)
+        self.loc, off = [("act", 0)], 0
         for t in self.tensors[1:-1]:
-            if t.key not in self.slot_off:
-                self.slot_off[t.key] = (off, off + t.size)
-                off += 2 * t.size
-        toggle, prev, self.io = {}, ("act", 0), []
-        for k, t in enumerate(self.tensors[1:]):
-            if k == len(layers) - 1:
-                dst = ("out", 0)
-            else:
-                i = toggle.get(t.key, 0)
-                toggle[t.key] = i ^ 1
-                dst = ("s", self.slot_off[t.key][i])
-            self.io.append((prev, dst))
-            prev = dst
+            self.loc.append(("s", off))
+            off += t.size
+        self.loc.append(("out", 0))
+        self.io = [(self.loc[self.inp[k]], self.loc[k + 1]) for k in range(len(layers))]
         ends = {"act": self.tensors[0].size, "s": max(off, 1), "out": self.tensors[-1].size}
         for k, l in enumerate(layers):
             (src, soff), _ = self.io[k]
-            ti, tl = self.tensors[k], self.tilings[k]
-            for c, t, b in tl.cores():
-                for o, sz, st in self.fill_taps(k, soff, c, t, b):
-                    end = o + sum((n - 1) * s_ for n, s_ in zip(sz, st)) + 1
-                    ends[src] = max(ends[src], end)
+            tl = self.tilings[k]
+            taps = [tp for c, t, b in tl.cores() for tp in self.fill_taps(k, soff, c, t, b)]
+            if l.sc:
+                ssrc, sbase = self.loc[k + 1 + l.sc]
+                o_, sz, st = self.scale_tap(k, sbase)
+                ends[ssrc] = max(ends[ssrc], o_ + sz[-1])
+            for o, sz, st in taps:
+                end = o + sum((n - 1) * s_ for n, s_ in zip(sz, st)) + 1
+                ends[src] = max(ends[src], end)
         self.size = {k: cdiv(v, 64) * 64 for k, v in ends.items()}
+
+    def scale_tap(self, k, base):
+        """SE 缩放向量 (C×1×1 张量) → 输入 fifo 的 n_pre 个元素, 每元素 E_IN // cplane 个通道组 (连续读)"""
+        ts = self.tensors[k + 1 + self.layers[k].sc]
+        return base + BR * ts.frow, [1, 1, 1, self.n_pre(k) * E_IN], [0, 0, 0, 1]
+
+    def n_pre(self, k):
+        l = self.layers[k]
+        if not l.sc:
+            return 0
+        ts = self.tensors[k + 1 + l.sc]
+        return cdiv(ts.c // 16, E_IN // ts.cplane)
 
     @staticmethod
     def _step_wbytes(l, st):
         _, nocp, _, nicp, _, _ = st
+        if l.op:
+            return 0
         if l.dw:
             return nocp * l.k * l.k * 64
         return l.k * l.k * nicp * 16 * nocp * 16
@@ -344,21 +439,28 @@ class Plan:
     def ob_groups(tl, l):
         """一层按 OC 块/份分成几个 task group, 每组每个 shim 通道最多 FILLS_PER_TG 个 fill
         (实测一个 task group 里同一通道排 7 个以上 DMA 任务就挂死, 5 个没事)"""
-        if tl.ocpar:
+        if tl.ocpar or tl.mode == "pool":
             return [(0, tl.n_ob)]
         if tl.mode == "dw":
             per = cdiv(max(tl.band_rows), 64)
         else:
             per = 1 if tl.mode == "ict" else (0 if l.s == 1 else cdiv(max(tl.band_rows), 64))
-        g = tl.n_ob if per == 0 else max(1, FILLS_PER_TG // per)
-        return [(o, min(o + g, tl.n_ob)) for o in range(0, tl.n_ob, g)]
+        if per == 0:
+            return [(0, tl.n_ob)]
+        g = max(1, FILLS_PER_TG // per)
+        g0 = max(1, (FILLS_PER_TG - (1 if l.sc else 0)) // per)     # 第一组还要放 SE 缩放向量的 fill
+        return [(0, min(g0, tl.n_ob))] + [(o, min(o + g, tl.n_ob)) for o in range(g0, tl.n_ob, g)]
 
     def fill_taps(self, k, base, c, t, b, ob0=0, ob1=None):
         """core c 这一层 (OC 块/份 ob0..ob1) 的输入 fill: [(偏移, sizes, strides)]"""
-        l, tl, ti = self.layers[k], self.tilings[k], self.tensors[k]
+        l, tl, ti = self.layers[k], self.tilings[k], self.tensors[self.inp[k]]
         ob1 = tl.n_ob if ob1 is None else ob1
         nob = tl.blocks_of(c) if tl.ocpar else ob1 - ob0
         rows = tl.band_rows[b]
+        if tl.mode == "pool":    # core c: 通道组 c, c+4, …; 每组 ne 个元素 × kr 行 × X 字节 (从真实第 0 行起)
+            ng = len(range(c, l.icp, N_CORES))
+            return [(base + BR * ti.frow + c * ti.cplane, [ng, tl.n_icb, tl.icp_pad, tl.plane],
+                     [N_CORES * ti.cplane, tl.icp_pad * ti.frow, ti.frow, 1])]
         off = base + (BR - 1 + l.s * tl.band_y0[b]) * ti.frow + t * l.s * tl.wt * 16   # 窗口第一行 = 真实行 s·y0-1
         if tl.mode == "dw":      # 每步 (m 个通道组) 每 64 个输出行一个 BD: [输出行][ky][m 组][PLANE]
             o0 = base + (BR + l.s * tl.band_y0[b] - l.pad) * ti.frow + t * l.s * tl.wt * 16
@@ -367,6 +469,8 @@ class Plan:
                     for o in range(ob0, ob1) for r0 in range(0, rows, 64)]
         if tl.mode == "ict":     # 不要上下边行; 每份 OC 一个 BD: [IC 步][行][m 组][PLANE]
             o1 = off + ti.frow
+            if rows == 1:        # FC: 一行, 所有份合成一个 BD (最外维步长 0)
+                return [(o1, [nob, tl.n_icb, tl.icp_pad, tl.plane], [0, tl.icp_pad * ti.cplane, ti.cplane, 1])]
             return [(o1, [tl.n_icb, rows, tl.icp_pad, tl.plane], [tl.icp_pad * ti.cplane, ti.frow, ti.cplane, 1])
                     for _ in range(nob)]
         if l.s == 1:             # OC 块: 最外维步长 0, 同一份输入重复 nob 次
@@ -377,6 +481,11 @@ class Plan:
 
     def drain_taps(self, k, base, c, t, b, ob0=0, ob1=None):
         tl, to = self.tilings[k], self.tensors[k + 1]
+        ob1 = tl.n_ob if ob1 is None else ob1
+        if tl.mode == "pool":    # core c 的组 c, c+4, … 各一个 640 B 块 (像素 0 = 均值, 其余 0)
+            ng = len(range(c, self.layers[k].icp, N_CORES))
+            return [(base + BR * to.frow + PAD * 16 + c * to.cplane, [1, 1, ng, CW * 16],
+                     [0, 0, N_CORES * to.cplane, 1])]
         if tl.mode == "dw":      # 每步一个 BD (最后一步可能少几个通道组)
             o0 = base + (BR + tl.band_y0[b]) * to.frow + (PAD + t * tl.wt) * 16
             return [(o0 + tl.steps[o][0] * to.cplane, [1, tl.band_rows[b], tl.steps[o][1], tl.wt * 16],
@@ -395,9 +504,19 @@ class Plan:
 
     def describe(self):
         out = []
-        for l, tl in zip(self.layers, self.tilings):
+        for k, (l, tl) in enumerate(zip(self.layers, self.tilings)):
             kind = ("dw " if l.dw else "") + ("1×1" if l.k == 1 else f"{l.k}×{l.k} s{l.s}") + \
                 (f" d{l.d}" if l.d > 1 else "")
+            if tl.mode == "pool":
+                out.append(f"{l.ic} 全局平均池化 {l.h}×{l.w}: 每 core 组 c, c+4, …, 每组 {tl.n_icb} 个元素 × "
+                           f"{tl.icp_pad} 行 × {tl.plane} B")
+                continue
+            if l.sc:
+                kind += f" ×SE(张量{k + 1 + l.sc})"
+            if l.src != -1:
+                kind += f" 输入=张量{k + 1 + l.src}"
+            if l.act == 1:
+                kind += " HardSigmoid"
             extra = {"dw": f" 每步 {tl.nocp} 组 × {tl.n_ob} 步", "full": "", "oc": f" OC 分 {tl.n_ob} 块×{tl.nocp} 组" + (" (OC 并行)" if tl.ocpar else ""),
                      "ict": f" IC 分 {tl.n_icb} 步×{tl.icp_pad} 组, OC 分 {tl.n_ob} 份×{tl.nocp} 组"}[tl.mode]
             out.append(f"{l.ic}→{l.oc} {kind} {l.h}×{l.w}→{l.ho}×{l.wo}: {tl.n_tw}条×{tl.n_bands}段 "
@@ -436,28 +555,34 @@ def conv_c16(act: In, wts: In, scratch: InOut, out: Out, *, spec: CompileTime[st
     out_ty = np.ndarray[(CW * 16,), u8]
     w_ty = np.ndarray[(P.e_w,), i8]
     acc_ty = np.ndarray[(ACC_CHUNKS * CW * 16,), i32]
+    sc_ty = np.ndarray[(SC_BYTES,), u8]
     kern = ExternalFunction("convC16Chunk", source_file=SRC,
-                            arg_types=[in_ty, in_ty, in_ty, w_ty, out_ty, acc_ty, np.int32, np.int32, np.int32],
+                            arg_types=[in_ty, in_ty, in_ty, w_ty, out_ty, acc_ty, sc_ty, np.int32, np.int32,
+                                       np.int32],
                             include_dirs=[KERNEL_INC], compile_flags=[f"-DCW={CW}"])
 
     def make_core(cid):
         hc = 32 + 16 * cid          # 本 core 在权重头里的那段
 
-        def call(k, win, wv, o, acc, j, r):
+        def call(k, win, wv, o, acc, sc, j, r):
             for _ in range(reps):
-                k(win[0], win[1], win[2], wv, o, acc, _i32(j), _i32(r), cid)
+                k(win[0], win[1], win[2], wv, o, acc, sc, _i32(j), _i32(r), cid)
 
-        def core(f_in, f_w, f_out, k, acc, dummy):
+        def core(f_in, f_w, f_out, k, acc, dummy, sc):
             for _ in range_(P.n_steps):
                 wv = f_w.acquire(1)
                 rows, nch = _u16(wv, hc), _u16(wv, hc + 8)
+                for e in range_(_u16(wv, 128)):             # SE 缩放向量 → sc (层的第一步)
+                    win = f_in.acquire(1)
+                    k(win, win, win, wv, dummy, acc, sc, -1, _i32(e), cid)
+                    f_in.release(1)
                 for _ in range_(_u16(wv, hc + 2)):          # stride 1 (含 1×1): 滑窗
                     f_in.acquire(2)
                     for r in range_(rows):
                         win = f_in.acquire(3)
                         for j in range_(nch):
                             o = f_out.acquire(1)
-                            call(k, win, wv, o, acc, j, r)
+                            call(k, win, wv, o, acc, sc, j, r)
                             f_out.release(1)
                         f_in.release(1)
                     f_in.release(2)
@@ -466,22 +591,33 @@ def conv_c16(act: In, wts: In, scratch: InOut, out: Out, *, spec: CompileTime[st
                         win = f_in.acquire(3)
                         for j in range_(nch):
                             o = f_out.acquire(1)
-                            call(k, win, wv, o, acc, j, r)
+                            call(k, win, wv, o, acc, sc, j, r)
                             f_out.release(1)
                         f_in.release(3)
                 for _ in range_(_u16(wv, hc + 10)):         # IC 分块中间步: 只累加
                     for r in range_(rows):
                         win = f_in.acquire(1)
                         for j in range_(nch):
-                            k(win, win, win, wv, dummy, acc, _i32(j), _i32(r), cid)
+                            k(win, win, win, wv, dummy, acc, sc, _i32(j), _i32(r), cid)
                         f_in.release(1)
                 for _ in range_(_u16(wv, hc + 12)):         # IC 分块最后一步: 出输出
                     for r in range_(rows):
                         win = f_in.acquire(1)
                         for j in range_(nch):
                             o = f_out.acquire(1)
-                            k(win, win, win, wv, o, acc, _i32(j), _i32(r), cid)
+                            k(win, win, win, wv, o, acc, sc, _i32(j), _i32(r), cid)
                             f_out.release(1)
+                        f_in.release(1)
+                for _ in range_(_u16(wv, 132)):             # 全局平均池化: 每组 rows+1 个元素, 最后一个出块
+                    for _ in range_(nch):
+                        for e in range_(rows):
+                            win = f_in.acquire(1)
+                            k(win, win, win, wv, dummy, acc, sc, -2, _i32(e), cid)
+                            f_in.release(1)
+                        win = f_in.acquire(1)
+                        o = f_out.acquire(1)
+                        k(win, win, win, wv, o, acc, sc, -3, _i32(rows), cid)
+                        f_out.release(1)
                         f_in.release(1)
                 f_w.release(1)
         return core
@@ -493,8 +629,9 @@ def conv_c16(act: In, wts: In, scratch: InOut, out: Out, *, spec: CompileTime[st
         f_out = ObjectFifo(out_ty, depth=2, name=f"c16_{c}o")
         acc = Buffer(acc_ty, name=f"c16_{c}acc")
         dummy = Buffer(out_ty, name=f"c16_{c}dummy")
+        sc = Buffer(sc_ty, name=f"c16_{c}sc")
         fifos.append((f_in, f_w, f_out))
-        workers.append(Worker(make_core(c), [f_in.cons(), f_w.cons(), f_out.prod(), kern, acc, dummy]))
+        workers.append(Worker(make_core(c), [f_in.cons(), f_w.cons(), f_out.prod(), kern, acc, dummy, sc]))
 
     rt = Runtime()
     nw = P.n_steps * N_CORES * P.e_w                # 权重缓冲区 [槽][core][e_w]
@@ -515,6 +652,11 @@ def conv_c16(act: In, wts: In, scratch: InOut, out: Out, *, spec: CompileTime[st
                 for c, (f_in, f_w, _) in enumerate(fifos):
                     rt.fill(f_w.prod(), w, tap=_tap(nw, (s0 * N_CORES + c) * P.e_w, [1, ns, P.e_w // 256, 256],
                                                      [0, N_CORES * P.e_w, 256, 1]), task_group=tg)
+                if l.sc and ob0 == 0:                        # SE 缩放向量: 每个 core 层的第一步之前
+                    ssrc, sbase = P.loc[k + 1 + l.sc]
+                    for c, t, b in tl.cores():
+                        rt.fill(fifos[c][0].prod(), bufs[ssrc], tap=_tap(P.size[ssrc], *P.scale_tap(k, sbase)),
+                                task_group=tg)
                 for c, t, b in tl.cores():
                     for o_, sz, st in P.fill_taps(k, soff, c, t, b, ob0, ob1):
                         rt.fill(fifos[c][0].prod(), bufs[src], tap=_tap(P.size[src], o_, sz, st), task_group=tg)
@@ -545,52 +687,71 @@ def from_layout(buf: np.ndarray, t: Tensor) -> np.ndarray:
     return buf[:t.size].reshape(hp, t.c // 16, wp, 16).transpose(1, 3, 0, 2).reshape(t.c, hp, wp)
 
 
-def pack_layer(l: Layer, tl: Tiling, Wq: np.ndarray, shift: int, e_w: int) -> list[np.ndarray]:
+def pack_layer(l: Layer, tl: Tiling, Wq, shift: int, e_w: int, n_pre: int = 0, ws_in: int = 0) -> list[np.ndarray]:
     """一层的所有槽 × 每个 core 一个 e_w 字节的权重元素 [头][权重], 顺序 [槽][core]"""
     ocp, icp = l.ocp, l.icp
-    if l.dw:       # [cp][ky][kx][4 像素][16 通道] (16 个通道的权重复制 4 份, 对上 4 像素 × 16 通道的向量)
+    if l.op == 1:
+        full = None
+    elif l.dw:     # [cp][ky][kx][4 像素][16 通道] (16 个通道的权重复制 4 份, 对上 4 像素 × 16 通道的向量)
         w4 = Wq.reshape(icp, 16, l.k, l.k).transpose(0, 2, 3, 1)
         full = np.ascontiguousarray(np.broadcast_to(w4[:, :, :, None, :], (icp, l.k, l.k, 4, 16)))
     elif l.k == 3:   # [ocp][ky][icp][kx][h][ob][ic8][oc8]
         full = Wq.reshape(ocp, 2, 8, icp, 2, 8, 3, 3).transpose(0, 6, 3, 7, 4, 1, 5, 2)
     else:          # [ocp][icp][h][ob][ic8][oc8]
         full = Wq.reshape(ocp, 2, 8, icp, 2, 8).transpose(0, 3, 4, 1, 5, 2)
-    out = []
+    out, seen = [], set()
     for slot in tl.slots():
         for c_own, st in enumerate(slot):
-            out.append(_pack_step(l, tl, full, shift, e_w, st, c_own))
+            first = st is not None and c_own not in seen
+            if st is not None:
+                seen.add(c_own)
+            out.append(_pack_step(l, tl, full, shift, e_w, st, c_own, n_pre if first else 0, ws_in))
     return out
 
 
-def _pack_step(l, tl, full, shift, e_w, st, c_own):
+POOL_S = 22      # 池化均值 = (Σ·M + 2^(S-1)) >> S, M = round(2^S / (H·W)); 255·H·W·M < 2^31
+
+
+def _pack_step(l, tl, full, shift, e_w, st, c_own, n_pre=0, ws_in=0):
     buf = np.zeros(e_w, np.int8)
     if st is None:               # 这个 core 这一槽空闲: 全零头 (所有选择字节为 0)
         return buf
     ocp0, nocp, icp0, nicp, first, last = st
-    if True:
-        if l.dw:
-            w = full[ocp0:ocp0 + nocp]
-        elif l.k == 3:
-            w = full[ocp0:ocp0 + nocp, :, icp0:icp0 + nicp]
-        else:
-            w = full[ocp0:ocp0 + nocp, icp0:icp0 + nicp]
-        hdr = np.zeros(32, np.int32)
-        hdr[:8] = [nicp, nocp, tl.wt, l.s, l.k, shift, tl.nxc, tl.plane]
-        hdr[24:26] = [first, last]
-        if l.dw:
-            hdr[26:29] = [l.d, 1, tl.icp_pad * tl.plane]
+    hdr = np.zeros(HDR // 4, np.int32)
+    if l.op == 1:                # 池化: 每 core 自己的组数 / 每组元素数, 参数在 int32[33..39]
+        hdr[:8] = [0, 0, CW, 1, 1, 0, 1, tl.plane]
+        m = round((1 << POOL_S) / (l.h * l.w))
+        assert m < 1 << 15, f"池化 {l.h}×{l.w} 太小: M = {m} 放不进 int16"
+        hdr[33:40] = [1, l.h, tl.icp_pad, tl.plane, (ws_in + 2 * PAD) // 4, m, POOL_S]
         buf[:HDR] = hdr.view(np.int8)
-        for c, t, b in tl.cores():
-            if tl.ocpar and c != c_own:
-                continue
-            rows = tl.band_rows[b]
-            wvalid = min(max(l.wo - t * tl.wt, 0), tl.wt)
-            ict = tl.mode in ("ict", "dw")       # depthwise 也走"每行 acquire 1 + 出输出"那一段
-            per = np.array([rows, int(not ict and l.s == 1), int(not ict and l.s == 2), wvalid, nocp * tl.nxc,
-                            int(ict and not last), int(ict and last), 0], np.uint16)
-            buf[32 + 16 * c: 48 + 16 * c] = per.view(np.int8)
-        flat = np.ascontiguousarray(w).reshape(-1)
-        buf[HDR:HDR + flat.size] = flat
+        ng = len(range(c_own, l.icp, N_CORES))
+        per = np.array([tl.n_icb - 1, 0, 0, 1, ng, 0, 0, 0], np.uint16)
+        buf[32 + 16 * c_own: 48 + 16 * c_own] = per.view(np.int8)
+        return buf
+    if l.dw:
+        w = full[ocp0:ocp0 + nocp]
+    elif l.k == 3:
+        w = full[ocp0:ocp0 + nocp, :, icp0:icp0 + nicp]
+    else:
+        w = full[ocp0:ocp0 + nocp, icp0:icp0 + nicp]
+    hdr[:8] = [nicp, nocp, tl.wt, l.s, l.k, shift, tl.nxc, tl.plane]
+    hdr[24:26] = [first, last]
+    if l.dw:
+        hdr[26:29] = [l.d, 1, tl.icp_pad * tl.plane]
+    hdr[29:33] = [l.act, int(bool(l.sc)), icp0, n_pre]
+    hdr[40:42] = [E_IN // ((CW + 2 * PAD) * 16), (CW + 2 * PAD) * 16]   # 缩放张量 (宽 1 存成 40): 每元素组数, 组步长
+    buf[:HDR] = hdr.view(np.int8)
+    for c, t, b in tl.cores():
+        if tl.ocpar and c != c_own:
+            continue
+        rows = tl.band_rows[b]
+        wvalid = min(max(l.wo - t * tl.wt, 0), tl.wt)
+        ict = tl.mode in ("ict", "dw")       # depthwise 也走"每行 acquire 1 + 出输出"那一段
+        per = np.array([rows, int(not ict and l.s == 1), int(not ict and l.s == 2), wvalid, nocp * tl.nxc,
+                        int(ict and not last), int(ict and last), 0], np.uint16)
+        buf[32 + 16 * c: 48 + 16 * c] = per.view(np.int8)
+    flat = np.ascontiguousarray(w).reshape(-1)
+    buf[HDR:HDR + flat.size] = flat
     return buf
 
 
@@ -611,21 +772,45 @@ def conv_acc(l: Layer, x_i8: np.ndarray, Wq: np.ndarray) -> np.ndarray:
     return acc.reshape(l.oc, l.ho, l.wo)
 
 
-def requant(acc, shift):
-    return np.clip((acc + (1 << (shift - 1))) >> shift, 0, 255).astype(np.uint8)
+def requant(acc, shift, act=0):
+    r = (acc + (1 << (shift - 1))) >> shift
+    if act == 1:     # HardSigmoid: int8 饱和后 +128 (0 → 0.5, ±(128·2^s) → 0 / 1)
+        return (np.clip(r, -128, 127) + 128).astype(np.uint8)
+    return np.clip(r, 0, 255).astype(np.uint8)
+
+
+def pool_ref(x_u8: np.ndarray) -> np.ndarray:
+    c, h, w = x_u8.shape
+    m = round((1 << POOL_S) / (h * w))
+    s = x_u8.astype(np.int64).reshape(c, -1).sum(1)
+    return np.minimum((s * m + (1 << (POOL_S - 1))) >> POOL_S, 255).astype(np.uint8).reshape(c, 1, 1)
+
+
+def se_weights(Wq: np.ndarray, s_u8: np.ndarray) -> np.ndarray:
+    """SE 的逐通道乘折进下一层 1×1 的权重: W'[o, i] = (W[o, i]·s[i] + 128) >> 8 (内核每步原地做一次)"""
+    return ((Wq.astype(np.int32) * s_u8.reshape(1, -1, 1, 1).astype(np.int32) + 128) >> 8).astype(np.int8)
 
 
 def make_case(layers, seed=0):
+    """随机输入和权重, 按层的 src / sc 连成图, 返回 (输入, 每层 (权重, shift), 末层参考)"""
     rng = np.random.default_rng(seed)
     x = rng.integers(-100, 101, (layers[0].ic, layers[0].h, layers[0].w), dtype=np.int64).astype(np.int8)
-    params, cur = [], x
-    for l in layers:
+    params, ts = [], [x]
+    for k, l in enumerate(layers):
+        cur = ts[k + 1 + l.src]
+        if l.op == 1:
+            params.append((None, 0))
+            ts.append(pool_ref(cur.view(np.uint8)))
+            continue
         Wq = rng.integers(-12, 13, (l.oc, 1 if l.dw else l.ic, l.k, l.k)).astype(np.int8)
-        acc = conv_acc(l, cur.view(np.int8), Wq)
-        shift = min(range(3, 16), key=lambda s: abs(requant(acc, s).mean() - 24))
+        acc = conv_acc(l, cur.view(np.int8), se_weights(Wq, ts[k + 1 + l.sc]) if l.sc else Wq)
+        if l.act == 1:   # HardSigmoid: 输出铺开在 0..255, 饱和的不太多
+            shift = min(range(3, 16), key=lambda s: abs(requant(acc, s, 1).astype(float).std() - 50))
+        else:
+            shift = min(range(3, 16), key=lambda s: abs(requant(acc, s).mean() - 24))
         params.append((Wq, shift))
-        cur = requant(acc, shift)
-    return x, params, cur
+        ts.append(requant(acc, shift, l.act))
+    return x, params, ts[-1]
 
 
 class C16Chain:
@@ -634,7 +819,8 @@ class C16Chain:
         self.P = P = Plan(layers)
         self.spec = spec_str(layers)
         self.t_act = iron.zeros(P.size["act"], dtype=np.int8, device="npu")
-        steps = [b for l, tl, (Wq, s) in zip(layers, P.tilings, params) for b in pack_layer(l, tl, Wq, s, P.e_w)]
+        steps = [b for k, (l, tl, (Wq, s)) in enumerate(zip(layers, P.tilings, params))
+                 for b in pack_layer(l, tl, Wq, s, P.e_w, P.n_pre(k), P.tensors[P.inp[k]].ws)]
         self.t_w = iron.tensor(np.concatenate(steps), dtype=np.int8, device="npu")
         self.t_s = iron.zeros(P.size["s"], dtype=np.int8, device="npu")
         self.t_out = iron.zeros(P.size["out"], dtype=np.uint8, device="npu")

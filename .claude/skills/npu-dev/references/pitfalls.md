@@ -32,6 +32,16 @@
 - **办法**：内核里不要放向量/累加器数组，按需重算或分批；大函数 `__attribute__((noinline))`；
   确实要大栈就设 `stack_size`（`RowPipeline(..., stack_size=8192)` / Worker 参数），上限约 16 KB。
 
+### 按引用把累加器传给 noinline 函数 → 栈溢出挂死
+- **症状**：`ERT_CMD_STATE_TIMEOUT`，连本来就对的层也挂。SE 时把 HardSigmoid 的存储写成 `store4h(uint8_t*, MM &c0, MM &c1, …)` 并标 noinline。
+- **原因**：被引用的累加器必须有内存地址 → 调用方（conv1，被内联进入口函数）把 4 个 1 KB 级的累加器放到栈上，超过默认 1 KB 栈。
+- **办法**：在调用方先 `to_vector<int8>(shift)`，把向量按值传进去（`store4h(o, V32 v0, V32 v1, nv)`）。
+
+### 激活在 0 处不为 0 → 补宽列被写脏
+- **症状**：`check` 返回 999（边/补宽列不是零），真实区域是对的。SE 的 FC2（HardSigmoid）在 1×1 图上把像素 1..3 写成 128。
+- **原因**：内核按 4 像素一组输出，组里超出有效宽度的像素 ReLU 版靠"零输入 → 0"自然是零；HardSigmoid(0) = 128。
+- **办法**：这类激活按像素数 nv 把组内宽度外的字节清零（`store4h` 的 nv 参数）。以后加 bias 也一样。
+
 ### JIT 缓存不认头文件和 Python 模块常量
 - **症状**：改了代码结果不变（或者"修好了"其实没跑新代码）。
 - **原因**：缓存键看内核 `.cc` 的 mtime 和 `@iron.jit` 的编译参数；`row_ops.h`、`harness.py`、`chain_c16.py` 的模块级常量（`E_IN`、`W_MAX`、`ACC_CHUNKS`…）和 `Plan` 逻辑都不在里面。

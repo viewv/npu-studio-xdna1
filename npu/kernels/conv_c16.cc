@@ -30,7 +30,7 @@
 #ifndef CW
 #define CW 40 // 每个输出块的像素数 (8 的倍数)
 #endif
-#define HDR 128
+#define HDR 256
 #define PAD 4
 
 using MM = ::aie::mmul<4, 8, 8, int8, int8>;
@@ -62,8 +62,21 @@ inline void mac2(MM &c0, MM &c1, const V64 &a, const int8_t *w) {
 }
 
 // 输出 4 像素 × 16 通道 (64 B); 超出真实宽度写 0
-inline void store4(uint8_t *o, MM &c0, MM &c1, int shift, bool valid) {
-  if (valid) {
+// HardSigmoid: int8 饱和, 再 +128 (异或 0x80) → uint8, 128 = 0.5。nv = 这 4 个像素里有几个在真实宽度内
+// (HardSigmoid(0) ≠ 0, 宽度外的像素要另外清零)。只有 SE 的 FC2 用, 不内联省程序内存
+// (按值传向量: 传累加器引用会让调用方把累加器放到栈上, 1 KB 的栈就溢出了)
+__attribute__((noinline)) void store4h(uint8_t *o, V32 v0, V32 v1, int nv) {
+  auto [p, q] = ::aie::interleave_zip(v0, v1, 8);
+  const auto m = ::aie::broadcast<uint8, 32>(0x80);
+  ::aie::store_v(o, ::aie::bit_xor(p.template cast_to<uint8>(), m));
+  ::aie::store_v(o + 32, ::aie::bit_xor(q.template cast_to<uint8>(), m));
+  for (int b = nv * 16; b < 64; b++) o[b] = 0;
+}
+
+inline void store4(uint8_t *o, MM &c0, MM &c1, int shift, bool valid, int act = 0, int nv = 4) {
+  if (valid && act) {
+    store4h(o, c0.template to_vector<int8>(shift), c1.template to_vector<int8>(shift), nv);
+  } else if (valid) {
     auto [p, q] = ::aie::interleave_zip(c0.template to_vector<uint8>(shift),
                                         c1.template to_vector<uint8>(shift), 8);
     ::aie::store_v(o, p);
@@ -150,7 +163,7 @@ inline ::aie::accum<acc32, 32> ld_acc(const int32_t *p) {
 }
 
 void conv1(const int8_t *r1, const int8_t *w0, uint8_t *out, const Desc &d, int px0, int wvalid,
-           int32_t *acc, int first, int last) {
+           int32_t *acc, int first, int last, int act) {
   for (int x = 0; x < CW; x += 8) {
     if (px0 + x >= wvalid) { // 整组都是补出来的列 (acc 也不用管: 收尾步会写零)
       if (last) {
@@ -179,8 +192,8 @@ void conv1(const int8_t *r1, const int8_t *w0, uint8_t *out, const Desc &d, int 
       w += 256;
     }
     if (last) {
-      store4(out + x * 16, c00, c01, d.shift, px0 + x < wvalid);
-      store4(out + (x + 4) * 16, c10, c11, d.shift, px0 + x + 4 < wvalid);
+      store4(out + x * 16, c00, c01, d.shift, px0 + x < wvalid, act, wvalid - (px0 + x));
+      store4(out + (x + 4) * 16, c10, c11, d.shift, px0 + x + 4 < wvalid, act, wvalid - (px0 + x + 4));
     } else {
       ::aie::store_v(ap, c00.template to_vector<int32>(0));
       ::aie::store_v(ap + 32, c01.template to_vector<int32>(0));
@@ -252,6 +265,76 @@ __attribute__((noinline)) void dwconv(const int8_t *elem, const int8_t *w0, uint
   }
 }
 
+// ---------------------------------------------------------------- SE (squeeze-excitation)
+using V16U = ::aie::vector<uint8, 16>;
+using V32U = ::aie::vector<uint8, 32>;
+using ACC32 = ::aie::accum<acc32, 32>;
+
+// 缩放向量装载: 输入元素 e 是 C×1×1 张量的连续 E_IN 字节, 每 cpl 字节一个通道组, 像素 0 在 PAD·16 处
+__attribute__((noinline)) void se_load(const uint8_t *e, uint8_t *sc, int r, int gpe, int cpl) {
+  for (int i = 0; i < gpe; i++) {
+    const int g = r * gpe + i;
+    if (g >= 64) break;
+    ::aie::store_v(sc + g * 16, ::aie::load_v<16>(e + i * cpl + PAD * 16));
+  }
+}
+
+// SE 的逐通道乘折进这一步的 1×1 权重 (原地, 每步一次): W'[o][i] = (W[o][i]·s[i] + 128) >> 8。
+// 权重 [ocp][icp][h][ob][ic8][oc8]: 一个 64 B 块的第 i 个字节对应输入通道 h·8 + i/8 → 缩放模式 = 8 个 s 各重复 8 次
+__attribute__((noinline)) void se_wscale(int8_t *w, const uint8_t *sc, int nicp, int nocp) {
+  for (int icp = 0; icp < nicp; icp++) {
+    const V16U s16 = ::aie::load_v<16>(sc + icp * 16);
+    const auto [a0, a1] = ::aie::interleave_zip(s16, s16, 1);       // s0 s0 s1 s1 … (每个 2 次)
+    for (int h = 0; h < 2; h++) {
+      const V16U a = h ? a1 : a0;
+      const auto [b0, b1] = ::aie::interleave_zip(a, a, 2);         // 每个 4 次
+      const V32U b = ::aie::concat(b0, b1);
+      const auto [c0, c1] = ::aie::interleave_zip(b, b, 4);         // 每个 8 次
+      const V64U pat = ::aie::concat(c0, c1);
+      int8_t *p = w + icp * 256 + h * 128;
+      for (int o = 0; o < nocp; o++) {
+        for (int ob = 0; ob < 2; ob++) {
+          const ACC64 m = ::aie::mul(::aie::load_v<64>(p + ob * 64), pat);
+          ::aie::store_v(p + ob * 64, m.template to_vector<int8>(8));
+        }
+        p += nicp * 256;
+      }
+    }
+  }
+}
+
+// 全局平均池化: 元素 = 一个通道组的 kr 行 (每行 X 字节, 前 nvec·64 字节是整行含零边);
+// r = 本组第几个元素; 16 个通道的和在 acc[0..15] (int32) 里跨调用累加, last 时出 640 B 块
+__attribute__((noinline)) void se_pool(const uint8_t *e, int32_t *acc, uint8_t *out, int r, int last,
+                                       const int32_t *h) {
+  const int H = h[34], kr = h[35], X = h[36], nvec = h[37], M = h[38], S = h[39];
+  const V32U ones = ::aie::broadcast<uint8, 32>(1);
+  ACC32 a0 = ::aie::zeros<acc32, 32>(), a1 = ::aie::zeros<acc32, 32>();
+  int kv = H - r * kr;
+  if (kv > kr) kv = kr;
+  for (int i = 0; i < kv; i++) {
+    const uint8_t *p = e + i * X;
+    for (int v = 0; v < nvec; v++) {
+      const V64U x = ::aie::load_v<64>(p);
+      a0 = ::aie::mac(a0, x.extract<32>(0), ones);
+      a1 = ::aie::mac(a1, x.extract<32>(1), ones);
+      p += 64;
+    }
+  }
+  const ::aie::vector<int32, 32> t = ::aie::add(a0.template to_vector<int32>(0), a1.template to_vector<int32>(0));
+  ::aie::vector<int32, 16> sum = ::aie::add(t.extract<16>(0), t.extract<16>(1));
+  if (r > 0) sum = ::aie::add(sum, ::aie::load_v<16>(acc));
+  if (!last) {
+    ::aie::store_v(acc, sum);
+    return;
+  }
+  for (int i = 64; i < CW * 16; i += 64) ::aie::store_v(out + i, ::aie::zeros<uint8, 64>());
+  // (Σ·M + 2^(S-1)) >> S, 饱和到 uint8 (M < 2^15)
+  const ::aie::accum<acc64, 16> m = ::aie::mul(sum, ::aie::broadcast<int16, 16>((int16_t)M));
+  const V32U lo = ::aie::concat(m.template to_vector<uint8>(S), ::aie::zeros<uint8, 16>());
+  ::aie::store_v(out, ::aie::concat(lo, ::aie::zeros<uint8, 32>()));
+}
+
 } // namespace
 
 extern "C" {
@@ -260,12 +343,20 @@ extern "C" {
 //        int32[26] dilation  int32[27] depthwise  int32[28] depthwise 输入元素的行步长 (= m·PLANE)
 // 每个 core c 一段 (字节 32 + 16c 起, u16): [0] rows [1] sel_s1 [2] sel_s2 [3] wvalid [4] 每行块数
 //                                          [5] sel_acc [6] sel_fin
+//        int32[29] 输出激活 (0 ReLU, 1 HardSigmoid)  [30] 输入逐通道乘 sc  [31] 这一步的输入通道组起点
+//        [32] 层第一步之前装载 sc 的元素数 (core 程序读)  [33] 池化段 (core 程序读)  [34..39] 池化参数
+//        [40] 缩放张量每元素的组数  [41] 缩放张量的组步长
 // r = 本 core 这一步里的行号 (只有 IC 分块用来定位 acc)
-void convC16Chunk(int8_t *r0, int8_t *r1, int8_t *r2, int8_t *wts, uint8_t *out, int32_t *acc,
+void convC16Chunk(int8_t *r0, int8_t *r1, int8_t *r2, int8_t *wts, uint8_t *out, int32_t *acc, uint8_t *sc,
                   int32_t j, int32_t r, int32_t core) {
   ::aie::set_saturation(::aie::saturation_mode::saturate);
   ::aie::set_rounding(::aie::rounding_mode::positive_inf);
   const int32_t *h = (const int32_t *)wts;
+  if (j < 0) { // 特殊调用: -1 装载 SE 缩放向量的第 r 个元素, -2 / -3 池化累加 / 池化收尾
+    if (j == -1) se_load((const uint8_t *)r0, sc, r, h[40], h[41]);
+    else se_pool((const uint8_t *)r0, acc, out, r, j == -3, h);
+    return;
+  }
   const Desc d{h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]};
   const uint16_t *pc = (const uint16_t *)(wts + 32 + 16 * core);
   const int wvalid = pc[3];
@@ -285,8 +376,12 @@ void convC16Chunk(int8_t *r0, int8_t *r1, int8_t *r2, int8_t *wts, uint8_t *out,
   } else if (d.k == 1) {
     const int first = h[24], last = h[25];
     const int nch = pc[4];
+    if (h[30]) { // SE: 这一步第一次调用时把缩放折进权重 (组 h[31].. 是这一步的输入通道组), 然后清掉标志
+      se_wscale(wts + HDR, sc + h[31] * 16, d.icp, d.ocp);
+      ((int32_t *)wts)[30] = 0;
+    }
     conv1(r1, w + ocp * (d.icp * 256), out, d, px0, wvalid, acc + (r * nch + j) * (CW * 16), first,
-          last);
+          last, h[29]);
   } else if (d.stride == 2) {
     conv3s2(rows, w + ocp * (9 * d.icp * 256), out, d, px0, wvalid);
   } else {

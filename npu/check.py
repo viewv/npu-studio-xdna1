@@ -38,10 +38,14 @@ def _cases(quick: bool):
     # RVM 整网串联框架 (一次调用多层; 覆盖 s2 滑窗绕法、描述符驱动循环、不均分行、补宽写零)
     from . import chain_c16
     yield "chain_c16 enc 13 层", lambda: chain_c16.selftest("enc", 10)
+    yield "chain_c16 se135 SE 块", lambda: chain_c16.selftest("se135", 10)       # 池化 / FC / HardSigmoid / 逐通道乘
     if not quick:
         yield "chain_c16 low 25 层", lambda: chain_c16.selftest("low", 10)
         yield "chain_c16 deep 13 层", lambda: chain_c16.selftest("deep", 10)   # OC / IC 分块
         yield "chain_c16 mnv3 27 层", lambda: chain_c16.selftest("mnv3", 10)   # 含全部 depthwise
+        yield "chain_c16 se39 SE 块", lambda: chain_c16.selftest("se39", 10)     # 投影层 full 模式
+        yield "chain_c16 se95 SE 块", lambda: chain_c16.selftest("se95", 10)     # 投影层 IC 分块
+        yield "chain_c16 mnv3se 39 层", lambda: chain_c16.selftest("mnv3se", 10)  # 主干 + 4 个 SE
 
 
 def _probe():
