@@ -1,6 +1,10 @@
 """RVM 编码器 (MobileNetV3, 320×180) 的整包功耗: NPU (npu/rvm/encoder_npu) vs onnxruntime CPU
 
   source npu/env.sh && python powerbench_enc.py [--secs 15] [--rounds 6] [--fps 30] [--max-rounds 2]
+                                               [--backends idle,npu,cpu×1,cpu×4,gpu,cpu×1-full]
+
+后端: npu = NPU 编码器; npu-full = NPU 编码器 + 解码器的卷积 (decoder_probe, 不含逐元素部分, 6 次调用); cpu×N = onnxruntime 编码器 N 线程; gpu = studio 用的 RVM 整网 @780M (ncnn + Vulkan, 常驻 worker 进程,
+它的 CPU 时间也算进每帧 CPU); cpu×1-full = onnxruntime 单线程 RVM 整网 (看编码器 / 解码器各占多少)。
 
 两种负载, 都在同一个进程里按轮交替 (每轮内顺序轮换), 跟 README 说的一样: 桌面在用时 PPT 漂移很大,
 分开跑的几分钟对比不可信, 只看同一轮里和空闲成对相减的差。
@@ -31,6 +35,8 @@ SECS = arg("--secs", 15.0)
 ROUNDS = arg("--rounds", 6, int)
 FPS = arg("--fps", 30.0)
 MAX_ROUNDS = arg("--max-rounds", 2, int)
+BACKENDS = arg("--backends", "idle,npu,cpu×1,cpu×4", str).split(",")
+CHILD = []          # 子进程 pid (gpu worker), 它们的 CPU 时间也算
 WARM = 3.0
 
 
@@ -54,7 +60,14 @@ def watts():
 
 def cpu_s():
     r = resource.getrusage(resource.RUSAGE_SELF)
-    return r.ru_utime + r.ru_stime
+    t = r.ru_utime + r.ru_stime
+    for pid in CHILD:
+        try:
+            f = open(f"/proc/{pid}/stat").read().rsplit(")", 1)[1].split()
+            t += (int(f[11]) + int(f[12])) / os.sysconf("SC_CLK_TCK")
+        except (OSError, ValueError, IndexError):
+            pass
+    return t
 
 
 def phase(run, paced: bool):
@@ -136,6 +149,47 @@ def main():
     runs = {"idle": None, "npu": run_npu}
     for th, s in sessions.items():
         runs[f"cpu×{th}"] = (lambda s=s: s.run(None, {x_name: xi}))
+    if "npu-full" in BACKENDS:                            # 编码器 + 解码器的卷积 (npu/rvm/decoder_probe, 随机权重)
+        from npu.rvm.decoder_probe import build_all
+        dec = [d[1] for d in build_all()]
+
+        def run_npu_full():
+            run_npu()
+            for d in dec:
+                d.call()
+        runs["npu-full"] = run_npu_full
+    frames = images(8)                                   # 整网的后端轮流喂几张不同的图
+    if "gpu" in BACKENDS:
+        import cv2
+        from studio.rvm_gpu import RvmGpuMatting
+        g = RvmGpuMatting()
+        CHILD.append(g.proc.pid)
+        bgr = [cv2.cvtColor(f, cv2.COLOR_RGB2BGR) for f in frames]
+        k_g = [0]
+
+        def run_gpu():
+            g(bgr[k_g[0] % len(bgr)])
+            k_g[0] += 1
+        runs["gpu"] = run_gpu
+    if "cpu×1-full" in BACKENDS:
+        so = ort.SessionOptions()
+        so.intra_op_num_threads = 1
+        so.inter_op_num_threads = 1
+        so.add_session_config_entry("session.intra_op.allow_spinning", "0")
+        sf = ort.InferenceSession(str(ONNX), so, providers=["CPUExecutionProvider"])
+        h, w = xf.shape[1:]
+        st = {f"r{i + 1}i": np.zeros((1, ch_, -(-h // 2 ** (i + 1)), -(-w // 2 ** (i + 1))), np.float32)
+              for i, ch_ in enumerate((16, 20, 40, 64))}
+        srcs = [(f.astype(np.float32) / 255).transpose(2, 0, 1)[None] for f in frames]
+        k_f = [0]
+
+        def run_full():
+            out = sf.run(["pha", "r1o", "r2o", "r3o", "r4o"],
+                         {"src": srcs[k_f[0] % len(srcs)], "downsample_ratio": np.array([1.0], np.float32), **st})
+            st.update({f"r{i + 1}i": r for i, r in enumerate(out[1:])})
+            k_f[0] += 1
+        runs["cpu×1-full"] = run_full
+    runs = {k: runs[k] for k in BACKENDS}
 
     names = list(runs)
     print(f"\n[1] 定速 {FPS:.0f} fps, {ROUNDS} 轮 × {len(names)} 种 × {SECS:.0f} s (轮内顺序轮换)", flush=True)

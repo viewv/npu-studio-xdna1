@@ -118,6 +118,8 @@ python -m npu.check --quick       # 只跑 720p 和较短的链, 快一半
 - **但它还比 CPU 慢**：NPU 9.2 ms（压开销后，原 11.4），onnxruntime CPU 单线程 8.4 / 4 线程 3.1 ms。纯计算只有 2.7 ms，
   非计算开销 6.6 ms（层间屏障、每步固定代价）。权重预取 + task group 流水 + 层间权重预取已经做了（见 overhead spike）；
   下一步是把倒残差块融合成一层（少屏障、少步），不是再加算子。
+- **功耗和画质都过关**：30 fps 下 NPU 编码器比 CPU 每秒省约 2.9 W（`powerbench_enc.py`）；用真实人像画面校准后，最终 alpha 和浮点只差边缘带 2.4/255、IoU 0.997（`npu/rvm/alpha_check.py`，见 quant.md）。下一步是解码器上 NPU。
+- **和核显比**：780M 跑 RVM 整网 +3.3 W；NPU 编码器 + 解码器的卷积（`npu/rvm/decoder_probe.py`，高分辨率 3×3 250–300 GMAC/s）+1.2 W → 整网上 NPU 预计每秒省约 2 W。NPU 只有在计算密集时才比核显省（编码器那样开销占大头时每 MMAC 不如核显）。
 - 还缺解码器的 **Concat（拼接视图已有）/ Resize / ConvGRU**、接入 studio；校准用的是系统壁纸（没有人像），要用真实摄像头画面再校一次、看最终 alpha。
 - 程序内存只剩约 0.75 KB：再加内核分支之前先省（把少用的分支挪成 noinline、合并相似的 dw 模板）。
 - 已知性能债：12×20 的 IC 分块层（输入按 OC 份数重读）、12×20 的 5×5 dilation 2 depthwise（步数多）、通用 3×3 只有专用版 61% 的速度、宽 20 补成 40。
