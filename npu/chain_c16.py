@@ -7,7 +7,7 @@
 接 chain_hetero.py (desc-loop spike)。那边留下的问题: (1) 输出 fifo 元素大小要求所有层 OCB·WT 相等;
 (2) 45/23/12 行切不成两段相等、宽 40/20 切不成 2 条 8 的倍数; (3) core 代码随 (行数, stride) 类别数增长。
 这里的做法:
-  · 激活布局改成"16 通道像素" [H+2][CP][PAD + Ws + PAD][16] (内核 npu/kernels/conv_c16.cc)。
+  · 激活布局改成"16 通道像素" [H+2·BR][CP][PAD + Ws + PAD][16] (上下各 BR=4 行零边) (内核 npu/kernels/conv_c16.cc)。
     一个输出块 = 1 个通道组 × CW (=40) 像素 = 640 字节, 是 DDR 里连续的一段 → 任何层的一行输出都是整数个块,
     drain 的 TAP 不用变 ([行][通道组][WT·16])。
   · 存储宽度 Ws 补到 CW 的倍数 (12×20 存成 40 宽), 内核把超出真实宽度的输出写 0 → 补的列就是下一层的零填充。
@@ -33,7 +33,12 @@
   · 补宽列不算也不读: 整组 8 像素都在有效宽度之外时内核只写零; PLANE 按有效宽度 (向上取 8) 定,
     12×20 的层每块只要 512 B → 一个输入元素放 15 个通道组, 少了很多 IC 分块。
 
-还没做: depthwise、5×5、空洞; 3×3 的 IC 分块 (RVM 里没有需要的层)。
+  · dw    depthwise k×k (k = 3/5, stride 1/2, dilation 1/2): 输入元素 = [k 行][m 个通道组][PLANE], DMA 按
+          (s·y + ky·d - pad) 把每个输出行要的 k 行放进一个元素 (TAP [行][ky][组][PLANE], 步长 [s·行, d·行, 组, 1]),
+          core 每行 acquire 1 / release 1 (复用 IC 分块的收尾段, core 代码不变); 每步 m 个通道组, 输入不重读。
+          张量上下各留 BR=4 行零边 (5×5 dilation 2 要 4 行)。内核按 (k, d, s) 模板展开 (运行时版慢 2–3 倍)。
+
+还没做: SE、hardswish、Add、Concat、Resize、ConvGRU; 3×3 的 IC 分块 (RVM 里没有需要的层)。
 层间激活约定同前: 内核输出 uint8 (饱和=ReLU), 下一层把同一字节当 int8 读。
 """
 from __future__ import annotations
@@ -56,6 +61,7 @@ from .harness import SelfTestResult
 
 SRC = str(Path(__file__).resolve().parent / "kernels" / "conv_c16.cc")
 PAD, HDR, CW = 4, 128, 40
+BR = 4                         # 张量上下各 BR 行零边 (5×5 dilation 2 的 depthwise 要 4 行)
 E_IN = 7680                    # 输入元素字节数 (所有层相同; = 10 组 × (40+8)·16)
 W_MAX = 18432                  # 一个权重元素里最多的权重字节 (= 3×3 128→16)
 ACC_CHUNKS = 3                 # acc 缓冲区能放几个输出块的部分和 (每块 CW·16 个 int32 = 2.5 KB)
@@ -77,7 +83,11 @@ class Layer:
     s: int
     h: int
     w: int
+    dw: int = 0     # 1 = depthwise (逐通道, ic == oc)
+    d: int = 1      # dilation
 
+    @property
+    def pad(self): return self.d * (self.k - 1) // 2
     @property
     def ho(self): return cdiv(self.h, self.s)
     @property
@@ -87,9 +97,9 @@ class Layer:
     @property
     def ocp(self): return self.oc // 16
     @property
-    def n_w(self): return self.k * self.k * self.ic * self.oc
+    def n_w(self): return self.k * self.k * (self.oc if self.dw else self.ic * self.oc)
     @property
-    def macs(self): return self.ho * self.wo * self.oc * self.ic * self.k * self.k
+    def macs(self): return self.ho * self.wo * self.oc * (1 if self.dw else self.ic) * self.k * self.k
 
 
 # RVM 编码器形状 (通道补到 16 的倍数; dw 卷积暂时用普通 3×3 代替), 输入 16 通道 180×320
@@ -115,6 +125,25 @@ _T = [(240, 80, 1, "Conv_67"), (80, 208, 1, "Conv_68"), (208, 80, 1, "Conv_74"),
       (960, 128, 1, "Conv_163"), (128, 128, 3, "Conv_176"), (128, 64, 3, "Conv_181")]
 for _ic, _oc, _k, _n in _T:
     R[_n] = Layer(_ic, _oc, _k, 1, 12, 20)
+# RVM 编码器 (MobileNetV3) 主干的真实形状, 跳过 SE 和 hardswish; 通道补到 16 的倍数 (3→16, 24→32, 72→80, 40→48,
+# 120→128, 200→208), Conv_105 的输入用 80 (原 112, 中间几层省掉了)
+_M = [("Conv_8", 16, 16, 3, 2, 180, 320, 0, 1), ("Conv_11", 16, 16, 3, 1, 90, 160, 1, 1),
+      ("Conv_13", 16, 16, 1, 1, 90, 160, 0, 1), ("Conv_15", 16, 64, 1, 1, 90, 160, 0, 1),
+      ("Conv_17", 64, 64, 3, 2, 90, 160, 1, 1), ("Conv_19", 64, 32, 1, 1, 45, 80, 0, 1),
+      ("Conv_20", 32, 80, 1, 1, 45, 80, 0, 1), ("Conv_22", 80, 80, 3, 1, 45, 80, 1, 1),
+      ("Conv_24", 80, 32, 1, 1, 45, 80, 0, 1), ("Conv_26", 32, 80, 1, 1, 45, 80, 0, 1),
+      ("Conv_28", 80, 80, 5, 2, 45, 80, 1, 1), ("Conv_36", 80, 48, 1, 1, 23, 40, 0, 1),
+      ("Conv_37", 48, 128, 1, 1, 23, 40, 0, 1), ("Conv_39", 128, 128, 5, 1, 23, 40, 1, 1),
+      ("Conv_47", 128, 48, 1, 1, 23, 40, 0, 1), ("Conv_61", 48, 240, 1, 1, 23, 40, 0, 1),
+      ("Conv_64", 240, 240, 3, 2, 23, 40, 1, 1), ("Conv_67m", 240, 80, 1, 1, 12, 20, 0, 1),
+      ("Conv_68m", 80, 208, 1, 1, 12, 20, 0, 1), ("Conv_71", 208, 208, 3, 1, 12, 20, 1, 1),
+      ("Conv_74m", 208, 80, 1, 1, 12, 20, 0, 1), ("Conv_105m", 80, 672, 1, 1, 12, 20, 0, 1),
+      ("Conv_122", 672, 672, 5, 1, 12, 20, 1, 2), ("Conv_131m", 672, 160, 1, 1, 12, 20, 0, 1),
+      ("Conv_132m", 160, 960, 1, 1, 12, 20, 0, 1), ("Conv_135", 960, 960, 5, 1, 12, 20, 1, 2),
+      ("Conv_144m", 960, 160, 1, 1, 12, 20, 0, 1)]
+for _n, *_a in _M:
+    R[_n] = Layer(*_a)
+MNV3 = [n for n, *_ in _M]
 ENC = ["e1", "e2", "e3", "e4", "e5", "e6", "e7", "e8", "e9", "e10", "e11", "e12", "e13"]
 DEEP = [n for *_, n in _T]
 CHAINS = {
@@ -122,6 +151,7 @@ CHAINS = {
     "head": ENC[:3],
     "low": ENC + ["e11", "e12", "e13"] * 4,           # 12×20 的三层重复
     "deep": DEEP,                                     # 12×20 高通道段 (OC / IC 分块)
+    "mnv3": MNV3,                                     # 编码器主干, 含全部几种 depthwise
 }
 
 
@@ -132,7 +162,7 @@ def chain_layers(spec: str) -> list[Layer]:
 
 
 def spec_str(layers) -> str:
-    return ";".join(f"{l.ic},{l.oc},{l.k},{l.s},{l.h},{l.w}" for l in layers)
+    return ";".join(f"{l.ic},{l.oc},{l.k},{l.s},{l.h},{l.w},{l.dw},{l.d}" for l in layers)
 
 
 def from_spec_str(s: str) -> list[Layer]:
@@ -151,7 +181,7 @@ class Tensor:
     @property
     def frow(self): return (self.c // 16) * self.cplane
     @property
-    def size(self): return (self.h + 2) * self.frow
+    def size(self): return (self.h + 2 * BR) * self.frow
     @property
     def key(self): return (self.c, self.h, self.ws)
 
@@ -213,6 +243,15 @@ def choose_tiling(l: Layer) -> Tiling:
     tl = Tiling(t, bands, wt, [sum(rows[:b]) for b in range(bands)], rows)
     we = min(wt, cdiv(min(l.wo, wt), 8) * 8)          # 内核实际会读到的输出宽度 (整组在 wvalid 外的不读)
     need = (l.s * we + 2 * PAD) * 16
+    if l.dw:
+        # depthwise: 输入元素 = [k 行][m 个通道组][PLANE], 每步 m 个通道组, 输入不重读
+        assert l.ic == l.oc and l.pad <= min(BR, PAD)
+        m = max(p for p in range(1, l.icp + 1) if E_IN % (l.k * p) == 0 and need <= E_IN // (l.k * p) <= MAX_PLANE
+                and (E_IN // (l.k * p)) % 64 == 0)
+        tl.mode, tl.icp_pad, tl.plane, tl.nocp = "dw", m, E_IN // (l.k * m), m
+        tl.n_ob = cdiv(l.icp, m)
+        tl.steps = [(o * m, min(m, l.icp - o * m), o * m, min(m, l.icp - o * m), 1, 1) for o in range(tl.n_ob)]
+        return tl
     per_ocp = l.k * l.k * l.ic * 16
     for p in range(l.icp, 64):
         if E_IN % p == 0 and need <= E_IN // p <= MAX_PLANE and (E_IN // p) % 64 == 0:
@@ -297,6 +336,8 @@ class Plan:
     @staticmethod
     def _step_wbytes(l, st):
         _, nocp, _, nicp, _, _ = st
+        if l.dw:
+            return nocp * l.k * l.k * 64
         return l.k * l.k * nicp * 16 * nocp * 16
 
     @staticmethod
@@ -305,7 +346,10 @@ class Plan:
         (实测一个 task group 里同一通道排 7 个以上 DMA 任务就挂死, 5 个没事)"""
         if tl.ocpar:
             return [(0, tl.n_ob)]
-        per = 1 if tl.mode == "ict" else (0 if l.s == 1 else cdiv(max(tl.band_rows), 64))
+        if tl.mode == "dw":
+            per = cdiv(max(tl.band_rows), 64)
+        else:
+            per = 1 if tl.mode == "ict" else (0 if l.s == 1 else cdiv(max(tl.band_rows), 64))
         g = tl.n_ob if per == 0 else max(1, FILLS_PER_TG // per)
         return [(o, min(o + g, tl.n_ob)) for o in range(0, tl.n_ob, g)]
 
@@ -315,7 +359,12 @@ class Plan:
         ob1 = tl.n_ob if ob1 is None else ob1
         nob = tl.blocks_of(c) if tl.ocpar else ob1 - ob0
         rows = tl.band_rows[b]
-        off = base + l.s * tl.band_y0[b] * ti.frow + t * l.s * tl.wt * 16
+        off = base + (BR - 1 + l.s * tl.band_y0[b]) * ti.frow + t * l.s * tl.wt * 16   # 窗口第一行 = 真实行 s·y0-1
+        if tl.mode == "dw":      # 每步 (m 个通道组) 每 64 个输出行一个 BD: [输出行][ky][m 组][PLANE]
+            o0 = base + (BR + l.s * tl.band_y0[b] - l.pad) * ti.frow + t * l.s * tl.wt * 16
+            return [(o0 + tl.steps[o][0] * ti.cplane + l.s * r0 * ti.frow,
+                     [min(64, rows - r0), l.k, tl.icp_pad, tl.plane], [l.s * ti.frow, l.d * ti.frow, ti.cplane, 1])
+                    for o in range(ob0, ob1) for r0 in range(0, rows, 64)]
         if tl.mode == "ict":     # 不要上下边行; 每份 OC 一个 BD: [IC 步][行][m 组][PLANE]
             o1 = off + ti.frow
             return [(o1, [tl.n_icb, rows, tl.icp_pad, tl.plane], [tl.icp_pad * ti.cplane, ti.frow, ti.cplane, 1])
@@ -326,21 +375,30 @@ class Plan:
                  [2 * ti.frow, ti.frow, ti.cplane, 1])
                 for _ in range(nob) for r0 in range(0, rows, 64)]
 
+    def drain_taps(self, k, base, c, t, b, ob0=0, ob1=None):
+        tl, to = self.tilings[k], self.tensors[k + 1]
+        if tl.mode == "dw":      # 每步一个 BD (最后一步可能少几个通道组)
+            o0 = base + (BR + tl.band_y0[b]) * to.frow + (PAD + t * tl.wt) * 16
+            return [(o0 + tl.steps[o][0] * to.cplane, [1, tl.band_rows[b], tl.steps[o][1], tl.wt * 16],
+                     [0, to.frow, to.cplane, 1]) for o in range(ob0, ob1)]
+        return [self.drain_tap(k, base, c, t, b, ob0, ob1)]
+
     def drain_tap(self, k, base, c, t, b, ob0=0, ob1=None):
         tl, to = self.tilings[k], self.tensors[k + 1]
         if tl.ocpar:             # core c 的块 c, c+4, … → 通道组 (c + 4i)·nocp
-            off = base + to.frow + PAD * 16 + c * tl.nocp * to.cplane
+            off = base + BR * to.frow + PAD * 16 + c * tl.nocp * to.cplane
             return off, [tl.blocks_of(c), tl.band_rows[0], tl.nocp, tl.wt * 16], \
                 [N_CORES * tl.nocp * to.cplane, to.frow, to.cplane, 1]
         ob1 = tl.n_ob if ob1 is None else ob1
-        off = base + (1 + tl.band_y0[b]) * to.frow + (PAD + t * tl.wt) * 16 + ob0 * tl.nocp * to.cplane
+        off = base + (BR + tl.band_y0[b]) * to.frow + (PAD + t * tl.wt) * 16 + ob0 * tl.nocp * to.cplane
         return off, [ob1 - ob0, tl.band_rows[b], tl.nocp, tl.wt * 16], [tl.nocp * to.cplane, to.frow, to.cplane, 1]
 
     def describe(self):
         out = []
         for l, tl in zip(self.layers, self.tilings):
-            kind = "1×1" if l.k == 1 else f"3×3 s{l.s}"
-            extra = {"full": "", "oc": f" OC 分 {tl.n_ob} 块×{tl.nocp} 组" + (" (OC 并行)" if tl.ocpar else ""),
+            kind = ("dw " if l.dw else "") + ("1×1" if l.k == 1 else f"{l.k}×{l.k} s{l.s}") + \
+                (f" d{l.d}" if l.d > 1 else "")
+            extra = {"dw": f" 每步 {tl.nocp} 组 × {tl.n_ob} 步", "full": "", "oc": f" OC 分 {tl.n_ob} 块×{tl.nocp} 组" + (" (OC 并行)" if tl.ocpar else ""),
                      "ict": f" IC 分 {tl.n_icb} 步×{tl.icp_pad} 组, OC 分 {tl.n_ob} 份×{tl.nocp} 组"}[tl.mode]
             out.append(f"{l.ic}→{l.oc} {kind} {l.h}×{l.w}→{l.ho}×{l.wo}: {tl.n_tw}条×{tl.n_bands}段 "
                        f"WT {tl.wt} 行 {tl.band_rows} ICPpad {tl.icp_pad} PLANE {tl.plane}{extra}")
@@ -461,9 +519,9 @@ def conv_c16(act: In, wts: In, scratch: InOut, out: Out, *, spec: CompileTime[st
                     for o_, sz, st in P.fill_taps(k, soff, c, t, b, ob0, ob1):
                         rt.fill(fifos[c][0].prod(), bufs[src], tap=_tap(P.size[src], o_, sz, st), task_group=tg)
                 for c, t, b in tl.cores():
-                    o_, sz, st = P.drain_tap(k, doff, c, t, b, ob0, ob1)
-                    rt.drain(fifos[c][2].cons(), bufs[dst], tap=_tap(P.size[dst], o_, sz, st), wait=True,
-                             task_group=tg)
+                    for o_, sz, st in P.drain_taps(k, doff, c, t, b, ob0, ob1):
+                        rt.drain(fifos[c][2].cons(), bufs[dst], tap=_tap(P.size[dst], o_, sz, st), wait=True,
+                                 task_group=tg)
                 rt.finish_task_group(tg)
     return Program(iron.get_current_device(), rt).resolve_program()
 
@@ -472,24 +530,28 @@ def conv_c16(act: In, wts: In, scratch: InOut, out: Out, *, spec: CompileTime[st
 
 def to_layout(x: np.ndarray, t: Tensor, size: int) -> np.ndarray:
     c, h, w = x.shape
-    p = np.zeros((c, h + 2, t.ws + 2 * PAD), x.dtype)
-    p[:, 1:-1, PAD:PAD + w] = x
-    flat = p.reshape(c // 16, 16, h + 2, t.ws + 2 * PAD).transpose(2, 0, 3, 1).reshape(-1)
+    p = np.zeros((c, h + 2 * BR, t.ws + 2 * PAD), x.dtype)
+    p[:, BR:BR + h, PAD:PAD + w] = x
+    flat = p.reshape(c // 16, 16, h + 2 * BR, t.ws + 2 * PAD).transpose(2, 0, 3, 1).reshape(-1)
     buf = np.zeros(size, x.dtype)
     buf[:flat.size] = flat
     return buf
 
 
 def from_layout(buf: np.ndarray, t: Tensor) -> np.ndarray:
-    """返回 (C, H+2, Ws+2PAD) 的整幅 (含边), 方便同时检查真实区域和补宽列是否为零"""
+    """返回 (C, H+2·BR, Ws+2PAD) 的整幅 (含边), 方便同时检查真实区域和补宽列是否为零"""
     wp = t.ws + 2 * PAD
-    return buf[:t.size].reshape(t.h + 2, t.c // 16, wp, 16).transpose(1, 3, 0, 2).reshape(t.c, t.h + 2, wp)
+    hp = t.h + 2 * BR
+    return buf[:t.size].reshape(hp, t.c // 16, wp, 16).transpose(1, 3, 0, 2).reshape(t.c, hp, wp)
 
 
 def pack_layer(l: Layer, tl: Tiling, Wq: np.ndarray, shift: int, e_w: int) -> list[np.ndarray]:
     """一层的所有槽 × 每个 core 一个 e_w 字节的权重元素 [头][权重], 顺序 [槽][core]"""
     ocp, icp = l.ocp, l.icp
-    if l.k == 3:   # [ocp][ky][icp][kx][h][ob][ic8][oc8]
+    if l.dw:       # [cp][ky][kx][4 像素][16 通道] (16 个通道的权重复制 4 份, 对上 4 像素 × 16 通道的向量)
+        w4 = Wq.reshape(icp, 16, l.k, l.k).transpose(0, 2, 3, 1)
+        full = np.ascontiguousarray(np.broadcast_to(w4[:, :, :, None, :], (icp, l.k, l.k, 4, 16)))
+    elif l.k == 3:   # [ocp][ky][icp][kx][h][ob][ic8][oc8]
         full = Wq.reshape(ocp, 2, 8, icp, 2, 8, 3, 3).transpose(0, 6, 3, 7, 4, 1, 5, 2)
     else:          # [ocp][icp][h][ob][ic8][oc8]
         full = Wq.reshape(ocp, 2, 8, icp, 2, 8).transpose(0, 3, 4, 1, 5, 2)
@@ -506,20 +568,24 @@ def _pack_step(l, tl, full, shift, e_w, st, c_own):
         return buf
     ocp0, nocp, icp0, nicp, first, last = st
     if True:
-        if l.k == 3:
+        if l.dw:
+            w = full[ocp0:ocp0 + nocp]
+        elif l.k == 3:
             w = full[ocp0:ocp0 + nocp, :, icp0:icp0 + nicp]
         else:
             w = full[ocp0:ocp0 + nocp, icp0:icp0 + nicp]
         hdr = np.zeros(32, np.int32)
         hdr[:8] = [nicp, nocp, tl.wt, l.s, l.k, shift, tl.nxc, tl.plane]
         hdr[24:26] = [first, last]
+        if l.dw:
+            hdr[26:29] = [l.d, 1, tl.icp_pad * tl.plane]
         buf[:HDR] = hdr.view(np.int8)
         for c, t, b in tl.cores():
             if tl.ocpar and c != c_own:
                 continue
             rows = tl.band_rows[b]
             wvalid = min(max(l.wo - t * tl.wt, 0), tl.wt)
-            ict = tl.mode == "ict"
+            ict = tl.mode in ("ict", "dw")       # depthwise 也走"每行 acquire 1 + 出输出"那一段
             per = np.array([rows, int(not ict and l.s == 1), int(not ict and l.s == 2), wvalid, nocp * tl.nxc,
                             int(ict and not last), int(ict and last), 0], np.uint16)
             buf[32 + 16 * c: 48 + 16 * c] = per.view(np.int8)
@@ -529,15 +595,19 @@ def _pack_step(l, tl, full, shift, e_w, st, c_own):
 
 
 def conv_acc(l: Layer, x_i8: np.ndarray, Wq: np.ndarray) -> np.ndarray:
-    p = (l.k - 1) // 2
+    p = l.pad
     xp = np.zeros((l.ic, l.h + 2 * p, l.w + 2 * p), np.int32)
     xp[:, p:p + l.h, p:p + l.w] = x_i8
     acc = np.zeros((l.oc, l.ho * l.wo), np.int32)
     Wi = Wq.astype(np.int32)
     for ky in range(l.k):
         for kx in range(l.k):
-            patch = xp[:, ky:ky + l.s * (l.ho - 1) + 1:l.s, kx:kx + l.s * (l.wo - 1) + 1:l.s]
-            acc += Wi[:, :, ky, kx] @ patch.reshape(l.ic, -1)
+            y0, x0 = ky * l.d, kx * l.d
+            patch = xp[:, y0:y0 + l.s * (l.ho - 1) + 1:l.s, x0:x0 + l.s * (l.wo - 1) + 1:l.s]
+            if l.dw:
+                acc += Wi[:, 0, ky, kx][:, None] * patch.reshape(l.ic, -1)
+            else:
+                acc += Wi[:, :, ky, kx] @ patch.reshape(l.ic, -1)
     return acc.reshape(l.oc, l.ho, l.wo)
 
 
@@ -550,7 +620,7 @@ def make_case(layers, seed=0):
     x = rng.integers(-100, 101, (layers[0].ic, layers[0].h, layers[0].w), dtype=np.int64).astype(np.int8)
     params, cur = [], x
     for l in layers:
-        Wq = rng.integers(-12, 13, (l.oc, l.ic, l.k, l.k)).astype(np.int8)
+        Wq = rng.integers(-12, 13, (l.oc, 1 if l.dw else l.ic, l.k, l.k)).astype(np.int8)
         acc = conv_acc(l, cur.view(np.int8), Wq)
         shift = min(range(3, 16), key=lambda s: abs(requant(acc, s).mean() - 24))
         params.append((Wq, shift))
@@ -582,10 +652,10 @@ class C16Chain:
 
 def check(full: np.ndarray, y: np.ndarray, t: Tensor) -> int:
     """真实区域与参考的最大差; 边和补宽列必须是 0 (否则返回 999)"""
-    real = full[:, 1:-1, PAD:PAD + t.w]
+    real = full[:, BR:BR + t.h, PAD:PAD + t.w]
     d = int(np.abs(real.astype(int) - y.astype(int)).max())
     mask = np.ones(full.shape, bool)
-    mask[:, 1:-1, PAD:PAD + t.w] = False
+    mask[:, BR:BR + t.h, PAD:PAD + t.w] = False
     return d if not full[mask].any() else 999
 
 

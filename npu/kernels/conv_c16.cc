@@ -190,11 +190,74 @@ void conv1(const int8_t *r1, const int8_t *w0, uint8_t *out, const Desc &d, int 
   }
 }
 
+
+// ---------------------------------------------------------------- depthwise (逐通道) k×k, stride s, dilation dil
+// 输入元素 [k 行][m 个通道组][PLANE]: DMA 已经按 (s·y + ky·dil - pad) 把每个输出行要的 k 行放好 (隔行/重复都由 TAP 做),
+// 行步长 = m·PLANE (描述符 int32[28])。权重 [通道组][ky][kx][4 像素][16 通道] (主机侧把 16 个通道的权重复制 4 份,
+// 正好对上 4 像素 × 16 通道的 64 字节向量)。水平偏移 o = kx·dil - pad ∈ [-4, 4] 像素, 用 shuffle 从相邻向量拼。
+// stride 2: 先按 stride 1 算 2 倍的位置, 再取偶数像素 (depthwise 计算量小, 多算一倍换简单)。
+using V64U = ::aie::vector<uint8, 64>;
+using ACC64 = ::aie::accum<acc32, 64>;
+
+template <int O> inline V64 hshift(const V64 &L, const V64 &C, const V64 &R) {
+  if constexpr (O == 0) return C;
+  else if constexpr (O <= -4) return L;
+  else if constexpr (O >= 4) return R;
+  else if constexpr (O < 0) return ::aie::shuffle_up_fill(C, L, (unsigned)(-O * 16));
+  else return ::aie::shuffle_down_fill(C, R, (unsigned)(O * 16));
+}
+
+// 一行 (ky) 对一个 4 像素组的累加, kx 全展开、移位量是常量
+template <int K, int D, int KX = 0>
+inline void dw_row(ACC64 &a, const V64 &L, const V64 &C, const V64 &R, const int8_t *w) {
+  if constexpr (KX < K) {
+    constexpr int O = KX * D - D * (K - 1) / 2;
+    a = ::aie::mac(a, hshift<O>(L, C, R), ::aie::load_v<64>(w + KX * 64));
+    dw_row<K, D, KX + 1>(a, L, C, R, w);
+  }
+}
+
+template <int K, int D, int S>
+__attribute__((noinline)) void dwconv(const int8_t *elem, const int8_t *w0, uint8_t *out, int rstride, int shift,
+                                      int px0, int wvalid) {
+  for (int x = 0; x < CW; x += 8) {
+    if (px0 + x >= wvalid) {
+      ::aie::store_v(out + x * 16, ::aie::zeros<uint8, 64>());
+      ::aie::store_v(out + x * 16 + 64, ::aie::zeros<uint8, 64>());
+      continue;
+    }
+    // S=1: 输出 x0..x0+7 = 两组 (x0, x0+4); S=2: 每半 (h2) 算 stride 1 的 8 个位置再取偶数
+    for (int h2 = 0; h2 < (S == 1 ? 1 : 2); h2++) {
+      ACC64 a0 = ::aie::zeros<acc32, 64>(), a1 = ::aie::zeros<acc32, 64>();
+      const int8_t *p = elem + (PAD + S * (px0 + x) + 8 * h2) * 16;
+      const int8_t *w = w0;
+      for (int ky = 0; ky < K; ky++) {
+        const V64 Lm = ::aie::load_v<64>(p - 64), C0 = ::aie::load_v<64>(p);
+        const V64 C1 = ::aie::load_v<64>(p + 64), Rp = ::aie::load_v<64>(p + 128);
+        dw_row<K, D>(a0, Lm, C0, C1, w);
+        dw_row<K, D>(a1, C0, C1, Rp, w);
+        p += rstride;
+        w += K * 64;
+      }
+      if constexpr (S == 1) {
+        ::aie::store_v(out + x * 16, px0 + x < wvalid ? a0.template to_vector<uint8>(shift) : ::aie::zeros<uint8, 64>());
+        ::aie::store_v(out + (x + 4) * 16,
+                       px0 + x + 4 < wvalid ? a1.template to_vector<uint8>(shift) : ::aie::zeros<uint8, 64>());
+      } else {
+        const V64U e = ::aie::filter_even(::aie::concat(a0.template to_vector<uint8>(shift),
+                                                        a1.template to_vector<uint8>(shift)), 16);
+        ::aie::store_v(out + (x + 4 * h2) * 16, px0 + x + 4 * h2 < wvalid ? e : ::aie::zeros<uint8, 64>());
+      }
+    }
+  }
+}
+
 } // namespace
 
 extern "C" {
 
 // 描述符 int32[0..7]: ICP OCP WT stride k shift NXC PLANE;  int32[24] first  int32[25] last
+//        int32[26] dilation  int32[27] depthwise  int32[28] depthwise 输入元素的行步长 (= m·PLANE)
 // 每个 core c 一段 (字节 32 + 16c 起, u16): [0] rows [1] sel_s1 [2] sel_s2 [3] wvalid [4] 每行块数
 //                                          [5] sel_acc [6] sel_fin
 // r = 本 core 这一步里的行号 (只有 IC 分块用来定位 acc)
@@ -210,7 +273,16 @@ void convC16Chunk(int8_t *r0, int8_t *r1, int8_t *r2, int8_t *wts, uint8_t *out,
   const int px0 = xc * CW;
   int8_t *rows[3] = {r0, r1, r2};
   const int8_t *w = wts + HDR;
-  if (d.k == 1) {
+  if (h[27]) { // depthwise: j 里的通道组号 = 这一步里的第几个通道组
+    const int8_t *e = r0 + ocp * d.plane;
+    const int8_t *wd = w + ocp * (d.k * d.k * 64);
+    const int key = d.k * 100 + h[26] * 10 + d.stride;      // RVM 用到的 5 种组合
+    if (key == 311) dwconv<3, 1, 1>(e, wd, out, h[28], d.shift, px0, wvalid);
+    else if (key == 312) dwconv<3, 1, 2>(e, wd, out, h[28], d.shift, px0, wvalid);
+    else if (key == 511) dwconv<5, 1, 1>(e, wd, out, h[28], d.shift, px0, wvalid);
+    else if (key == 512) dwconv<5, 1, 2>(e, wd, out, h[28], d.shift, px0, wvalid);
+    else if (key == 521) dwconv<5, 2, 1>(e, wd, out, h[28], d.shift, px0, wvalid);
+  } else if (d.k == 1) {
     const int first = h[24], last = h[25];
     const int nch = pc[4];
     conv1(r1, w + ocp * (d.icp * 256), out, d, px0, wvalid, acc + (r * nch + j) * (CW * 16), first,
