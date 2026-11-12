@@ -290,6 +290,58 @@ __attribute__((noinline)) void dwconv(const int8_t *elem, const int8_t *w0, uint
   }
 }
 
+// ---------------------------------------------------------------- 双线性 ×2 上采样 (pytorch_half_pixel)
+// 一个输出块 = CW 个输出像素 = CW/2 个输入像素。c / n = 中心行 / 相邻行里这一块的第一个输入像素 (16 通道):
+// 输出 (2j, 2j+1) = (9·c[j] + 3·n[j] + 3·c[j∓1] + n[j∓1] + 8) >> 4 (rounding positive_inf 就是 +8)。
+// 边上夹住由调用方处理 (相邻行指针换成中心行、左右把边像素抄进 PAD 列)。
+inline void upsample2(const int8_t *c, const int8_t *n, uint8_t *out, int px0, int wvalid) {
+  const V64 k9 = ::aie::broadcast<int8, 64>(9), k3 = ::aie::broadcast<int8, 64>(3),
+            k1 = ::aie::broadcast<int8, 64>(1);
+  for (int x = 0; x < CW; x += 8, c += 64, n += 64) { // 4 个输入像素 → 8 个输出像素
+    if (px0 + x >= wvalid) {
+      ::aie::store_v(out + x * 16, ::aie::zeros<uint8, 64>());
+      ::aie::store_v(out + x * 16 + 64, ::aie::zeros<uint8, 64>());
+      continue;
+    }
+    const V64 cl = ::aie::load_v<64>(c - 64), cc = ::aie::load_v<64>(c), cr = ::aie::load_v<64>(c + 64);
+    const V64 nl = ::aie::load_v<64>(n - 64), nc = ::aie::load_v<64>(n), nr = ::aie::load_v<64>(n + 64);
+    ACC64 e = ::aie::mul(cc, k9), o = ::aie::mul(cc, k9);
+    e = ::aie::mac(e, nc, k3);
+    o = ::aie::mac(o, nc, k3);
+    e = ::aie::mac(e, hshift<-1>(cl, cc, cr), k3);
+    o = ::aie::mac(o, hshift<1>(cl, cc, cr), k3);
+    e = ::aie::mac(e, hshift<-1>(nl, nc, nr), k1);
+    o = ::aie::mac(o, hshift<1>(nl, nc, nr), k1);
+    const auto [lo, hi] = ::aie::interleave_zip(e.template to_vector<int8>(4), o.template to_vector<int8>(4), 16);
+    ::aie::store_v(out + x * 16, lo.template cast_to<uint8>());
+    ::aie::store_v(out + x * 16 + 64, hi.template cast_to<uint8>());
+  }
+}
+
+// 一次调用: 滑窗 (r0, r1, r2) = 输入行 i-1, i, i+1; j = (子行 a, 通道组 g, 块 xc); 每 core 段 [7] = 边界标志
+// (1 左边 2 右边 4 顶段 8 底段 16 最后一行要裁掉)
+__attribute__((noinline)) void upsample_step(int8_t *r0, int8_t *r1, int8_t *r2, const int8_t *wts, uint8_t *out,
+                                             int j, int r, int core) {
+  const int32_t *h = (const int32_t *)wts;
+  const uint16_t *pc = (const uint16_t *)(wts + 32 + 16 * core);
+  const int per = h[1] * h[6], a = j >= per, rest = a ? j - per : j; // 不用除法 (AIE2 没有除法指令, 软件除法很占程序内存)
+  const int g = rest >> h[58], xc = rest & (h[6] - 1);               // h[58] = log2(NXC), NXC 是 2 的幂
+  const int f = pc[7], last = r == pc[0] - 1;
+  int8_t *ce = r1 + g * h[7] + PAD * 16, *ne = (a ? r2 : r0) + g * h[7] + PAD * 16;
+  if ((a == 0 && (f & 4) && r == 0) || (a && (f & 8) && last))
+    ne = ce;
+  if (f & 1) { // 左边夹住: 像素 0 抄进像素 -1 (PAD 列; 元素在本地, 可以写)
+    ::aie::store_v(ce - 16, ::aie::load_v<16>(ce));
+    ::aie::store_v(ne - 16, ::aie::load_v<16>(ne));
+  }
+  if (f & 2) { // 右边夹住: 最后一个有效输入像素抄到它后面一列
+    const int wl = pc[3] / 2;
+    ::aie::store_v(ce + wl * 16, ::aie::load_v<16>(ce + (wl - 1) * 16));
+    ::aie::store_v(ne + wl * 16, ::aie::load_v<16>(ne + (wl - 1) * 16));
+  }
+  upsample2(ce + xc * (CW / 2) * 16, ne + xc * (CW / 2) * 16, out, xc * CW, (a && (f & 16) && last) ? 0 : pc[3]);
+}
+
 // ---------------------------------------------------------------- SE (squeeze-excitation)
 using V16U = ::aie::vector<uint8, 16>;
 using V32U = ::aie::vector<uint8, 32>;
@@ -405,6 +457,7 @@ extern "C" {
 //        int32[29] 输出激活 (0 ReLU uint8, 1 HardSigmoid, 2 线性 int8, 3 hardswish, 4 ReLU int8)
 //        [49] [50] 重新量化的 s1 s2  [52] 重新量化表在权重区里的偏移  [53] [54] hardswish 第二次重新量化的 t1 t2  [30] 输入逐通道乘 sc  [31] 这一步的输入通道组起点
 //        [33] 池化 (1 累加步, 2 收尾步)  [34..39] 池化参数  [43] 池化每组元素数 ne  [47] 池化输入是 int8
+//        [57] 双线性 ×2 上采样 (每 core 段的 [7] 是边界标志)  [58] 上采样的 log2(NXC)
 //        [40] 缩放张量每元素的组数  [41] 缩放张量的组步长  [42] 本步是"装 SE 缩放向量"  [48] SE 只乘前几个输入通道组
 // r = 本 core 这一步里的行号 (只有 IC 分块用来定位 acc)
 void convC16Chunk(int8_t *r0, int8_t *r1, int8_t *r2, int8_t *wts, uint8_t *out, int32_t *acc, uint8_t *sc,
@@ -412,6 +465,8 @@ void convC16Chunk(int8_t *r0, int8_t *r1, int8_t *r2, int8_t *wts, uint8_t *out,
   ::aie::set_saturation(::aie::saturation_mode::saturate);
   ::aie::set_rounding(::aie::rounding_mode::positive_inf);
   const int32_t *h = (const int32_t *)wts;
+  // 按链编译: chain_c16.Plan.kernel_flags() 给链里用不到的分支加 -DNO_xxx (程序内存只有 16 KB, 装不下所有分支)
+#ifndef NO_SE
   if (h[42]) { // 装 SE 缩放向量 (累加段, r = 第几个元素)
     se_load((const uint8_t *)r0, sc, r, h[40], h[41]);
     return;
@@ -426,6 +481,13 @@ void convC16Chunk(int8_t *r0, int8_t *r1, int8_t *r2, int8_t *wts, uint8_t *out,
     }
     return;
   }
+#endif
+#ifndef NO_UP
+  if (h[57]) { // 双线性 ×2 上采样 (整段逻辑在 noinline 函数里, 入口函数保持小 → conv1 仍被内联)
+    upsample_step(r0, r1, r2, wts, out, j, r, core);
+    return;
+  }
+#endif
   const Desc d{h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], h[29], h[49], h[50],
                h[29] == 0 || h[29] == 4 ? 0 : -128};
   const uint16_t *pc = (const uint16_t *)(wts + 32 + 16 * core);
@@ -435,29 +497,48 @@ void convC16Chunk(int8_t *r0, int8_t *r1, int8_t *r2, int8_t *wts, uint8_t *out,
   int8_t *rows[3] = {r0, r1, r2};
   const int8_t *w = wts + HDR;
   const int8_t *rq = w + h[52] + ocp * RQB; // 这个输出通道组的重新量化表
+#ifndef NO_DW
   if (h[27]) { // depthwise: j 里的通道组号 = 这一步里的第几个通道组
     const int8_t *e = r0 + ocp * d.plane;
     const int8_t *wd = w + ocp * (d.k * d.k * 64);
-    if (d.k == 3) dwconv<3, 1>(e, wd, out, h[28], d.stride, px0, wvalid, rq, d);   // RVM 用到的: 3×3 s1/s2,
-    else if (h[26] == 1) dwconv<5, 1>(e, wd, out, h[28], d.stride, px0, wvalid, rq, d); // 5×5 s1/s2,
-    else dwconv<5, 2>(e, wd, out, h[28], d.stride, px0, wvalid, rq, d);                // 5×5 dilation 2
-  } else if (d.k == 1) {
+#ifndef NO_DW3
+    if (d.k == 3) dwconv<3, 1>(e, wd, out, h[28], d.stride, px0, wvalid, rq, d); else // 3×3 s1/s2
+#endif
+#ifndef NO_DW5
+    if (h[26] == 1) dwconv<5, 1>(e, wd, out, h[28], d.stride, px0, wvalid, rq, d); else // 5×5 s1/s2
+#endif
+#ifndef NO_DW5D2
+    dwconv<5, 2>(e, wd, out, h[28], d.stride, px0, wvalid, rq, d); // 5×5 dilation 2
+#else
+    {}
+#endif
+  } else
+#endif
+  if (d.k == 1) {
     const int first = h[24], last = h[25];
     const int nch = pc[4];
+#ifndef NO_SE
     if (h[30]) { // SE: 这一步第一次调用时把缩放折进权重 (组 h[31].. 是这一步的输入通道组), 然后清掉标志
       const int n = h[48] - h[31] < d.icp ? h[48] - h[31] : d.icp; // 拼进来的残差组不乘
       if (n > 0) se_wscale(wts + HDR, sc + h[31] * 16, n, d.icp, d.ocp);
       ((int32_t *)wts)[30] = 0;
     }
+#endif
     conv1(r1, w + ocp * (d.icp * 256), out, d, px0, wvalid, acc + (r * nch + j) * (CW * 16), first,
           last, rq);
-  } else if (d.stride == 2) {
+  }
+#ifndef NO_S2
+  else if (d.stride == 2) {
     conv3s2(rows, w + ocp * (9 * d.icp * 256), out, d, px0, wvalid, rq);
-  } else {
+  }
+#endif
+  else {
     conv3s1(rows, w + ocp * (9 * d.icp * 256), out, d, px0, wvalid, rq);
   }
+#ifndef NO_PA
   if ((h[29] == 1 || h[29] == 3) && h[25]) // IC 分块的中间步 (last = 0) 没有输出
     post_act(out, h[29], wvalid - px0, rq, h[53], h[54]);
+#endif
 }
 
 } // extern "C"

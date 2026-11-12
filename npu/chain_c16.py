@@ -120,13 +120,14 @@ class Layer:
     src: int = -1   # 输入张量 (相对本层输出张量的偏移; -1 = 上一层的输出)
     sc: int = 0     # ≠ 0: 输入逐通道乘这个 C×1×1 张量 (SE 的 Mul), 折进权重: W' = (W·s[ic] + 128) >> 8
     cat: int = 0    # ≠ 0: 输入 = 通道拼接 [张量 src, 张量 cat] (两者放进同一块存储, 不用搬); 残差加 = 拼接 + 单位权重
+    oh: int = 0     # op = 2 (双线性 ×2 上采样) 的输出高度 (0 = 2h; 2h − 1 = 裁掉最后一行, 如 12 → 23)
 
     @property
     def pad(self): return 0 if self.op else self.d * (self.k - 1) // 2
     @property
-    def ho(self): return 1 if self.op == 1 else cdiv(self.h, self.s)
+    def ho(self): return 1 if self.op == 1 else (self.oh or 2 * self.h) if self.op == 2 else cdiv(self.h, self.s)
     @property
-    def wo(self): return 1 if self.op == 1 else cdiv(self.w, self.s)
+    def wo(self): return 1 if self.op == 1 else 2 * self.w if self.op == 2 else cdiv(self.w, self.s)
     @property
     def icp(self): return self.ic // 16
     @property
@@ -137,6 +138,8 @@ class Layer:
     def macs(self):
         if self.op == 1:
             return self.h * self.w * self.ic
+        if self.op == 2:
+            return self.ho * self.wo * self.ic
         return self.ho * self.wo * self.oc * (1 if self.dw else self.ic) * self.k * self.k
 
 
@@ -266,14 +269,26 @@ CHAINS["res144"] = _resid(_real(["Conv_131m", "Conv_132m", "Conv_135"] + SE["Con
 CHAINS["se135a"] = _real(CHAINS["se135"])            # hardswish 的 dw → 有符号池化
 
 
+# 直接用 Layer 写的链 (形状不在 RVM 编码器的卷积表里的)
+LAYER_CHAINS = {
+    # 解码器的上采样 + 卷积骨架: 4 个真实形状的双线性 ×2 (含 12→23、23→45 的裁行), 中间用 3×3 接起来
+    "up": [Layer(128, 128, 1, 1, 12, 20, op=2, oh=23), Layer(128, 80, 3, 1, 23, 40),
+           Layer(80, 80, 1, 1, 23, 40, op=2, oh=45), Layer(80, 48, 3, 1, 45, 80),
+           Layer(48, 48, 1, 1, 45, 80, op=2), Layer(48, 32, 3, 1, 90, 160),
+           Layer(32, 32, 1, 1, 90, 160, op=2), Layer(32, 16, 3, 1, 180, 320)],
+}
+
+
 def chain_layers(spec: str) -> list[Layer]:
+    if spec in LAYER_CHAINS:
+        return list(LAYER_CHAINS[spec])
     if spec in CHAINS:
         return [R[k] for k in CHAINS[spec]]
     return [R[k] for k in spec.split(",")]
 
 
 def spec_str(layers) -> str:
-    return ";".join(f"{l.ic},{l.oc},{l.k},{l.s},{l.h},{l.w},{l.dw},{l.d},{l.op},{l.act},{l.src},{l.sc},{l.cat}"
+    return ";".join(f"{l.ic},{l.oc},{l.k},{l.s},{l.h},{l.w},{l.dw},{l.d},{l.op},{l.act},{l.src},{l.sc},{l.cat},{l.oh}"
                     for l in layers)
 
 
@@ -368,6 +383,32 @@ def _pool_rows(cplane):
                and (E_IN // d) % 64 == 0)
 
 
+def _up_tiling(l: Layer) -> Tiling:
+    """双线性 ×2 上采样: 按输出宽度切条 (wt 是 CW 的倍数, 每条读 wt/2 个输入像素), 按**输入**行切段
+    (band_y0 / band_rows 记输出行 = 2 × 输入行; 最后一段可能多出裁掉的那一行, 内核写 0, 落在下边的零边里)。
+    输入元素 = 一个输入行的 m 个通道组 [m][PLANE], s1 滑窗 (每个输入行窗口出 2 个输出行); 每步 m 个通道组。"""
+    assert l.ic == l.oc and l.oh in (0, 2 * l.h, 2 * l.h - 1) and l.wo % CW == 0, l
+    best = None
+    for t in (4, 2, 1):
+        wt = cdiv(cdiv(l.wo, t), CW) * CW
+        bands = N_CORES // t
+        if l.h < bands or (t - 1) * wt >= l.wo:
+            continue
+        score = (t * wt / l.wo, -t)
+        if best is None or score < best[0]:
+            best = (score, t, wt, bands)
+    _, t, wt, bands = best
+    q, r = divmod(l.h, bands)
+    rows = [q + (1 if b < r else 0) for b in range(bands)]
+    tl = Tiling(t, bands, wt, [2 * sum(rows[:b]) for b in range(bands)], [2 * x for x in rows])
+    need = (wt // 2 + 2 * PAD) * 16
+    m = max(p for p in range(1, l.icp + 1) if E_IN % p == 0 and need <= E_IN // p <= MAX_PLANE and (E_IN // p) % 64 == 0)
+    tl.mode, tl.icp_pad, tl.plane, tl.nocp = "up", m, E_IN // m, m
+    tl.n_ob = cdiv(l.icp, m)
+    tl.steps = [(o * m, min(m, l.icp - o * m), o * m, min(m, l.icp - o * m), 1, 1) for o in range(tl.n_ob)]
+    return tl
+
+
 def choose_tiling(l: Layer, ws_in: int | None = None, w_max: int = 0) -> Tiling:
     W_MAX = w_max or W_BIG
     if l.op == 1:
@@ -379,6 +420,8 @@ def choose_tiling(l: Layer, ws_in: int | None = None, w_max: int = 0) -> Tiling:
                     n_ob=1, n_icb=cdiv(l.h, kr))
         tl.steps = [(0, l.icp, 0, l.icp, 1, 0), (0, l.icp, 0, l.icp, 0, 1)]
         return tl
+    if l.op == 2:
+        return _up_tiling(l)
     best = None
     for t in (4, 2, 1):
         wt = cdiv(cdiv(l.wo, t), CW) * CW
@@ -560,6 +603,8 @@ class Plan:
             return [(0, tl.n_ob)]
         if tl.mode == "dw":
             per = cdiv(max(tl.band_rows), 64)
+        elif tl.mode == "up":
+            per = 1
         else:
             per = 1 if tl.mode == "ict" else (0 if l.s == 1 else cdiv(max(tl.band_rows), 64))
         if per == 0:
@@ -567,6 +612,21 @@ class Plan:
         g = max(1, FILLS_PER_TG // per)
         g0 = max(1, (FILLS_PER_TG - (1 if l.sc else 0)) // per)     # 第一组还要放 SE 缩放向量的 fill
         return [(0, min(g0, tl.n_ob))] + [(o, min(o + g, tl.n_ob)) for o in range(g0, tl.n_ob, g)]
+
+    def kernel_flags(self) -> list[str]:
+        """链里用不到的内核分支 → -DNO_xxx (程序内存只有 16 KB, 装不下所有分支; 编码器 / 解码器各编各的)"""
+        L = self.layers
+        use = {
+            "SE": any(l.op == 1 or l.sc for l in L),
+            "UP": any(l.op == 2 for l in L),
+            "DW": any(l.dw for l in L),
+            "DW3": any(l.dw and l.k == 3 for l in L),
+            "DW5": any(l.dw and l.k == 5 and l.d == 1 for l in L),
+            "DW5D2": any(l.dw and l.k == 5 and l.d == 2 for l in L),
+            "S2": any(not l.op and not l.dw and l.k == 3 and l.s == 2 for l in L),
+            "PA": any(l.act in (1, 3) for l in L),
+        }
+        return [f"-DNO_{k}" for k, v in use.items() if not v]
 
     def chunks(self, k):
         """层 k 的 task group 们: [(ob0, ob1, 权重槽数 ns, 第一个槽 s0)]"""
@@ -595,6 +655,11 @@ class Plan:
             o0 = base + BR * ti.frow + c * ti.cplane
             taps = [(o0, [ng, ne - 1, kr, tl.plane], [N_CORES * ti.cplane, kr * ti.frow, ti.frow, 1])] if ne > 1 else []
             return taps + [(o0 + (ne - 1) * kr * ti.frow, [1, ng, kr, tl.plane], [0, N_CORES * ti.cplane, ti.frow, 1])]
+        if tl.mode == "up":      # 每步 (m 个通道组) 一个 BD: 输入行 y0-1 .. y0+rows, 每行 [m 组][PLANE]; 条 t 从输入像素 t·wt/2 起
+            y0, rr = tl.band_y0[b] // 2, tl.band_rows[b] // 2
+            o0 = base + (BR - 1 + y0) * ti.frow + t * (tl.wt // 2) * 16
+            return [(o0 + tl.steps[o][0] * ti.cplane, [1, rr + 2, tl.icp_pad, tl.plane], [0, ti.frow, ti.cplane, 1])
+                    for o in range(ob0, ob1)]
         off = base + (BR - 1 + l.s * tl.band_y0[b]) * ti.frow + t * l.s * tl.wt * 16   # 窗口第一行 = 真实行 s·y0-1
         if tl.mode == "dw":      # 每步 (m 个通道组) 每 64 个输出行一个 BD: [输出行][ky][m 组][PLANE]
             o0 = base + (BR + l.s * tl.band_y0[b] - l.pad) * ti.frow + t * l.s * tl.wt * 16
@@ -629,7 +694,7 @@ class Plan:
             return [(o0 + r0 * to.frow + tl.steps[o * len(tl.steps) // tl.n_ob][0] * to.cplane,
                      [1, rs, tl.nocp, tl.wt * 16], [0, to.frow, to.cplane, 1])
                     for o in range(ob0, ob1) for r0, rs in [tl.sub_rows(b, o)] if rs]
-        if tl.mode == "dw":      # 每步一个 BD (最后一步可能少几个通道组)
+        if tl.mode in ("dw", "up"):      # 每步一个 BD (最后一步可能少几个通道组)
             o0 = base + (BR + tl.band_y0[b]) * to.frow + (PAD + t * tl.wt) * 16
             return [(o0 + tl.steps[o][0] * to.cplane, [1, tl.band_rows[b], tl.steps[o][1], tl.wt * 16],
                      [0, to.frow, to.cplane, 1]) for o in range(ob0, ob1)]
@@ -650,6 +715,10 @@ class Plan:
         for k, (l, tl) in enumerate(zip(self.layers, self.tilings)):
             kind = ("dw " if l.dw else "") + ("1×1" if l.k == 1 else f"{l.k}×{l.k} s{l.s}") + \
                 (f" d{l.d}" if l.d > 1 else "")
+            if tl.mode == "up":
+                out.append(f"{l.ic} 上采样 ×2 {l.h}×{l.w}→{l.ho}×{l.wo}: {tl.n_tw}条×{tl.n_bands}段 WT {tl.wt} "
+                           f"输出行 {tl.band_rows} 每步 {tl.nocp} 组 × {tl.n_ob} 步 PLANE {tl.plane}")
+                continue
             if tl.mode == "pool":
                 out.append(f"{l.ic} 全局平均池化 {l.h}×{l.w}: 每 core 组 c, c+4, …, 每组 {tl.n_icb} 个元素 × "
                            f"{tl.icp_pad} 行 × {tl.plane} B")
@@ -702,7 +771,7 @@ def conv_c16(act: In, wts: In, scratch: InOut, out: Out, *, spec: CompileTime[st
     kern = ExternalFunction("convC16Chunk", source_file=SRC,
                             arg_types=[in_ty, in_ty, in_ty, w_ty, out_ty, acc_ty, sc_ty, np.int32, np.int32,
                                        np.int32],
-                            include_dirs=[KERNEL_INC], compile_flags=[f"-DCW={CW}"])
+                            include_dirs=[KERNEL_INC], compile_flags=[f"-DCW={CW}", *P.kernel_flags()])
 
     def make_core(cid):
         hc = 32 + 16 * cid          # 本 core 在权重头里的那段
@@ -876,7 +945,7 @@ def pack_layer(l: Layer, tl: Tiling, p: LParam, e_w: int, ws_in: int = 0, sgn_in
     """一层的所有槽 × 每个 core 一个 e_w 字节的权重元素 [头][权重][重新量化表], 顺序 [槽][core]"""
     ocp, icp = l.ocp, l.icp
     Wq = p.W
-    if l.op == 1:
+    if l.op:                 # 池化 / 上采样: 没有权重
         full = None
     elif l.dw:     # [cp][ky][kx][4 像素][16 通道] (16 个通道的权重复制 4 份, 对上 4 像素 × 16 通道的向量)
         w4 = Wq.reshape(icp, 16, l.k, l.k).transpose(0, 2, 3, 1)
@@ -885,7 +954,7 @@ def pack_layer(l: Layer, tl: Tiling, p: LParam, e_w: int, ws_in: int = 0, sgn_in
         full = Wq.reshape(ocp, 2, 8, icp, 2, 8, 3, 3).transpose(0, 6, 3, 7, 4, 1, 5, 2)
     else:          # [ocp][icp][h][ob][ic8][oc8]
         full = Wq.reshape(ocp, 2, 8, icp, 2, 8).transpose(0, 3, 4, 1, 5, 2)
-    rq = None if l.op == 1 else rq_table(l, p)
+    rq = None if l.op else rq_table(l, p)
     return [_pack_step(l, tl, full, p, rq, e_w, st, c_own, ws_in, sgn_in, sc_cp) for slot in tl.slots()
             for c_own, st in enumerate(slot)]
 
@@ -916,6 +985,20 @@ def _pack_step(l, tl, full, p, rq, e_w, st, c_own, ws_in=0, sgn_in=False, sc_cp=
         ng = len(range(c_own, l.icp, N_CORES))
         per = np.array([ng * (tl.n_icb - 1), 0, 0, 1, 1, 1, 0, 0] if first else [ng, 0, 0, 1, 1, 0, 1, 0], np.uint16)
         buf[32 + 16 * c_own: 48 + 16 * c_own] = per.view(np.int8)
+        return buf
+    if l.op == 2:                # 上采样: 没有权重; 每 core [行数, s1 滑窗, 0, 有效输出宽, 每窗口块数 = 2 × 组 × 块, 0, 0, 标志]
+        hdr[:8] = [nicp, nocp, tl.wt, 1, 1, 0, tl.nxc, tl.plane]
+        hdr[57] = 1
+        assert tl.nxc & (tl.nxc - 1) == 0
+        hdr[58] = tl.nxc.bit_length() - 1
+        buf[:HDR] = hdr.view(np.int8)
+        for c, t, b in tl.cores():
+            rows = tl.band_rows[b] // 2
+            wvalid = min(max(l.wo - t * tl.wt, 0), tl.wt)
+            last_b = b == tl.n_bands - 1
+            flags = (t == 0) | (t == tl.n_tw - 1) << 1 | (b == 0) << 2 | last_b << 3 | (last_b and l.ho == 2 * l.h - 1) << 4
+            per = np.array([rows, 1, 0, wvalid, 2 * nocp * tl.nxc, 0, 0, flags], np.uint16)
+            buf[32 + 16 * c: 48 + 16 * c] = per.view(np.int8)
         return buf
     if l.dw:
         w = full[ocp0:ocp0 + nocp]
@@ -1002,6 +1085,23 @@ def pool_ref(x_u8: np.ndarray, sgn=False) -> np.ndarray:
         .reshape(c, 1, 1)
 
 
+def up_ref(x_u8: np.ndarray, ho: int) -> np.ndarray:
+    """双线性 ×2 (pytorch_half_pixel) 的整数版: 输出 (2i+a, 2j+b) = (9·x[i,j] + 3·x[i',j] + 3·x[i,j'] + x[i',j'] + 8) >> 4,
+    i' = i−1 (a = 0) / i+1 (a = 1), j' 同理, 出界就夹在边上; 再裁到 ho 行。按 int8 算, 返回 uint8 位模式"""
+    x = x_u8.view(np.int8).astype(np.int64)
+
+    def nb(a, ax, d):            # 沿 ax 取前 (d=-1) / 后 (d=1) 一个, 边上夹住
+        n = a.shape[ax]
+        idx = np.clip(np.arange(n) + d, 0, n - 1)
+        return np.take(a, idx, ax)
+
+    def axis(a, ax):             # 返回 (3·a + 前, 3·a + 后) 交错 → 长度翻倍
+        e, o = 3 * a + nb(a, ax, -1), 3 * a + nb(a, ax, 1)
+        return np.stack([e, o], ax + 1).reshape(*a.shape[:ax], 2 * a.shape[ax], *a.shape[ax + 1:])
+    y = (axis(axis(x, 1), 2) + 8) >> 4
+    return y[:, :ho].astype(np.int8).view(np.uint8)
+
+
 def signed_in(layers, k) -> bool:
     """层 k 的输入是不是 int8 (输入张量由 act 2 / 3 的层产生; 池化输出跟着输入走)"""
     i = k + layers[k].src
@@ -1033,6 +1133,10 @@ def make_case(layers, seed=0, rq=False):
         if l.op == 1:
             params.append(LParam(None))
             ts.append(pool_ref(cur.view(np.uint8), signed_in(layers, k)))
+            continue
+        if l.op == 2:
+            params.append(LParam(None))
+            ts.append(up_ref(cur, l.ho))
             continue
         Wq = rng.integers(-12, 13, (l.oc, 1 if l.dw else l.ic, l.k, l.k)).astype(np.int8)
         if l.cat:                    # 残差加: 拼进来的 B (= 块的输入) 用单位权重 RES_W 累加进同一个输出通道

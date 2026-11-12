@@ -52,7 +52,7 @@ python -m npu.check --quick       # 只跑 720p 和较短的链, 快一半
 - 层模式：`full`（整层一步）、`oc`（权重太大，按输出通道切块，输入用步长 0 重读）、`ict`（1×1 输入太宽，按输入通道切步，部分和在 core 本地 int32）、
   `dw`（depthwise，DMA 把每个输出行要的 k 行打进一个元素）、`pool`（全局平均池化，按通道组分 core）。
   低分辨率的 oc 层、以及 1 行的 FC 层（含 ict）用 **OC 并行**（每 core 不同通道块、全部行）。
-- 当前支持：普通 3×3（s1/s2）、1×1、depthwise 3×3/5×5（s1/s2、dilation 2）、**SE**（池化 → FC1 → FC2 HardSigmoid →
+- 当前支持：普通 3×3（s1/s2）、1×1、depthwise 3×3/5×5（s1/s2、dilation 2）、**双线性 ×2 上采样**（`Layer(op=2, oh=…)`，解码器用）、**SE**（池化 → FC1 → FC2 HardSigmoid →
   投影层逐通道乘，乘法折进投影层权重）、**残差加**（拼接 + 单位权重），输出激活 ReLU / HardSigmoid / 线性 / **hardswish**，
   **重新量化**：累加器初值 = bias，`y = sat8((sat16(acc >> s1) · M[c]) >> s2)`（M 逐通道 int16）；bias / M / hardswish 的逐通道参数
   放在每步权重后面的重新量化表里（`RQB` = 576 B / 输出通道组，`LParam`、`rq_table`）。激活都是对称 int8（ReLU 0..127）。
@@ -71,7 +71,10 @@ python -m npu.check --quick       # 只跑 720p 和较短的链, 快一半
 6. **一行里多个平面的指针不能写 `base + 编译期常量`**（偏移 ≥ 1024 B 时 llvm-aie 读错地址）。用 `rowops::plane_stride(N)` 或运行时值。`npu.check` 的探针会告诉你 bug 还在不在。
 7. **`acquire(1)` 返回的是元素本身，不是列表**；`win[0]` 会变成取一个字节（编译报 operand type mismatch）。
 8. **JIT 缓存键不含头文件、`harness.py`、模块级常量和 Plan 逻辑**。改了这些（例如 `chain_c16.py` 里的 `E_IN`、`W_MAX`）必须 `rm -rf ~/.npu/cache/*`，否则静默跑旧二进制。
-9. **内存预算**：每 core 数据约 59/64 KB（输入 4×7.5 + 权重 18.9 + acc 7.5 + 输出/dummy 1.9 + SE 缩放 1），**程序 15.25/16 KB**（只剩约 0.75 KB）。
+9. **内存预算**：每 core 数据约 61–63/64 KB（输入 4×7.5 + 权重 2×9.7 或 1×18.9 + acc 7.5 + 输出/dummy 1.9 + SE 缩放 1），
+   **程序 16 KB**：所有分支一起编约 16.0 KB（装不下），所以**按链编译**——`Plan.kernel_flags()` 给链里用不到的分支加 `-DNO_SE / NO_UP / NO_DW / NO_DW3 / NO_DW5 / NO_DW5D2 / NO_S2 / NO_PA`
+   （编码器 ≈ 14.9 KB，解码器类 ≈ 7.5 KB）。加新分支：在 `convC16Chunk` 里用 `#ifndef NO_xxx` 包起来，在 `kernel_flags` 里加判断。
+   `python -m npu.ksize -DCW=40 -DNO_UP …` 看某种组合的大小。
    超了 aiecc 报 `Overflow of program memory` / `XAie_LoadElf failed with XAIE_INVALID_ELF`；`python -m npu.ksize` 看是哪个函数。
    加缓冲区、加内核分支前先算账；`llvm-nm --size-sort -S -C main_core_0_2.elf` 看是哪个函数涨了（`core_0_2` 是 core 程序，`convC16Chunk` 是入口）。
 10. **激活函数在 0 处不为 0 时（HardSigmoid、以后的 bias）要显式把有效宽度外的像素写 0**：ReLU 版靠"零输入 → 零输出"，换了激活就会把补宽列写脏（`check` 报 999）。
@@ -120,7 +123,7 @@ python -m npu.check --quick       # 只跑 720p 和较短的链, 快一半
   下一步是把倒残差块融合成一层（少屏障、少步），不是再加算子。
 - **功耗和画质都过关**：30 fps 下 NPU 编码器比 CPU 每秒省约 2.9 W（`powerbench_enc.py`）；用真实人像画面校准后，最终 alpha 和浮点只差边缘带 2.4/255、IoU 0.997（`npu/rvm/alpha_check.py`，见 quant.md）。下一步是解码器上 NPU。
 - **和核显比**：780M 跑 RVM 整网 +3.3 W；NPU 编码器 + 解码器的卷积（`npu/rvm/decoder_probe.py`，高分辨率 3×3 250–300 GMAC/s）+1.2 W → 整网上 NPU 预计每秒省约 2 W。NPU 只有在计算密集时才比核显省（编码器那样开销占大头时每 MMAC 不如核显）。
-- 还缺解码器的 **Concat（拼接视图已有）/ Resize / ConvGRU**、接入 studio；校准用的是系统壁纸（没有人像），要用真实摄像头画面再校一次、看最终 alpha。
-- 程序内存只剩约 0.75 KB：再加内核分支之前先省（把少用的分支挪成 noinline、合并相似的 dw 模板）。
+- **解码器进行中**（`docs/npu-spikes/rvm-npu-decoder-spike.md`）：浮点参考 `npu/rvm/decoder_ref.py`、量化方案 `npu/rvm/decoder_q.py` 定了；
+  NPU 算子已有双线性 ×2 上采样（`check` 里的 `up` 链）。还缺三路拼接、sigmoid / tanh 查表、GRU 逐元素、LRASPP 逐通道乘、DGF 细化，然后接入 studio。
 - 已知性能债：12×20 的 IC 分块层（输入按 OC 份数重读）、12×20 的 5×5 dilation 2 depthwise（步数多）、通用 3×3 只有专用版 61% 的速度、宽 20 补成 40。
 - RVM 真实形状表：`docs/npu-spikes/rvm_convs_180x320.tsv`（onnxruntime 在工作分辨率 320×180 下跑出来的）。

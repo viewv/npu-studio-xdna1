@@ -41,6 +41,7 @@ def _cases(quick: bool):
     yield "chain_c16 se135 SE 块", lambda: chain_c16.selftest("se135", 10)       # 池化 / FC / HardSigmoid / 逐通道乘
     yield "chain_c16 res144 残差", lambda: chain_c16.selftest("res144", 10)      # hardswish / 有符号池化 / 拼接残差 / IC 分块
     yield "chain_c16 res144 bias/M", lambda: chain_c16.selftest("res144", 10, rq=True)   # 随机 bias + 逐通道重新量化
+    yield "chain_c16 up 解码器上采样", lambda: chain_c16.selftest("up", 10)        # 双线性 ×2 (裁行 / 夹边) + 3×3
     if not quick:
         yield "chain_c16 low 25 层", lambda: chain_c16.selftest("low", 10)
         yield "chain_c16 deep 13 层", lambda: chain_c16.selftest("deep", 10)   # OC / IC 分块
