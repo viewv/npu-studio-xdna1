@@ -40,6 +40,7 @@ def _cases(quick: bool):
     yield "chain_c16 enc 13 层", lambda: chain_c16.selftest("enc", 10)
     if not quick:
         yield "chain_c16 low 25 层", lambda: chain_c16.selftest("low", 10)
+        yield "chain_c16 deep 13 层", lambda: chain_c16.selftest("deep", 10)   # OC / IC 分块
 
 
 def _probe():

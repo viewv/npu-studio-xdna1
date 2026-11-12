@@ -6,7 +6,8 @@
 //     任何层 (OC、宽度不同) 的一行输出都能拆成整数个同样大小的块 → 输出 ObjectFifo 元素大小对所有层相同。
 //   · 每次调用算一个块: 块号 j → (ocp = j / NXC, xc = j % NXC), 像素 [xc·CW, xc·CW + CW)。
 //   · 宽度可以补齐: 像素 ≥ wvalid (本 core 条带的真实宽度, 描述符里按 core 给) 的输出写 0,
-//     所以存储宽度 Ws 可以大于真实宽度, 补出来的列对下一层就是零填充。
+//     所以存储宽度 Ws 可以大于真实宽度, 补出来的列对下一层就是零填充。整组 (8 像素) 都在 wvalid 之外时
+//     不做乘加也不读输入, 所以输入元素每块只需要放到 wvalid 向上取 8 的倍数为止 (主机侧据此定 PLANE)。
 //
 // mmul<4,8,8>: A = 4 像素 × 8 输入通道。16 通道像素的 64 字节向量 (4 像素) 用 interleave_unzip(·, 8)
 // 拆成低 8 通道 / 高 8 通道两个 A, 各喂 2 个输出通道块。
@@ -16,6 +17,10 @@
 //             3×3: [ky][icp][kx][h][ob][ic8][oc8]   (h = 输入通道的低/高 8 个, ob = 输出的低/高 8 个)
 //             1×1: [icp][h][ob][ic8][oc8]
 // 输出块:   [CW][16] uint8 = sat_u8((Σ x·w + 2^(s-1)) >> s)
+//
+// IC 分块 (只用于 1×1, 输入通道太多、一行放不进一个输入元素时): 一层拆成若干步, 每步只带一部分输入通道,
+// 部分和存在 core 本地的 acc 缓冲区 (int32, 每块 CW·16 个, 按 [行][块] 排), 描述符里的 first/last 决定
+// 这一步是从零开始还是接着累加、结束时写回 acc 还是量化成输出。
 #define NOCPP
 #include <stdint.h>
 
@@ -71,6 +76,11 @@ inline void store4(uint8_t *o, MM &c0, MM &c1, int shift, bool valid) {
 
 void conv3s1(int8_t **rows, const int8_t *w0, uint8_t *out, const Desc &d, int px0, int wvalid) {
   for (int x = 0; x < CW; x += 8) {
+    if (px0 + x >= wvalid) { // 整组都是补出来的列: 只写零
+      ::aie::store_v(out + x * 16, ::aie::zeros<uint8, 64>());
+      ::aie::store_v(out + x * 16 + 64, ::aie::zeros<uint8, 64>());
+      continue;
+    }
     MM c00(::aie::zeros<acc32, 32>()), c01(::aie::zeros<acc32, 32>());
     MM c10(::aie::zeros<acc32, 32>()), c11(::aie::zeros<acc32, 32>());
     const int8_t *w = w0;
@@ -99,6 +109,11 @@ void conv3s1(int8_t **rows, const int8_t *w0, uint8_t *out, const Desc &d, int p
 // stride 2: 输出像素 x ← 输入 2x-1, 2x, 2x+1; 16 字节 = 1 像素, filter_even/odd(·, 16) 拆奇偶像素
 void conv3s2(int8_t **rows, const int8_t *w0, uint8_t *out, const Desc &d, int px0, int wvalid) {
   for (int x = 0; x < CW; x += 8) {
+    if (px0 + x >= wvalid) { // 整组都是补出来的列: 只写零
+      ::aie::store_v(out + x * 16, ::aie::zeros<uint8, 64>());
+      ::aie::store_v(out + x * 16 + 64, ::aie::zeros<uint8, 64>());
+      continue;
+    }
     MM c00(::aie::zeros<acc32, 32>()), c01(::aie::zeros<acc32, 32>());
     MM c10(::aie::zeros<acc32, 32>()), c11(::aie::zeros<acc32, 32>());
     const int8_t *w = w0;
@@ -128,10 +143,31 @@ void conv3s2(int8_t **rows, const int8_t *w0, uint8_t *out, const Desc &d, int p
   }
 }
 
-void conv1(const int8_t *r1, const int8_t *w0, uint8_t *out, const Desc &d, int px0, int wvalid) {
+inline ::aie::accum<acc32, 32> ld_acc(const int32_t *p) {
+  ::aie::accum<acc32, 32> a;
+  a.from_vector(::aie::load_v<32>(p), 0);
+  return a;
+}
+
+void conv1(const int8_t *r1, const int8_t *w0, uint8_t *out, const Desc &d, int px0, int wvalid,
+           int32_t *acc, int first, int last) {
   for (int x = 0; x < CW; x += 8) {
+    if (px0 + x >= wvalid) { // 整组都是补出来的列 (acc 也不用管: 收尾步会写零)
+      if (last) {
+        ::aie::store_v(out + x * 16, ::aie::zeros<uint8, 64>());
+        ::aie::store_v(out + x * 16 + 64, ::aie::zeros<uint8, 64>());
+      }
+      continue;
+    }
+    int32_t *ap = acc + (x / 8) * 128; // 每 8 像素 4 个累加器 × 32 = 128 个 int32
     MM c00(::aie::zeros<acc32, 32>()), c01(::aie::zeros<acc32, 32>());
     MM c10(::aie::zeros<acc32, 32>()), c11(::aie::zeros<acc32, 32>());
+    if (!first) {
+      c00 = MM(ld_acc(ap));
+      c01 = MM(ld_acc(ap + 32));
+      c10 = MM(ld_acc(ap + 64));
+      c11 = MM(ld_acc(ap + 96));
+    }
     const int8_t *w = w0;
     const int8_t *p = r1 + (PAD + px0 + x) * 16;
     for (int icp = 0; icp < d.icp; icp++) {
@@ -142,8 +178,15 @@ void conv1(const int8_t *r1, const int8_t *w0, uint8_t *out, const Desc &d, int 
       mac2(c10, c11, C1, w);
       w += 256;
     }
-    store4(out + x * 16, c00, c01, d.shift, px0 + x < wvalid);
-    store4(out + (x + 4) * 16, c10, c11, d.shift, px0 + x + 4 < wvalid);
+    if (last) {
+      store4(out + x * 16, c00, c01, d.shift, px0 + x < wvalid);
+      store4(out + (x + 4) * 16, c10, c11, d.shift, px0 + x + 4 < wvalid);
+    } else {
+      ::aie::store_v(ap, c00.template to_vector<int32>(0));
+      ::aie::store_v(ap + 32, c01.template to_vector<int32>(0));
+      ::aie::store_v(ap + 64, c10.template to_vector<int32>(0));
+      ::aie::store_v(ap + 96, c11.template to_vector<int32>(0));
+    }
   }
 }
 
@@ -151,10 +194,12 @@ void conv1(const int8_t *r1, const int8_t *w0, uint8_t *out, const Desc &d, int 
 
 extern "C" {
 
-// 描述符 int32[0..7]: ICP OCP WT stride k shift NXC PLANE
+// 描述符 int32[0..7]: ICP OCP WT stride k shift NXC PLANE;  int32[24] first  int32[25] last
 // 每个 core c 一段 (字节 32 + 16c 起, u16): [0] rows [1] sel_s1 [2] sel_s2 [3] wvalid [4] 每行块数
-void convC16Chunk(int8_t *r0, int8_t *r1, int8_t *r2, int8_t *wts, uint8_t *out, int32_t j,
-                  int32_t core) {
+//                                          [5] sel_acc [6] sel_fin
+// r = 本 core 这一步里的行号 (只有 IC 分块用来定位 acc)
+void convC16Chunk(int8_t *r0, int8_t *r1, int8_t *r2, int8_t *wts, uint8_t *out, int32_t *acc,
+                  int32_t j, int32_t r, int32_t core) {
   ::aie::set_saturation(::aie::saturation_mode::saturate);
   ::aie::set_rounding(::aie::rounding_mode::positive_inf);
   const int32_t *h = (const int32_t *)wts;
@@ -166,7 +211,10 @@ void convC16Chunk(int8_t *r0, int8_t *r1, int8_t *r2, int8_t *wts, uint8_t *out,
   int8_t *rows[3] = {r0, r1, r2};
   const int8_t *w = wts + HDR;
   if (d.k == 1) {
-    conv1(r1, w + ocp * (d.icp * 256), out, d, px0, wvalid);
+    const int first = h[24], last = h[25];
+    const int nch = pc[4];
+    conv1(r1, w + ocp * (d.icp * 256), out, d, px0, wvalid, acc + (r * nch + j) * (CW * 16), first,
+          last);
   } else if (d.stride == 2) {
     conv3s2(rows, w + ocp * (9 * d.icp * 256), out, d, px0, wvalid);
   } else {
