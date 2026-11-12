@@ -19,6 +19,7 @@
 | 9 | `rvm-npu-quant-spike.md` | 真实权重：量化方案（逐通道激活 + bias + 逐通道 M）、真实编码器 70 层逐字节一致；每层开销占 75% | `npu/rvm/encoder_*.py`、`conv_c16.cc` |
 | 10 | `rvm-npu-overhead-spike.md` | 拆"每层开销"：按步 / 按 task group 算，不是按字节；权重预取 + task group 流水 + 层间权重预取，11.4 → 9.2 ms | `npu/chain_c16.py` |
 | 11 | `rvm-npu-alpha-spike.md` | 摄像头实录看最终 alpha：int8 编码器 + 浮点解码器，真实画面校准后边缘带 2.4/255、IoU 0.997 | `npu/rvm/alpha_check.py` |
+| 12 | `rvm-npu-decoder-spike.md` | 解码器（进行中）：结构、浮点参考、量化方案（GRU 状态固定 1/127、查表激活），只看解码器边缘带 1.05/255 | `npu/rvm/decoder_ref.py`、`decoder_q.py` |
 
 `rvm_convs_180x320.tsv`：RVM（MobileNetV3）85 个卷积在工作分辨率 320×180 下的实测形状和 MAC 数（onnxruntime 跑出来的）。
 
