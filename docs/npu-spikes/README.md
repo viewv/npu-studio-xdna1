@@ -17,6 +17,7 @@
 | 7 | `rvm-npu-se-spike.md` | SE：全局平均池化、FC、HardSigmoid、逐通道乘折进权重；层间分支 | `npu/chain_c16.py`、`conv_c16.cc` |
 | 8 | `rvm-npu-act-res-spike.md` | 省程序内存；hardswish / 线性输出；残差加 = 通道拼接 + 单位权重；IC 切行 | `npu/chain_c16.py`、`conv_c16.cc` |
 | 9 | `rvm-npu-quant-spike.md` | 真实权重：量化方案（逐通道激活 + bias + 逐通道 M）、真实编码器 70 层逐字节一致；每层开销占 75% | `npu/rvm/encoder_*.py`、`conv_c16.cc` |
+| 10 | `rvm-npu-overhead-spike.md` | 拆"每层开销"：按步 / 按 task group 算，不是按字节；权重预取 + task group 流水 + 层间权重预取，11.4 → 9.2 ms | `npu/chain_c16.py` |
 
 `rvm_convs_180x320.tsv`：RVM（MobileNetV3）85 个卷积在工作分辨率 320×180 下的实测形状和 MAC 数（onnxruntime 跑出来的）。
 

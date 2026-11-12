@@ -34,13 +34,14 @@
 | fifo / 缓冲区 | 大小 | 深度 | 说明 |
 |---|---|---|---|
 | 输入 `c16_{c}i` | `E_IN` = 7680 B = `[ICP_pad][PLANE]` 或 dw 的 `[k][m][PLANE]` | 4 | 每块 PLANE 字节里前面是真实像素，后面是 DMA 顺带读的垃圾 |
-| 权重 `c16_{c}w` | `e_w`（= 128 B 头 + 最大一步的权重，补到 256 的倍数，目前约 18.3 KB） | 1 | 一个元素 = 一步 |
+| 权重 `c16_{c}w` | `e_w`（= 256 B 头 + 最大一步的权重 + 重新量化表，补到 256 的倍数） | 2 / 1 | 一个元素 = 一步。链里所有层都放得进 `W_SMALL`(9.8 KB) 时 e_w ≈ 9.7 KB、深度 2（预取）；否则 `W_BIG`(18.9 KB)、深度 1（`Plan.w_depth`，深度 × e_w ≤ `W_BUDGET`） |
 | 输出 `c16_{c}o` | 640 B = 1 个通道组 × CW(40) 像素 | 2 | 一行输出 = 若干个块 |
 | `c16_{c}acc`（Buffer） | `ACC_CHUNKS`(3) × 640 个 int32 = 7.5 KB | – | IC 分块的部分和 |
 | `c16_{c}dummy`（Buffer） | 640 B | – | 累加步没有输出时给内核的占位 |
 | `c16_{c}sc`（Buffer） | 1024 B | – | SE 缩放向量（≤ 64 个通道组），层前面的"装缩放"槽装、本层各步用 |
 
-合计约 58.5 KB / 64 KB。权重 fifo 改深度 2 实测**没有收益**（瓶颈不在权重预取），还会让 3×3 128 通道的层放不下。
+合计约 61–63 KB / 64 KB。小元素 + 深度 2 在真实编码器上快约 11%（tiling spike 那时测"没有收益"是因为当时瓶颈在多读的输入；见 overhead spike）。
+1×1 层一个输出组的权重放不进元素时自动走 IC 分块（ict 的 m 也受 `(W_MAX − RQB) / 256` 限制）。
 
 ## 4. 权重头（256 B）
 
@@ -131,11 +132,15 @@ fill（C×1×1 张量从第 BR 行起连续读 `pre·E_IN` 字节，每 768 B �
 内核每步第一次调用时 `se_wscale` 把 sc 折进这一步的权重：`W' = (W·s + 128) >> 8`。先试过"每行原地乘输入"，
 IC 分块的层每份 OC 都要重读、重乘输入，Conv_144 多 0.35 ms；改成乘权重以后只多 0.07 ms。
 
-- `ict` 的 OC 份大小 nocp 受 acc 限制：`rows · nocp · NXC ≤ ACC_CHUNKS`。12×20 每 core 3 行 → nocp = 1 → 输入要按 OC 份数重读（目前最大的性能债）。
+- `ict` 的 OC 份大小 nocp 受 acc 限制：`rows · nocp · NXC ≤ ACC_CHUNKS`。12×20 每 core 3 行 → nocp = 1 → 输入要按 OC 份数重读。
+  （试过行切得更细、每份多几个通道组：输入少读一半，但步数和份数变多，整体慢 0.6 ms → 输入重读不是瓶颈。）
 - `ict` **切行**：rows · NXC 都放不下（23×40 每 core 6 行）时，每 core 的行再切成 `n_rb` 段（每段 ≤ `rcap` 行），
   份号 o → (OC 块 o // n_rb, 行段 o % n_rb)；每份一个 fill BD、一个 drain BD，只读写自己那段行（`Tiling.sub_rows`）。
   步骤元组多一个第 7 项 = 行段号。
-- 同一层按 OC 块/份分成几个 task group，保证每组每个 shim 通道 ≤ `FILLS_PER_TG`(4) 个 fill（`Plan.ob_groups`）。
+- 同一层按 OC 块/份分成几个 task group（`Plan.ob_groups` / `Plan.chunks`），每组每个 shim 通道 `FILLS_PER_TG`(2) 个 fill。
+  **组之间流水**（`TG_INFLIGHT` = 2）：发完第 g+1 组再 `finish_task_group(g)`，DMA 队列不会空；每个通道在途任务合计 ≤ 4。
+  层之间全屏障（下一层读这一层的输出）；下一层第一组的权重 fill 在屏障之前就发（`W_PREFETCH`，权重不依赖上一层）。
+  IRON 的 runtime sequence 按调用顺序发任务，`finish_task_group` 只是在那个位置插 await/free，所以可以同时开几个组。
 - 权重缓冲区按 `[槽][core][e_w]` 存（每个 core 一份，非 OC 并行时 4 份相同）；每 core 的权重 fill 是
   `[1, 槽数, e_w/256, 256]` 步长 `[0, 4·e_w, 256, 1]`（跳着读，最内维要 ≤ 1023 字）。
 

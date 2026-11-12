@@ -26,7 +26,10 @@
   · ict   IC 分块 (只用于 1×1): 一行输入放不进一个元素时, 每步只带 ≤ 8 个输入通道组, 部分和存在 core 本地的
           int32 acc 缓冲区里 (Buffer); 中间步 (sel_acc) 不出输出, 每个 OC 子块的最后一步 (sel_fin) 量化输出。
           acc 只有 ACC_CHUNKS 个块那么大, 所以 OC 也要切成 k 个通道组一份 (每份把输入再读一遍)。
-  同一层的步按 OC 块/份分成几个 task group (每组每个 shim 通道 ≤ FILLS_PER_TG 个 fill, 多了会挂死)。
+  同一层的步按 OC 块/份分成几个 task group (每组每个 shim 通道 FILLS_PER_TG = 2 个 fill)。组之间流水: 先发下一组
+  再等上一组 (TG_INFLIGHT = 2, 每个通道在途的任务合计 ≤ 4, 多了会挂死); 层之间才是全屏障, 下一层第一组的权重在屏障之前
+  就发出 (W_PREFETCH)。权重元素: 链里没有大 3×3 时用小元素 W_SMALL + fifo 深度 2 (算这一步时预取下一步),
+  否则 W_BIG + 深度 1 (Plan 自动选)。
   · OC 并行: 一条带 (宽 ≤ 40) 的 OC 分块层不再按行切给 4 个 core, 而是每个 core 算不同的 OC 块 (c, c+4, …)、
     处理全部行 → 每 core 只拿 1/4 的权重。权重缓冲区按 [槽][core] 存, 每个 core 读自己那份
     (所以 e_w 补到 256 的倍数, fill 写成 [槽][e_w/256][256]: 跳着读时最内维不能超过 1023 个字)。
@@ -85,11 +88,14 @@ PAD, HDR, CW = 4, 256, 40
 BR = 4                         # 张量上下各 BR 行零边 (5×5 dilation 2 的 depthwise 要 4 行)
 E_IN = 7680                    # 输入元素字节数 (所有层相同; = 10 组 × (40+8)·16)
 RQB = 576                      # 每个输出通道组的重新量化表 (bias / M / hardswish 参数), 跟在这一步的权重后面
-W_MAX = 18432 + RQB            # 一个权重元素里最多的权重 + 重新量化表字节 (= 3×3 128→16)
+W_BIG = 18432 + RQB            # 一个权重元素里最多的权重 + 重新量化表字节 (= 3×3 128→16; 权重 fifo 深度 1)
+W_SMALL = 9216 + RQB           # 链里没有大 3×3 时用小元素 + 深度 2 (算这一步时预取下一步, 实测快 ~11%)
+W_BUDGET = 20480               # 每 core 权重 fifo 的内存 (深度 × e_w)
 ACC_CHUNKS = 3                 # acc 缓冲区能放几个输出块的部分和 (每块 CW·16 个 int32 = 2.5 KB)
 N_CORES = 4
-W_DEPTH = 1                    # 权重 fifo 深度 (2 = 算这一步时预取下一步)
-FILLS_PER_TG = 4               # 一个 task group 里同一个 shim 通道最多排几个 fill
+FILLS_PER_TG = 2               # 一个 task group 里同一个 shim 通道排几个 fill (在途的组合计 ≤ 4, 多了会挂死)
+W_PREFETCH = True              # 下一层第一组的权重在层间屏障之前发出
+TG_INFLIGHT = 2                # 同一层里同时在途的 task group 数 (2 = 发下一组之后再等前一组)
 MAX_PLANE = 4064               # shim BD 最内维上限之内
 SC_BYTES = 1024                # 每 core 的 SE 缩放向量缓冲区 (≤ 64 个通道组)
 
@@ -362,7 +368,8 @@ def _pool_rows(cplane):
                and (E_IN // d) % 64 == 0)
 
 
-def choose_tiling(l: Layer, ws_in: int | None = None) -> Tiling:
+def choose_tiling(l: Layer, ws_in: int | None = None, w_max: int = 0) -> Tiling:
+    W_MAX = w_max or W_BIG
     if l.op == 1:
         # 全局平均池化: 按通道组分给 4 个 core (组 c, c+4, …), 每 core 读自己的组的全部行, 不用跨 core 归约。
         # 输入元素 = 一个通道组的 kr 行 (每行 X 字节); 每组 ne 个元素, 最后一个元素多出来的行内核不看。
@@ -404,7 +411,7 @@ def choose_tiling(l: Layer, ws_in: int | None = None) -> Tiling:
         if E_IN % p == 0 and need <= E_IN // p <= MAX_PLANE and (E_IN // p) % 64 == 0:
             tl.icp_pad, tl.plane = p, E_IN // p
             break
-    if tl.plane:                                     # 一行输入放得下
+    if tl.plane and (per_ocp <= W_MAX or l.k != 1):  # 一行输入放得下 (1×1 一个输出组的权重放不下时走 IC 分块)
         if per_ocp > W_MAX:
             raise ValueError(f"{l}: 一个输出通道组的权重 {per_ocp} B > {W_MAX} (要 3×3 的 IC 分块)")
         tl.nocp = _divisor_le(l.ocp, W_MAX // per_ocp)
@@ -424,10 +431,12 @@ def choose_tiling(l: Layer, ws_in: int | None = None) -> Tiling:
         return tl
     if l.k != 1:
         raise ValueError(f"{l}: 3×3 的一行输入放不下 (要 3×3 的 IC 分块)")
-    # IC 分块: 每步的通道组数 m 取放得下的最大值
-    m = max(p for p in range(1, 64) if E_IN % p == 0 and need <= E_IN // p <= MAX_PLANE and (E_IN // p) % 64 == 0)
+    # IC 分块: 每步的通道组数 m 取放得下的最大值 (一个输出组 m·256 B 的权重也要放进一个权重元素)
+    m = max(p for p in range(1, min(64, (W_MAX - RQB) // 256 + 1))
+            if E_IN % p == 0 and need <= E_IN // p <= MAX_PLANE and (E_IN // p) % 64 == 0)
     tl.mode, tl.icp_pad, tl.plane = "ict", m, E_IN // m
     tl.n_icb = cdiv(l.icp, m)
+    # (试过: 行切得更细、每份多几个通道组 → 输入重读少一半, 但步数 / 份数变多, 整体反而慢; 见 overhead spike)
     k_cap = ACC_CHUNKS // (max(rows) * tl.nxc)
     if k_cap < 1:                # acc 放不下一个 core 的全部行: 行再切段, 每段一份 (输入按段读, 不多读)
         tl.rcap = ACC_CHUNKS // tl.nxc
@@ -449,38 +458,47 @@ class Plan:
     def __init__(self, layers: list[Layer]):
         self.layers = layers
         l0 = layers[0]
-        self.tensors = [Tensor(l0.ic, l0.h, l0.w, l0.w)]
-        self.tilings, self.inp = [], []          # inp[k] = 层 k 的输入张量号 (输出是 k+1)
-        cats = []                                # (A, B): 层读 A ‖ B, B 放在 A 的存储里 A 后面
-        for k, l in enumerate(layers):
-            i = k + 1 + l.src
-            assert 0 <= i <= k, f"层 {k} 的输入 {l.src} 越界"
-            cur = self.tensors[i]
-            ca = cur.c
-            if l.cat:
-                j = k + 1 + l.cat
-                tb = self.tensors[j]
-                assert 0 < j <= k and 0 < i and (tb.h, tb.w, tb.ws) == (cur.h, cur.w, cur.ws), \
-                    f"层 {k} 拼接的两个张量形状不一样: {cur} / {tb}"
-                cats.append((i, j))
-                ca += tb.c
-            assert l.ic == ca and l.h == cur.h and l.w == cur.w, f"接不上: {cur} → {l}"
-            assert l.ic % 16 == 0 and l.oc % 16 == 0
-            if l.sc:
-                ts = self.tensors[k + 1 + l.sc]
-                assert l.k == 1 and l.s == 1 and not l.dw and (ts.c, ts.h, ts.w) == (cur.c, 1, 1), \
-                    f"层 {k} 的缩放张量 {ts} 不对"
-            tl = choose_tiling(l, cur.ws)
-            if l.sc:
-                ts = self.tensors[k + 1 + l.sc]
-                tl.pre = cdiv(ts.c // 16, E_IN // ts.cplane)
-            self.tilings.append(tl)
-            self.inp.append(i)
-            self.tensors.append(Tensor(l.oc, l.ho, l.wo, tl.n_tw * tl.wt))
+        # 权重元素: 先试小元素 + 深度 2 (预取); 有放不进的层 (大 3×3) 就用大元素 + 深度 1
+        for w_max in (W_SMALL, W_BIG):
+            try:
+                self.tensors = [Tensor(l0.ic, l0.h, l0.w, l0.w)]
+                self.tilings, self.inp = [], []          # inp[k] = 层 k 的输入张量号 (输出是 k+1)
+                self.cats = cats = []                            # (A, B): 层读 A ‖ B, B 放在 A 的存储里 A 后面
+                for k, l in enumerate(layers):
+                    i = k + 1 + l.src
+                    assert 0 <= i <= k, f"层 {k} 的输入 {l.src} 越界"
+                    cur = self.tensors[i]
+                    ca = cur.c
+                    if l.cat:
+                        j = k + 1 + l.cat
+                        tb = self.tensors[j]
+                        assert 0 < j <= k and 0 < i and (tb.h, tb.w, tb.ws) == (cur.h, cur.w, cur.ws), \
+                            f"层 {k} 拼接的两个张量形状不一样: {cur} / {tb}"
+                        cats.append((i, j))
+                        ca += tb.c
+                    assert l.ic == ca and l.h == cur.h and l.w == cur.w, f"接不上: {cur} → {l}"
+                    assert l.ic % 16 == 0 and l.oc % 16 == 0
+                    if l.sc:
+                        ts = self.tensors[k + 1 + l.sc]
+                        assert l.k == 1 and l.s == 1 and not l.dw and (ts.c, ts.h, ts.w) == (cur.c, 1, 1), \
+                            f"层 {k} 的缩放张量 {ts} 不对"
+                    tl = choose_tiling(l, cur.ws, w_max)
+                    if l.sc:
+                        ts = self.tensors[k + 1 + l.sc]
+                        tl.pre = cdiv(ts.c // 16, E_IN // ts.cplane)
+                    self.tilings.append(tl)
+                    self.inp.append(i)
+                    self.tensors.append(Tensor(l.oc, l.ho, l.wo, tl.n_tw * tl.wt))
+                break
+            except ValueError:
+                if w_max == W_BIG:
+                    raise
+        cats = self.cats
         self.n_steps = sum(len(tl.slots()) for tl in self.tilings)       # core 外层循环次数
         # 补到 256 的倍数: 权重按 [槽][core] 交错存, fill 是跳着读的, 最内维不能超过 1023 个字
         self.e_w = cdiv(HDR + max(self._step_wbytes(l, st) for l, tl in zip(layers, self.tilings)
                                   for st in tl.steps), 256) * 256
+        self.w_depth = 2 if 2 * self.e_w <= W_BUDGET else 1
         self.step0 = np.cumsum([0] + [len(tl.slots()) for tl in self.tilings]).tolist()
         # 通道拼接: B 住进 A 的存储 (A 在前); 每个存储张量一个自己的 scratch 槽 (有分支, 不能按形状乒乓)
         last = len(self.tensors) - 1
@@ -549,6 +567,21 @@ class Plan:
         g = max(1, FILLS_PER_TG // per)
         g0 = max(1, (FILLS_PER_TG - (1 if l.sc else 0)) // per)     # 第一组还要放 SE 缩放向量的 fill
         return [(0, min(g0, tl.n_ob))] + [(o, min(o + g, tl.n_ob)) for o in range(g0, tl.n_ob, g)]
+
+    def chunks(self, k):
+        """层 k 的 task group 们: [(ob0, ob1, 权重槽数 ns, 第一个槽 s0)]"""
+        l, tl = self.layers[k], self.tilings[k]
+        spo = len(tl.steps) // tl.n_ob                   # 每个 OC 块/份的步数
+        out = []
+        for ob0, ob1 in self.ob_groups(tl, l):
+            if tl.ocpar:
+                ns, s0 = len(tl.slots()), self.step0[k]
+            else:                                        # 有"装缩放"槽时它在第一组最前面
+                pre = 1 if tl.pre else 0
+                ns = (ob1 - ob0) * spo + (pre if ob0 == 0 else 0)
+                s0 = self.step0[k] + ob0 * spo + (pre if ob0 > 0 else 0)
+            out.append((ob0, ob1, ns, s0))
+        return out
 
     def fill_taps(self, k, base, c, t, b, ob0=0, ob1=None):
         """core c 这一层 (OC 块/份 ob0..ob1) 的输入 fill: [(偏移, sizes, strides)]"""
@@ -720,7 +753,7 @@ def conv_c16(act: In, wts: In, scratch: InOut, out: Out, *, spec: CompileTime[st
     fifos, workers = [], []
     for c in range(N_CORES):
         f_in = ObjectFifo(in_ty, depth=4, name=f"c16_{c}i")
-        f_w = ObjectFifo(w_ty, depth=W_DEPTH, name=f"c16_{c}w")
+        f_w = ObjectFifo(w_ty, depth=P.w_depth, name=f"c16_{c}w")
         f_out = ObjectFifo(out_ty, depth=2, name=f"c16_{c}o")
         acc = Buffer(acc_ty, name=f"c16_{c}acc")
         dummy = Buffer(out_ty, name=f"c16_{c}dummy")
@@ -734,21 +767,24 @@ def conv_c16(act: In, wts: In, scratch: InOut, out: Out, *, spec: CompileTime[st
                      np.ndarray[(P.size["s"],), i8], np.ndarray[(P.size["out"],), u8]) as (a, w, s, o):
         bufs = {"act": a, "s": s, "out": o}
         rt.start(*workers)
+        pending, pre_tg = [], None
+
+        def wfill(k, ci, tg):           # 层 k 第 ci 组的权重 (每个 core 一个 BD, 连续 ns 个槽)
+            _, _, ns, s0 = P.chunks(k)[ci]
+            for c, (_, f_w, _) in enumerate(fifos):
+                rt.fill(f_w.prod(), w, tap=_tap(nw, (s0 * N_CORES + c) * P.e_w, [1, ns, P.e_w // 256, 256],
+                                                 [0, N_CORES * P.e_w, 256, 1]), task_group=tg)
+
         for k, l in enumerate(layers):
             (src, soff), (dst, doff) = P.io[k]
             tl = P.tilings[k]
-            spo = len(tl.steps) // tl.n_ob                   # 每个 OC 块/份的步数
-            for ob0, ob1 in P.ob_groups(tl, l):
-                if tl.ocpar:
-                    ns, s0 = len(tl.slots()), P.step0[k]
-                else:                                        # 有"装缩放"槽时它在第一组最前面
-                    pre = 1 if tl.pre else 0
-                    ns = (ob1 - ob0) * spo + (pre if ob0 == 0 else 0)
-                    s0 = P.step0[k] + ob0 * spo + (pre if ob0 > 0 else 0)
-                tg = rt.task_group()
-                for c, (f_in, f_w, _) in enumerate(fifos):
-                    rt.fill(f_w.prod(), w, tap=_tap(nw, (s0 * N_CORES + c) * P.e_w, [1, ns, P.e_w // 256, 256],
-                                                     [0, N_CORES * P.e_w, 256, 1]), task_group=tg)
+            for ci, (ob0, ob1, _, _) in enumerate(P.chunks(k)):
+                if ci == 0 and pre_tg is not None:          # 权重在上一层屏障之前就发了
+                    tg, pre_tg = pre_tg, None
+                else:
+                    tg = rt.task_group()
+                    wfill(k, ci, tg)
+                pending.append(tg)
                 if l.sc and ob0 == 0:                        # SE 缩放向量: 每个 core 层的第一步之前
                     ssrc, sbase = P.loc[k + 1 + l.sc]
                     for c, t, b in tl.cores():
@@ -761,7 +797,13 @@ def conv_c16(act: In, wts: In, scratch: InOut, out: Out, *, spec: CompileTime[st
                     for o_, sz, st in P.drain_taps(k, doff, c, t, b, ob0, ob1):
                         rt.drain(fifos[c][2].cons(), bufs[dst], tap=_tap(P.size[dst], o_, sz, st), wait=True,
                                  task_group=tg)
-                rt.finish_task_group(tg)
+                while len(pending) >= TG_INFLIGHT:          # 下一组已经排上了, 再等前一组 (队列不空)
+                    rt.finish_task_group(pending.pop(0))
+            if W_PREFETCH and k + 1 < len(layers):          # 下一层第一组的权重不依赖这一层, 先发
+                pre_tg = rt.task_group()
+                wfill(k + 1, 0, pre_tg)
+            while pending:                                   # 层间屏障: 下一层要读这一层的输出
+                rt.finish_task_group(pending.pop(0))
     return Program(iron.get_current_device(), rt).resolve_program()
 
 

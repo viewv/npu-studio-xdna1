@@ -62,7 +62,7 @@
 
 ### 资源分配失败
 - **症状**：`Error: Resource allocation pipeline failed`。
-- **原因**：通常是 core 数据内存超了 64 KB（比如权重 fifo 深度 1 → 2，18 KB × 2）。
+- **原因**：通常是 core 数据内存超了 64 KB（比如权重 fifo 深度 2 × 18.9 KB 的大元素；`Plan.w_depth` 只在深度 × e_w ≤ `W_BUDGET` 时用 2）。
 - **办法**：先算账（见 chain-framework.md §3），再减深度 / 减元素大小 / 把大权重拆步。
 
 ## DMA / runtime sequence
@@ -74,7 +74,8 @@
 
 ### 一个 task group 里同一 shim 通道排太多任务 → 挂死
 - **症状**：`ERT_CMD_STATE_TIMEOUT`。实测 5 个 fill 没事，7 个以上挂死（像是通道任务队列深度）。
-- **办法**：一层拆成多个 task group，每组每通道 ≤ 4 个 fill（`FILLS_PER_TG`），组之间是普通屏障。
+- **办法**：每个通道**在途**（已发、没 await）的任务合计 ≤ 4。现在每组 2 个 fill、同时在途 2 组（`FILLS_PER_TG` × `TG_INFLIGHT`），
+  再加一个预取的权重 fill，权重通道最多 3 个。改这两个常量前先算这个账。
 
 ### fill/drain 字节数必须和 core 的消费/产出严格对上
 - 输入 fifo 元素固定大小 → 每个 fill 的总字节必须是元素大小的整数倍，且等于 core 要 acquire 的元素数 × 元素大小；
