@@ -54,9 +54,13 @@
     写的人直接写到位, 不用搬。残差加 = 拼接 + 投影层里残差那部分用单位权重 RES_W (内核不用改)。
   · ict 切行: 一个 core 的行数 × 块数放不进 acc 时, 行再切成几段 (n_rb), 每段一份 (输入只读自己那段)。
 
+  · 重新量化 (LParam): 累加器初值 = bias, 输出 y = sat8((sat16((acc + 2^(s1-1)) >> s1) · M[c] + 2^(s2-1)) >> s2),
+    M 是逐通道 int16。bias / M / hardswish 的逐通道参数放在每步权重后面的重新量化表里 (每个输出通道组 RQB 字节,
+    已经排成内核要的向量布局)。随机权重的测试用 bias 0、M 1、s1 = shift、s2 0 (= 只移位); --rq 用随机 bias 和 M。
+    真实 RVM 编码器的权重和参数由 npu/rvm/encoder_q.py (量化模拟) 冻结, npu/rvm/encoder_npu.py 转成这里的层。
+
 还没做: Concat 层 (拼接视图有了, 解码器还没接)、Resize、ConvGRU; 3×3 的 IC 分块 (RVM 里没有需要的层)。
-层间激活约定: ReLU / HardSigmoid 输出 uint8, 线性 / hardswish 输出 int8; 下一层一律把字节当 int8 读
-(ReLU 的输出被当 int8 读是实验约定, 接真实模型时换成 per-tensor 零点)。
+层间激活约定: 全部是对称 int8 (零点 0); ReLU 输出 0..127, HardSigmoid 输出 uint8 (比例 1/256, 只给 SE 的缩放用)。
 """
 from __future__ import annotations
 
@@ -80,7 +84,8 @@ SRC = str(Path(__file__).resolve().parent / "kernels" / "conv_c16.cc")
 PAD, HDR, CW = 4, 256, 40
 BR = 4                         # 张量上下各 BR 行零边 (5×5 dilation 2 的 depthwise 要 4 行)
 E_IN = 7680                    # 输入元素字节数 (所有层相同; = 10 组 × (40+8)·16)
-W_MAX = 18432                  # 一个权重元素里最多的权重字节 (= 3×3 128→16)
+RQB = 576                      # 每个输出通道组的重新量化表 (bias / M / hardswish 参数), 跟在这一步的权重后面
+W_MAX = 18432 + RQB            # 一个权重元素里最多的权重 + 重新量化表字节 (= 3×3 128→16)
 ACC_CHUNKS = 3                 # acc 缓冲区能放几个输出块的部分和 (每块 CW·16 个 int32 = 2.5 KB)
 N_CORES = 4
 W_DEPTH = 1                    # 权重 fifo 深度 (2 = 算这一步时预取下一步)
@@ -394,7 +399,7 @@ def choose_tiling(l: Layer, ws_in: int | None = None) -> Tiling:
         tl.n_ob = cdiv(l.icp, m)
         tl.steps = [(o * m, min(m, l.icp - o * m), o * m, min(m, l.icp - o * m), 1, 1) for o in range(tl.n_ob)]
         return tl
-    per_ocp = l.k * l.k * l.ic * 16
+    per_ocp = l.k * l.k * l.ic * 16 + RQB
     for p in range(l.icp, 64):
         if E_IN % p == 0 and need <= E_IN // p <= MAX_PLANE and (E_IN // p) % 64 == 0:
             tl.icp_pad, tl.plane = p, E_IN // p
@@ -429,7 +434,7 @@ def choose_tiling(l: Layer, ws_in: int | None = None) -> Tiling:
         if tl.rcap < 1:
             raise ValueError(f"{l}: acc 放不下一行 ({tl.nxc} 块 > {ACC_CHUNKS})")
         tl.n_rb, k_cap = cdiv(max(rows), tl.rcap), 1
-    tl.nocp = _divisor_le(l.ocp, min(k_cap, W_MAX // (m * 256)))
+    tl.nocp = _divisor_le(l.ocp, min(k_cap, W_MAX // (m * 256 + RQB)))
     tl.n_ob = l.ocp // tl.nocp * tl.n_rb
     tl.steps = [((o // tl.n_rb) * tl.nocp, tl.nocp, i * m, min(m, l.icp - i * m), int(i == 0), int(i == tl.n_icb - 1),
                  o % tl.n_rb)
@@ -526,8 +531,8 @@ class Plan:
         if l.op:
             return 0
         if l.dw:
-            return nocp * l.k * l.k * 64
-        return l.k * l.k * nicp * 16 * nocp * 16
+            return nocp * (l.k * l.k * 64 + RQB)
+        return l.k * l.k * nicp * 16 * nocp * 16 + nocp * RQB
 
     @staticmethod
     def ob_groups(tl, l):
@@ -779,10 +784,56 @@ def from_layout(buf: np.ndarray, t: Tensor) -> np.ndarray:
     return buf[:t.size].reshape(hp, t.c // 16, wp, 16).transpose(1, 3, 0, 2).reshape(t.c, hp, wp)
 
 
-def pack_layer(l: Layer, tl: Tiling, Wq, shift: int, e_w: int, ws_in: int = 0, sgn_in=False,
+@dataclass
+class LParam:
+    """一层的整数参数。y = act(sat8((sat16((acc + bias + 2^(s1-1)) >> s1) · M[c] + 2^(s2-1)) >> s2))
+    hardswish (act 3): yt = y · clamp(y + q3[c], 0, q6[c]), out = sat8((sat16((yt + 2^(t1-1)) >> t1) · M2[c] + …) >> t2)
+    默认值 (bias 0, M 1, s2 0, q3 = 3·HS_Q …) 就是随机权重老测试的"只移位"量化。"""
+    W: np.ndarray | None
+    s1: int = 0
+    s2: int = 0
+    bias: np.ndarray | None = None
+    M: np.ndarray | None = None
+    q3: np.ndarray | None = None
+    q6: np.ndarray | None = None
+    M2: np.ndarray | None = None
+    t1: int = 0
+    t2: int = 0
+
+    def arr(self, name, n, default):
+        v = getattr(self, name)
+        return np.full(n, default, np.int64) if v is None else np.asarray(v, np.int64)
+
+
+def rq_table(l: Layer, p: LParam) -> np.ndarray:
+    """[ocp][RQB] 字节: 每个输出通道组的 bias / M (mmul 或 dw 的布局) / hardswish 参数"""
+    oc = l.oc
+    bias, M = p.arr("bias", oc, 0).reshape(-1, 16), p.arr("M", oc, 1).reshape(-1, 16)
+    q3 = p.arr("q3", oc, 3 * HS_Q).reshape(-1, 16)
+    q6 = p.arr("q6", oc, 6 * HS_Q).reshape(-1, 16)
+    M2 = p.arr("M2", oc, 1).reshape(-1, 16)
+    n = oc // 16
+    out = np.zeros((n, RQB), np.int8)
+    if l.dw:     # [4 像素][16 通道]
+        b4 = np.repeat(bias[:, None, :], 4, 1).reshape(n, 64)
+        m4 = np.repeat(M[:, None, :], 4, 1).reshape(n, 64)
+    else:        # mmul: 低 8 通道 [4 像素][8], 高 8 通道 [4 像素][8]
+        b4 = np.concatenate([np.repeat(bias[:, None, :8], 4, 1).reshape(n, 32),
+                             np.repeat(bias[:, None, 8:], 4, 1).reshape(n, 32)], 1)
+        m4 = np.concatenate([np.repeat(M[:, None, :8], 4, 1).reshape(n, 32),
+                             np.repeat(M[:, None, 8:], 4, 1).reshape(n, 32)], 1)
+    out[:, :256] = b4.astype(np.int32).view(np.int8).reshape(n, 256)
+    out[:, 256:384] = m4.astype(np.int16).view(np.int8).reshape(n, 128)
+    for i, v in enumerate((q3, q6, M2)):     # [2 像素][16]
+        out[:, 384 + 64 * i: 448 + 64 * i] = np.tile(v, 2).astype(np.int16).view(np.int8).reshape(n, 64)
+    return out
+
+
+def pack_layer(l: Layer, tl: Tiling, p: LParam, e_w: int, ws_in: int = 0, sgn_in=False,
                sc_cp=0) -> list[np.ndarray]:
-    """一层的所有槽 × 每个 core 一个 e_w 字节的权重元素 [头][权重], 顺序 [槽][core]"""
+    """一层的所有槽 × 每个 core 一个 e_w 字节的权重元素 [头][权重][重新量化表], 顺序 [槽][core]"""
     ocp, icp = l.ocp, l.icp
+    Wq = p.W
     if l.op == 1:
         full = None
     elif l.dw:     # [cp][ky][kx][4 像素][16 通道] (16 个通道的权重复制 4 份, 对上 4 像素 × 16 通道的向量)
@@ -792,14 +843,15 @@ def pack_layer(l: Layer, tl: Tiling, Wq, shift: int, e_w: int, ws_in: int = 0, s
         full = Wq.reshape(ocp, 2, 8, icp, 2, 8, 3, 3).transpose(0, 6, 3, 7, 4, 1, 5, 2)
     else:          # [ocp][icp][h][ob][ic8][oc8]
         full = Wq.reshape(ocp, 2, 8, icp, 2, 8).transpose(0, 3, 4, 1, 5, 2)
-    return [_pack_step(l, tl, full, shift, e_w, st, c_own, ws_in, sgn_in, sc_cp) for slot in tl.slots()
+    rq = None if l.op == 1 else rq_table(l, p)
+    return [_pack_step(l, tl, full, p, rq, e_w, st, c_own, ws_in, sgn_in, sc_cp) for slot in tl.slots()
             for c_own, st in enumerate(slot)]
 
 
 POOL_S = 22      # 池化均值 = (Σ·M + 2^(S-1)) >> S, M = round(2^S / (H·W)); 255·H·W·M < 2^31
 
 
-def _pack_step(l, tl, full, shift, e_w, st, c_own, ws_in=0, sgn_in=False, sc_cp=0):
+def _pack_step(l, tl, full, p, rq, e_w, st, c_own, ws_in=0, sgn_in=False, sc_cp=0):
     buf = np.zeros(e_w, np.int8)
     if st is None:               # 这个 core 这一槽空闲: 全零头 (所有选择字节为 0)
         return buf
@@ -829,13 +881,15 @@ def _pack_step(l, tl, full, shift, e_w, st, c_own, ws_in=0, sgn_in=False, sc_cp=
         w = full[ocp0:ocp0 + nocp, :, icp0:icp0 + nicp]
     else:
         w = full[ocp0:ocp0 + nocp, icp0:icp0 + nicp]
-    hdr[:8] = [nicp, nocp, tl.wt, l.s, l.k, shift, tl.nxc, tl.plane]
+    hdr[:8] = [nicp, nocp, tl.wt, l.s, l.k, p.s1, tl.nxc, tl.plane]
     hdr[24:26] = [first, last]
     if l.dw:
         hdr[26:29] = [l.d, 1, tl.icp_pad * tl.plane]
     hdr[29:32] = [l.act, int(bool(l.sc)), icp0]
     hdr[48] = sc_cp                  # SE: 只有前 sc_cp 个输入通道组乘缩放 (后面是拼进来的残差)
-    hdr[44:47] = [3 * HS_Q, 6 * HS_Q, HS_S]
+    flat = np.ascontiguousarray(w).reshape(-1)
+    hdr[49:51] = [p.s1, p.s2]
+    hdr[52:55] = [flat.size, p.t1, p.t2]     # 重新量化表紧跟在权重后面 (权重字节数都是 64 的倍数)
     buf[:HDR] = hdr.view(np.int8)
     for c, t, b in tl.cores():
         if tl.ocpar and c != c_own:
@@ -846,8 +900,9 @@ def _pack_step(l, tl, full, shift, e_w, st, c_own, ws_in=0, sgn_in=False, sc_cp=
         per = np.array([rows, int(not ict and l.s == 1), int(not ict and l.s == 2), wvalid, nocp * tl.nxc,
                         int(ict and not last), int(ict and last), 0], np.uint16)
         buf[32 + 16 * c: 48 + 16 * c] = per.view(np.int8)
-    flat = np.ascontiguousarray(w).reshape(-1)
     buf[HDR:HDR + flat.size] = flat
+    t = rq[ocp0:ocp0 + nocp].reshape(-1)
+    buf[HDR + flat.size: HDR + flat.size + t.size] = t
     return buf
 
 
@@ -871,17 +926,28 @@ def conv_acc(l: Layer, x_i8: np.ndarray, Wq: np.ndarray) -> np.ndarray:
 HS_Q, HS_S = 20, 7   # hardswish: y 的 1.0 = HS_Q; 输出 = (y · clamp(y + 3q, 0, 6q) + 2^(s-1)) >> s
 
 
-def requant(acc, shift, act=0):
-    """返回 uint8 字节 (act 2 / 3 是 int8 的位模式, 下一层按 int8 读)"""
-    r = (acc + (1 << (shift - 1))) >> shift
-    if act == 0:
-        return np.clip(r, 0, 255).astype(np.uint8)
+def _rs(v, s):
+    return (v + (1 << (s - 1))) >> s if s > 0 else v
+
+
+def requant(acc, p: LParam | int, act=0):
+    """acc (C, H, W) int (已含 bias) → 输出字节 (uint8; act 2 / 3 / 4 是 int8 的位模式, 下一层按 int8 读)。
+    p 是 int 时就是老测试的"只移位" (LParam(None, s1=p))"""
+    if not isinstance(p, LParam):
+        p = LParam(None, s1=p)
+    c = acc.shape[0]
+    col = lambda v: v.reshape(-1, *([1] * (acc.ndim - 1)))
+    t = np.clip(_rs(acc.astype(np.int64), p.s1), -32768, 32767)
+    r = _rs(t * col(p.arr("M", c, 1)), p.s2)
+    if act in (0, 4):    # ReLU: int8 的 0..127
+        return np.clip(r, 0, 127).astype(np.uint8)
     y = np.clip(r, -128, 127)
-    if act == 1:     # HardSigmoid: int8 饱和后 +128 (0 → 0.5, ±(128·2^s) → 0 / 1)
+    if act == 1:     # HardSigmoid: int8 饱和后 +128 (0 → 0.5)
         return (y + 128).astype(np.uint8)
-    if act == 3:     # hardswish: x · relu6(x + 3) / 6, 输出比例 = 2^s / (6q²)
-        t = np.clip(y + 3 * HS_Q, 0, 6 * HS_Q)
-        y = np.clip((y * t + (1 << (HS_S - 1))) >> HS_S, -128, 127)
+    if act == 3:     # hardswish: 逐通道 q3 / q6, 再重新量化一次
+        yt = y * np.clip(y + col(p.arr("q3", c, 3 * HS_Q)), 0, col(p.arr("q6", c, 6 * HS_Q)))
+        t2 = np.clip(_rs(yt, p.t1), -32768, 32767)
+        y = np.clip(_rs(t2 * col(p.arr("M2", c, 1)), p.t2), -128, 127)
     return y.astype(np.int8).view(np.uint8)
 
 
@@ -914,15 +980,16 @@ def se_weights(Wq: np.ndarray, s_u8: np.ndarray) -> np.ndarray:
     return w
 
 
-def make_case(layers, seed=0):
-    """随机输入和权重, 按层的 src / sc 连成图, 返回 (输入, 每层 (权重, shift), 末层参考)"""
+def make_case(layers, seed=0, rq=False):
+    """随机输入和权重, 按层的 src / sc 连成图, 返回 (输入, 每层 LParam, 末层参考)。
+    rq: 随机 bias 和逐通道 M (测完整的重新量化路径); 否则只移位 (bias 0, M 1)"""
     rng = np.random.default_rng(seed)
     x = rng.integers(-100, 101, (layers[0].ic, layers[0].h, layers[0].w), dtype=np.int64).astype(np.int8)
     params, ts = [], [x]
     for k, l in enumerate(layers):
         cur = ts[k + 1 + l.src]
         if l.op == 1:
-            params.append((None, 0))
+            params.append(LParam(None))
             ts.append(pool_ref(cur.view(np.uint8), signed_in(layers, k)))
             continue
         Wq = rng.integers(-12, 13, (l.oc, 1 if l.dw else l.ic, l.k, l.k)).astype(np.int8)
@@ -936,8 +1003,17 @@ def make_case(layers, seed=0):
             shift = min(range(3, 18), key=lambda s: abs(np.clip((acc + (1 << (s - 1))) >> s, -128, 127).std() - 40))
         else:
             shift = min(range(3, 16), key=lambda s: abs(requant(acc, s).mean() - 24))
-        params.append((Wq, shift))
-        ts.append(requant(acc, shift, l.act))
+        p = LParam(Wq, s1=shift)
+        if rq:                   # bias ±(2^shift·16); M ∈ [2^13, 2^14) 配 s1 = shift-6, s2 = 7: 整体 ≈ 原来的 1–2 倍
+            p.bias = rng.integers(-(16 << shift), 16 << shift, l.oc)
+            p.s1, p.s2 = max(0, shift - 6), 7 + min(6, shift)
+            p.M = rng.integers(1 << 13, 1 << 14, l.oc)
+            acc = acc + p.bias.reshape(-1, 1, 1)
+            if l.act == 3:       # 逐通道 q: 10..30; yt 大约到 127·6q → t1 = 3, M2 ~ 2^12, t2 = 13
+                q = rng.integers(10, 31, l.oc)
+                p.q3, p.q6, p.M2, p.t1, p.t2 = 3 * q, 6 * q, rng.integers(1 << 11, 1 << 12, l.oc), 3, 13
+        params.append(p)
+        ts.append(requant(acc, p, l.act))
     return x, params, ts[-1]
 
 
@@ -947,8 +1023,8 @@ class C16Chain:
         self.P = P = Plan(layers)
         self.spec = spec_str(layers)
         self.t_act = iron.zeros(P.size["act"], dtype=np.int8, device="npu")
-        steps = [b for k, (l, tl, (Wq, s)) in enumerate(zip(layers, P.tilings, params))
-                 for b in pack_layer(l, tl, Wq, s, P.e_w, P.tensors[P.inp[k]].ws, signed_in(layers, k),
+        steps = [b for k, (l, tl, p) in enumerate(zip(layers, P.tilings, params))
+                 for b in pack_layer(l, tl, p, P.e_w, P.tensors[P.inp[k]].ws, signed_in(layers, k),
                                      P.tensors[k + 1 + l.sc].c // 16 if l.sc else 0)]
         self.t_w = iron.tensor(np.concatenate(steps), dtype=np.int8, device="npu")
         self.t_s = iron.zeros(P.size["s"], dtype=np.int8, device="npu")
@@ -979,9 +1055,9 @@ def _cpu():
     return r.ru_utime + r.ru_stime
 
 
-def run_one(spec, iters=50, reps=1, seed=0, verbose=False):
+def run_one(spec, iters=50, reps=1, seed=0, verbose=False, rq=False):
     layers = chain_layers(spec)
-    x, params, y = make_case(layers, seed)
+    x, params, y = make_case(layers, seed, rq)
     ch = C16Chain(layers, params, reps)
     if verbose:
         for line in ch.P.describe():
@@ -1023,9 +1099,9 @@ def compute_split(spec, reps=(1, 2, 3), iters=50):
               f"{(icpt - 0.25) / n:.3f} ms (固定按 0.25)", file=sys.stderr)
 
 
-def selftest(spec="enc", iters=10) -> SelfTestResult:
-    """npu.check 用: 一条链逐字节一致 (含补宽列为零), 返回中位耗时"""
-    r = run_one(spec, iters)
+def selftest(spec="enc", iters=10, rq=False) -> SelfTestResult:
+    """npu.check 用: 一条链逐字节一致 (含补宽列为零), 返回中位耗时; rq: 随机 bias / 逐通道 M"""
+    r = run_one(spec, iters, rq=rq)
     report(r)
     return SelfTestResult(r["max_diff"] == 0, r["max_diff"], r["med"])
 
@@ -1047,7 +1123,7 @@ if __name__ == "__main__":
         compute_split(arg("--compute", "enc"), iters=iters)
         sys.exit(0)
     if "--spec" in sys.argv:
-        r = run_one(arg("--spec", "enc"), iters, verbose=True)
+        r = run_one(arg("--spec", "enc"), iters, verbose=True, rq="--rq" in sys.argv)
         report(r)
         sys.exit(0 if r["max_diff"] == 0 else 1)
     sys.exit(0 if main(iters) else 1)

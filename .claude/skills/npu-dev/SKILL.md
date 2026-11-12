@@ -31,6 +31,10 @@ python -m npu.check --quick       # 只跑 720p 和较短的链, 快一半
 | `npu/conv3x3.py`、`npu/kernels/conv3x3.cc` | 专用 int8 3×3 卷积（Conv_290），全展开，最快的卷积写法 |
 | `npu/offset_probe.py` | llvm-aie 常量偏移 bug 的探针 |
 | **`npu/chain_c16.py` + `npu/kernels/conv_c16.cc`** | **整网串联框架**：一次 NPU 调用跑 N 层，描述符驱动。RVM 整网的主线 |
+| `npu/rvm/encoder_ref.py` | 从 ONNX 抽 RVM 编码器（135 个算子）+ numpy 浮点参考（和 onnxruntime 一致到 3e-5） |
+| `npu/rvm/encoder_q.py` | int8 量化模拟（整数逐位定义）：几种方案对浮点的误差；冻结后就是 NPU 的逐字节参考 |
+| `npu/rvm/encoder_npu.py` | 冻结的整数参数 → `chain_c16` 的层 + `LParam`，NPU 跑真实编码器（70 层），和模拟逐字节比 |
+| `npu/ksize.py` | 单独编译内核、按函数列程序内存（`python -m npu.ksize`） |
 | `npu/chain_spike.py`、`npu/chain_hetero.py`、`npu/kernels/conv_generic.cc` | 串联框架的早期版本，只用于复现历史数字，别在上面加功能 |
 | `docs/npu-spikes/` | 每轮实验的原始记录和数字（历史；结论以本 skill 为准） |
 
@@ -43,14 +47,16 @@ python -m npu.check --quick       # 只跑 720p 和较短的链, 快一半
   **边和补宽列永远是零、从不写**（内核把有效宽度外的输出写 0）。fill/drain 用 TAP 直接从整幅布局里切条带。
 - **ObjectFifo 元素大小对所有层固定**：输入 7680 B（多读的是垃圾，内核不看）、输出 640 B（1 个通道组 × 40 像素）、权重 e_w（补到 256 的倍数）。
 - **一个权重元素 = 一步**。权重头（128 B）写着这一步干什么：形状、每 core 的行数/有效宽度/选哪段循环。
-  core 程序与层的形状、层数都无关（`.text` ≈ 14.4 KB，其中 core 程序 3.2 KB），只有 4 段循环：s1 滑窗、s2、累加、收尾。
+  core 程序与层的形状、层数都无关（ELF `.text` ≈ 15.25 KB，其中 core 程序 3.2 KB），只有 4 段循环：s1 滑窗、s2、累加、收尾。
   池化、装 SE 缩放向量这类"不是卷积"的步也塞进累加 / 收尾段，靠权重头里的标志让内核分派——**加新步类型时先这么做，别加段**（每段约 0.6 KB）。
 - 层模式：`full`（整层一步）、`oc`（权重太大，按输出通道切块，输入用步长 0 重读）、`ict`（1×1 输入太宽，按输入通道切步，部分和在 core 本地 int32）、
   `dw`（depthwise，DMA 把每个输出行要的 k 行打进一个元素）、`pool`（全局平均池化，按通道组分 core）。
   低分辨率的 oc 层、以及 1 行的 FC 层（含 ict）用 **OC 并行**（每 core 不同通道块、全部行）。
 - 当前支持：普通 3×3（s1/s2）、1×1、depthwise 3×3/5×5（s1/s2、dilation 2）、**SE**（池化 → FC1 → FC2 HardSigmoid →
   投影层逐通道乘，乘法折进投影层权重）、**残差加**（拼接 + 单位权重），输出激活 ReLU / HardSigmoid / 线性 / **hardswish**，
-  per-layer shift 量化。激活在入口函数末尾对整个输出块做（`post_act`），卷积内核只分 uint8 / int8 饱和两种存法。
+  **重新量化**：累加器初值 = bias，`y = sat8((sat16(acc >> s1) · M[c]) >> s2)`（M 逐通道 int16）；bias / M / hardswish 的逐通道参数
+  放在每步权重后面的重新量化表里（`RQB` = 576 B / 输出通道组，`LParam`、`rq_table`）。激活都是对称 int8（ReLU 0..127）。
+  HardSigmoid / hardswish 在入口函数末尾对整个输出块做（`post_act`）。
 
 ## 硬规则（每条都踩过；症状和来龙去脉见 `references/pitfalls.md`）
 
@@ -65,7 +71,8 @@ python -m npu.check --quick       # 只跑 720p 和较短的链, 快一半
 6. **一行里多个平面的指针不能写 `base + 编译期常量`**（偏移 ≥ 1024 B 时 llvm-aie 读错地址）。用 `rowops::plane_stride(N)` 或运行时值。`npu.check` 的探针会告诉你 bug 还在不在。
 7. **`acquire(1)` 返回的是元素本身，不是列表**；`win[0]` 会变成取一个字节（编译报 operand type mismatch）。
 8. **JIT 缓存键不含头文件、`harness.py`、模块级常量和 Plan 逻辑**。改了这些（例如 `chain_c16.py` 里的 `E_IN`、`W_MAX`）必须 `rm -rf ~/.npu/cache/*`，否则静默跑旧二进制。
-9. **内存预算**：每 core 数据约 58.5/64 KB（输入 4×7.5 + 权重 18.3 + acc 7.5 + 输出/dummy 1.9 + SE 缩放 1），**程序 14.4/16 KB**（只剩 1.6 KB）。
+9. **内存预算**：每 core 数据约 59/64 KB（输入 4×7.5 + 权重 18.9 + acc 7.5 + 输出/dummy 1.9 + SE 缩放 1），**程序 15.25/16 KB**（只剩约 0.75 KB）。
+   超了 aiecc 报 `Overflow of program memory` / `XAie_LoadElf failed with XAIE_INVALID_ELF`；`python -m npu.ksize` 看是哪个函数。
    加缓冲区、加内核分支前先算账；`llvm-nm --size-sort -S -C main_core_0_2.elf` 看是哪个函数涨了（`core_0_2` 是 core 程序，`convC16Chunk` 是入口）。
 10. **激活函数在 0 处不为 0 时（HardSigmoid、以后的 bias）要显式把有效宽度外的像素写 0**：ReLU 版靠"零输入 → 零输出"，换了激活就会把补宽列写脏（`check` 报 999）。
 11. **Peano 不给循环做软件流水**：短的逐元素循环（load → 几条运算 → mul → srs → store）每轮都串着等延迟（实测约 22 周期 / 32 B）。
@@ -80,13 +87,19 @@ python -m npu.check --quick       # 只跑 720p 和较短的链, 快一半
 5. 测试顺序：单层 → 和前后层串成链 → 加进 `CHAINS` 和 `npu.check`。随机权重 ±12、每层 shift 自动选成输出均值约 24，检查输出不是全零/全饱和。
 6. 测性能用**链里逐层加前缀的边际耗时**，不要用单层耗时（见下）。
 
+## 接真实权重 / 改量化方案（细节见 `references/quant.md`）
+
+1. 先在 `npu/rvm/encoder_q.py` 里改（numpy，整数逐位定义），看对浮点的余弦；**16 位激活 + 16 位权重应该接近 1.0**，不是就是有 bug。
+2. 方案要改内核时，先给 `chain_c16` 的随机测试加对应的随机参数（`make_case(rq=True)` 那样），逐字节过了再接真实权重。
+3. `python -m npu.rvm.encoder_npu`：NPU 和模拟必须逐字节一致；不一致就逐层读回比（`read_tensor`），找第一个错的层。
+
 ## 怎么测性能（细节见 `references/perf.md`）
 
 - 单层调用里固定成本（XRT 派发 + 流水线启停，0.25–0.4 ms）占大头，**会误导**。用 deep/mnv3 链按前缀逐层加，看边际。
 - 拆"纯计算 vs 额外开销"：内核每行重复调用 r = 1/2/3 次（`--compute`），对 r 的斜率是纯计算。
 - 中位数受机器负载影响很大，同时看最快值；判据"每层额外开销 ≤ 0.1 ms"。
-- 现在的数字：MobileNetV3 主干 27 层 ≈ 4.9–5.2 ms，加 4 个 SE ≈ 5.5–5.8 ms，再换真实激活（hardswish）≈ 5.9–6.1，再加 4 个残差（`mnv3r`）≈ 6.2–6.3 ms；
-  12×20 高通道段 13 层 ≈ 2.4–2.6 ms；每层额外 ≈ 0.1–0.12 ms。
+- 现在的数字（负载 ≈ 3）：真实编码器 70 层 11.4 ms（纯计算 2.8）；mnv3 27 层 ≈ 5.55 ms，mnv3r 39 层 ≈ 6.8 ms，deep 13 层 ≈ 2.84 ms；
+  每层额外 ≈ 0.12 ms。重新量化路径（bias + 逐通道 M）比只移位慢约 9%。
 
 ## 调试挂死 / 算错
 
@@ -100,8 +113,11 @@ python -m npu.check --quick       # 只跑 720p 和较短的链, 快一半
 
 ## 现状和待办（详见 `references/chain-framework.md` 末尾）
 
-- RVM 编码器的算子都有了：普通 3×3、1×1、depthwise、SE、hardswish、残差加（`mnv3r`：真实激活 + 4 个 SE + 4 个残差，39 层逐字节一致）。
-  还缺解码器的 **Concat（拼接视图已有）/ Resize / ConvGRU**，以及接真实量化权重、对 onnxruntime 比精度、接入 studio。
-- 程序内存只剩约 1.6 KB：再加内核分支之前先省（把少用的分支挪成 noinline、合并相似的 dw 模板）。
+- **真实 RVM 编码器（70 层）在 NPU 上和 numpy 整数模拟逐字节一致**（`python -m npu.rvm.encoder_npu`）；反量化后对 onnxruntime 的余弦
+  f1 0.998 / f2 0.966 / f3 0.943 / f4 0.879（比 onnxruntime 自己的 int8 静态量化好：f4 0.72–0.84）。量化方案见 `references/quant.md`。
+- **但它比 CPU 慢**：NPU 11.4 ms，onnxruntime CPU 单线程 8.4 / 4 线程 3.1 ms。纯计算只有 2.8 ms，**每层固定开销 0.12 ms × 70 层 = 8.5 ms**。
+  下一个大方向是压每层开销（融合整个倒残差块、少分 task group、层间预取），不是再加算子。
+- 还缺解码器的 **Concat（拼接视图已有）/ Resize / ConvGRU**、接入 studio；校准用的是系统壁纸（没有人像），要用真实摄像头画面再校一次、看最终 alpha。
+- 程序内存只剩约 0.75 KB：再加内核分支之前先省（把少用的分支挪成 noinline、合并相似的 dw 模板）。
 - 已知性能债：12×20 的 IC 分块层（输入按 OC 份数重读）、12×20 的 5×5 dilation 2 depthwise（步数多）、通用 3×3 只有专用版 61% 的速度、宽 20 补成 40。
 - RVM 真实形状表：`docs/npu-spikes/rvm_convs_180x320.tsv`（onnxruntime 在工作分辨率 320×180 下跑出来的）。

@@ -64,7 +64,22 @@ int32[43]     池化每组元素数 ne
 int32[44..46] hardswish 的 q3 = 3·HS_Q, q6 = 6·HS_Q, s2 = HS_S
 int32[47]     池化输入是 int8 (前一层是线性 / hardswish)
 int32[48]     SE 只乘前几个输入通道组 (拼进来的残差不乘)
+int32[49..50] 重新量化 s1 s2: y = sat8((sat16((acc + 2^(s1-1)) >> s1) · M[c] + 2^(s2-1)) >> s2)
+int32[52]     重新量化表在权重区里的偏移 (= 这一步的权重字节数)
+int32[53..54] hardswish 第二次重新量化的 t1 t2
 ```
+
+**重新量化表**（每个输出通道组 `RQB` = 576 B，跟在这一步的权重后面，主机侧 `rq_table` 已排成内核要的布局）：
+
+| 字节 | 内容 |
+|---|---|
+| [0, 256) | bias int32：mmul（3×3 / 1×1）= 低 8 通道 `[4 像素][8]` + 高 8 通道 `[4 像素][8]`；dw = `[4 像素][16]` |
+| [256, 384) | M int16，同样的布局 |
+| [384, 576) | hardswish 的 q3 / q6 / M2，各 int16 `[2 像素][16]` |
+
+`W_MAX` 包括重新量化表（18432 + 576）；`_step_wbytes` 和各模式选 nocp 时都把 `RQB` 算进每个输出通道组。
+层参数是 `LParam`（W、s1、s2、bias、M、q3、q6、M2、t1、t2）；随机权重的测试用默认值（bias 0、M 1、s1 = shift、s2 0）=
+"只移位"，`--rq` / `selftest(rq=True)` 用随机 bias 和 M 测完整路径。
 
 `ICP`/`OCP` 是**这一步**的输入/输出通道组数，不是整层的。core 只读自己那一段（`hc = 32 + 16·c`）；空闲槽是全零头（所有 sel 都是 0）。
 权重缓冲区本来就是每 core 一份（`[槽][core][e_w]`），所以"全局"字段其实也可以按 core 不同（n_pre 就是）。
@@ -126,14 +141,16 @@ IC 分块的层每份 OC 都要重读、重乘输入，Conv_144 多 0.35 ms；�
 
 ## 7. 内核分支（`conv_c16.cc`）
 
-- 输出：`store4` / `cvt` 只分 uint8 饱和（ReLU）和 int8 饱和（`Desc.sgn`，其它激活）；HardSigmoid（+128、宽度外清零）和
-  hardswish（`sat8((y·clamp(y+q3, 0, q6) + 2^(s2−1)) >> s2)`）由入口函数最后的 `post_act` 对整个 640 B 块做。
+- 输出：累加器初值 = bias（`bias_init` / dw 的 `b0`）；`store4` / `cvt` → `fin`：`to_vector<int16>(s1)` × M → `to_vector<int8>(s2)`
+  → `max(·, lo)`（ReLU 的 lo = 0，其余 −128）。宽度外的像素显式写 0（有 bias 以后不会自然是 0；4 像素组里部分有效时走 `zero_tail`）。
+  HardSigmoid（+128、宽度外清零）和逐通道 hardswish 由入口函数最后的 `post_act` 对整个 640 B 块做。
+  act 0 现在也是 int8 的 ReLU（0..127）：原来"输出 uint8、下一层当 int8 读"的实验约定已经去掉。
 - `conv3s1` / `conv3s2` / `conv1`：`mmul<4,8,8>`。4 像素 × 16 通道的 64 B 向量用 `interleave_unzip(·, 8)` 拆成低/高 8 通道两个 A，
   各喂两个输出通道块；kx 偏移用 `shuffle_up/down_fill(·, 16)`；s2 用 `filter_even/odd(·, 16)` 拆奇偶像素。
   每 8 像素 4 个累加器。整组在有效宽度外直接写 0、不算。`conv1` 支持 IC 分块（first/last、acc）。
-- `dwconv<K, D, S>`：逐元素 `aie::mac`（64 路 = 两条 32 路指令）；权重主机侧复制成 `[组][ky][kx][4 像素][16 通道]`；
-  水平偏移 o = kx·D − pad ∈ [−4, 4] 用常量 shuffle；S = 2 先按 stride 1 算再 `filter_even(·, 16)`。`noinline`。
-  现在实例化了 (3,1,1) (3,1,2) (5,1,1) (5,1,2) (5,2,1)，加组合要改分派。
+- `dwconv<K, D>`（stride 是运行时参数，省程序内存）：逐元素 `aie::mac`（64 路 = 两条 32 路指令）；权重主机侧复制成
+  `[组][ky][kx][4 像素][16 通道]`；水平偏移 o = kx·D − pad ∈ [−4, 4] 用常量 shuffle；S = 2 先按 stride 1 算再 `filter_even(·, 16)`。
+  `noinline`。实例化了 (3,1) (5,1) (5,2)，加组合要改分派。
 - 权重布局（主机侧 `pack_layer`）：3×3 `[ocp][ky][icp][kx][h][ob][ic8][oc8]`，1×1 `[ocp][icp][h][ob][ic8][oc8]`（h/ob = 低/高 8 个通道）。
 
 ## 8. 测试入口
@@ -163,6 +180,6 @@ SE 块在 `R` 里由 `_se(dw, fc1, fc2, proj, mid, oc)` 生成（`<dw>.pool`、F
 | 不均分行、补宽、最多 152 步的链 | 真实量化权重 / bias / per-tensor 零点、与 onnxruntime 比精度、接入 studio |
 
 建议顺序：解码器（Concat / Resize / ConvGRU）→ 3×3 特化提速 / IC 分块的输入重读 → 真实权重 → studio。
-加东西时盯住程序内存（**14.4/16 KB**）和数据内存（58.5/64 KB）。
+加东西时盯住程序内存（**15.25/16 KB**）和数据内存（59/64 KB）。
 已知小坑：只有一层、而且这层用不满 4 个 core 的链（例如单独跑 OC 并行 3 块的 Conv_92）会报 `Prod endpoint not set`
 （某个 core 的输入 fifo 整条链都没有 fill）。和别的层串起来就没事。

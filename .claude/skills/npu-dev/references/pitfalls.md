@@ -48,6 +48,13 @@
 - **办法**：每轮手动做 4 个互不依赖的向量（定长小数组 + 完全展开的内层 for，SROA 后全在寄存器里；
   反汇编确认没有 `[sp, …]` 访问，否则就违反规则 5）。快约 2 倍。
 
+### 程序内存溢出
+- **症状**：编译到最后 `[AIE ERROR] _XAie_LoadProgMemSection(): Overflow of program memory` / `XAie_LoadElf failed with XAIE_INVALID_ELF`，
+  JIT 缓存目录是空的（没有 ELF 可看）。
+- **办法**：`python -m npu.ksize` 单独编译内核、按函数列大小（链接后 ≈ 合计 + 3.5 KB）。上一次超（17.8 KB）是新的重新量化路径在
+  6 个存储点各内联一份、还带着 uint8 / int8 两条分支：去掉 uint8 ReLU、下限改成无分支的 `max(y, lo)`、罕见分支（部分像素清零）
+  挪成 noinline、dw 的 stride 改成运行时参数（5 个模板实例 → 3 个），回到 15.25 KB。
+
 ### JIT 缓存不认头文件和 Python 模块常量
 - **症状**：改了代码结果不变（或者"修好了"其实没跑新代码）。
 - **原因**：缓存键看内核 `.cc` 的 mtime 和 `@iron.jit` 的编译参数；`row_ops.h`、`harness.py`、`chain_c16.py` 的模块级常量（`E_IN`、`W_MAX`、`ACC_CHUNKS`…）和 `Plan` 逻辑都不在里面。
@@ -75,6 +82,8 @@
 - 输入可以多读（TAP 读超出真实条带的字节），但缓冲区尾部要留余量（`Plan.size` 按所有 TAP 的最远地址算）。
 
 ## 量化 / 数值
+
+- 真实权重的量化坑（死通道、hardswish 的 q 溢出 int16、SE 折两次）见 `quant.md`。
 
 - 舍入 `(acc + 2^(s−1)) >> s` = `rounding_mode::positive_inf` + `saturation_mode::saturate`，`to_vector<uint8>(shift)` 一次完成舍入 + ReLU。参考实现必须一模一样。
 - 随机权重 ±12 时 shift 要按层自动选（输出均值 ~24），否则 10 层内就衰减成全零，逐字节比较变成平凡的 0 == 0。

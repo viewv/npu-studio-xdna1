@@ -40,6 +40,7 @@ def _cases(quick: bool):
     yield "chain_c16 enc 13 层", lambda: chain_c16.selftest("enc", 10)
     yield "chain_c16 se135 SE 块", lambda: chain_c16.selftest("se135", 10)       # 池化 / FC / HardSigmoid / 逐通道乘
     yield "chain_c16 res144 残差", lambda: chain_c16.selftest("res144", 10)      # hardswish / 有符号池化 / 拼接残差 / IC 分块
+    yield "chain_c16 res144 bias/M", lambda: chain_c16.selftest("res144", 10, rq=True)   # 随机 bias + 逐通道重新量化
     if not quick:
         yield "chain_c16 low 25 层", lambda: chain_c16.selftest("low", 10)
         yield "chain_c16 deep 13 层", lambda: chain_c16.selftest("deep", 10)   # OC / IC 分块
@@ -49,6 +50,10 @@ def _cases(quick: bool):
         yield "chain_c16 mnv3se 39 层", lambda: chain_c16.selftest("mnv3se", 10)  # 主干 + 4 个 SE
         yield "chain_c16 res24 残差", lambda: chain_c16.selftest("res24", 10)     # 45×80 残差 (full 模式)
         yield "chain_c16 mnv3r 39 层", lambda: chain_c16.selftest("mnv3r", 10)    # 真实激活 + SE + 4 个残差 (含 IC 切行)
+        yield "chain_c16 mnv3r bias/M", lambda: chain_c16.selftest("mnv3r", 10, rq=True)
+        from .rvm import encoder_npu, encoder_ref
+        if encoder_ref.ONNX.exists() and encoder_ref.images(1):   # 要 models/ 里的 RVM 模型和系统壁纸 (校准图)
+            yield "RVM 编码器 真实权重 70 层", lambda: encoder_npu.selftest(2, 10)   # 和 numpy 整数模拟逐字节一致
 
 
 def _probe():
