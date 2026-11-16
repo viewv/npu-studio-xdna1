@@ -67,6 +67,7 @@
 """
 from __future__ import annotations
 
+import os
 import resource
 import sys
 import time
@@ -90,7 +91,8 @@ E_IN = 7680                    # 输入元素字节数 (所有层相同; = 10 �
 RQB = 576                      # 每个输出通道组的重新量化表 (bias / M / hardswish 参数), 跟在这一步的权重后面
 W_BIG = 18432 + RQB            # 一个权重元素里最多的权重 + 重新量化表字节 (= 3×3 128→16; 权重 fifo 深度 1)
 W_SMALL = 9216 + RQB           # 链里没有大 3×3 时用小元素 + 深度 2 (算这一步时预取下一步, 实测快 ~11%)
-W_BUDGET = 20480               # 每 core 权重 fifo 的内存 (深度 × e_w)
+W_BUDGET = 24576               # 每 core 权重 fifo 的内存 (深度 × e_w); 太小会让大权重层退化成深度 1
+W_BD_MAX = 16384               # 单个 DMA BD 的字节上限 (实测 ≥ 16384 会挂死); 权重 fill 组按它切
 ACC_CHUNKS = 3                 # acc 缓冲区能放几个输出块的部分和 (每块 CW·16 个 int32 = 2.5 KB)
 N_CORES = 4
 FILLS_PER_TG = 2               # 一个 task group 里同一个 shim 通道排几个 fill (在途的组合计 ≤ 4, 多了会挂死)
@@ -165,7 +167,9 @@ R = {
     "e12": Layer(128, 32, 1, 1, 12, 20),
     "e13": Layer(32, 32, 3, 1, 12, 20),    # 3×3 s1 @12×20 (补宽列必须是零)
     "gelu1": Layer(64, 128, 1, 1, 12, 20, act=5),   # GELU 查表 (act 5) 的测试层
-    "lm1": Layer(512, 512, 1, 1, 4, 35, op=5),      # LayerNorm 的测试层 (512 通道, 4 行 × 35 像素)
+    # LayerNorm (op 5) 的测试层: 4 行 × 35 像素、256 通道 (2 个 IC 块) —— 与参考逐字节一致。
+    # 注: 512 通道 (语音模型用的形状) 现在跑不起来 (4 个 IC 块时挂死), 见 docs/npu-models.md §14.8
+    "lm1": Layer(256, 256, 1, 1, 4, 35, op=5),
 }
 # RVM 编码器 12×20 段的真实形状 (跳过 depthwise 和 SE; 200/184 补到 208/192), 输入 240 通道
 _T = [(240, 80, 1, "Conv_67"), (80, 208, 1, "Conv_68"), (208, 80, 1, "Conv_74"), (80, 480, 1, "Conv_92"),
@@ -453,11 +457,13 @@ def choose_tiling(l: Layer, ws_in: int | None = None, w_max: int = 0) -> Tiling:
         m = max(p for p in range(1, 65) if E_IN % p == 0 and need <= E_IN // p <= MAX_PLANE
                 and (E_IN // p) % 64 == 0 and l.icp % p == 0)
         tl.mode, tl.icp_pad, tl.plane = "lm", m, E_IN // m
-        tl.nocp, tl.n_ob, tl.n_icb = 1, 1, cdiv(l.icp, m)
+        tl.nocp, tl.n_icb = 1, cdiv(l.icp, m)
         # 步: (ocp0, nocp, icp0, nicp, first, last, 行段, pass, stats)
         tl.steps = ([(0, 1, i * m, min(m, l.icp - i * m), 0, 0, 0, 0, int(i == tl.n_icb - 1))
-                     for i in range(tl.n_icb)]
-                    + [(0, 1, i * m, min(m, l.icp - i * m), 0, 0, 0, 1, 0) for i in range(tl.n_icb)])
+                     for i in range(tl.n_icb)]                       # pass 0: 累加
+                    + [(0, 1, i * m, min(m, l.icp - i * m), 0, 0, 0, 1, 0)
+                       for i in range(tl.n_icb)])                     # pass 1: 归一化
+        tl.n_ob = len(tl.steps)          # 每步一个 fill 单元 (照 ict: 大 BD 会撞 DMA 限制)
         return tl
     if l.op == 2:
         return _up_tiling(l)
@@ -692,8 +698,8 @@ class Plan:
     @staticmethod
     def _step_wbytes(l, st):
         _, nocp, _, nicp = st[:4]
-        if l.op == 5:                # LN: m1/m2/g10/b12/gq (各 ic 个 int32)
-            return 5 * 4 * l.ic
+        if l.op == 5:                # LN: m1/m2/g10/b12/gq (各 ic 个 int32) + 2 个 fp32 常量
+            return 5 * 4 * l.ic + 8
         if l.op:
             return 0
         if l.dw:
@@ -701,23 +707,26 @@ class Plan:
         return l.k * l.k * nicp * 16 * nocp * 16 + nocp * RQB + (GELU_TBL if l.act == 5 else 0)
 
     @staticmethod
-    def ob_groups(tl, l):
+    def ob_groups(tl, l, wmax=99):
         """一层按 OC 块/份分成几个 task group, 每组每个 shim 通道最多 FILLS_PER_TG 个 fill
-        (实测一个 task group 里同一通道排 7 个以上 DMA 任务就挂死, 5 个没事)"""
+        (实测一个 task group 里同一通道排 7 个以上 DMA 任务就挂死, 5 个没事)。
+        wmax = 权重 fifo 深度: 一组里的步数不能超过它, 否则一次 fill 塞进去的元素比 fifo 深
+        (后面的元素直接覆盖前面的, fifo 锁的计数也错位 → 核心读到错步的权重)"""
         if tl.mode == "input":
             return []
         if tl.ocpar or tl.mode == "pool":
             return [(0, tl.n_ob)]
         if tl.mode == "dw":
             per = cdiv(max(tl.band_rows), 64)
-        elif tl.mode == "up":
+        elif tl.mode in ("up", "lm"):
             per = 1
         else:
             per = 1 if tl.mode == "ict" else (0 if l.s == 1 else cdiv(max(tl.band_rows), 64))
         if per == 0:
             return [(0, tl.n_ob)]
-        g = max(1, FILLS_PER_TG // per)
+        g = min(max(1, FILLS_PER_TG // per), wmax)
         g0 = max(1, (FILLS_PER_TG - (1 if l.sc else 0)) // per)     # 第一组还要放 SE 缩放向量的 fill
+        g0 = min(g0, wmax)
         return [(0, min(g0, tl.n_ob))] + [(o, min(o + g, tl.n_ob)) for o in range(g0, tl.n_ob, g)]
 
     def kernel_flags(self, k0=0, k1=None) -> list[str]:
@@ -742,7 +751,8 @@ class Plan:
         l, tl = self.layers[k], self.tilings[k]
         spo = len(tl.steps) // tl.n_ob                   # 每个 OC 块/份的步数
         out = []
-        for ob0, ob1 in self.ob_groups(tl, l):
+        wmax = max(1, min(self.w_depth, (W_BD_MAX - 1) // self.e_w))   # 一次 fill 别超过 BD 上限
+        for ob0, ob1 in self.ob_groups(tl, l, wmax):
             if tl.ocpar:
                 ns, s0 = len(tl.slots()), self.step0[k]
             else:                                        # 有"装缩放"槽时它在第一组最前面
@@ -775,10 +785,10 @@ class Plan:
             return [(o0 + tl.steps[o][0] * ti.cplane + l.s * r0 * ti.frow,
                      [min(64, rows - r0), l.k, tl.icp_pad, tl.plane], [l.s * ti.frow, l.d * ti.frow, ti.cplane, 1])
                     for o in range(ob0, ob1) for r0 in range(0, rows, 64)]
-        if tl.mode == "lm":      # 两遍: 每遍一个 BD [IC 步][行][m 组][PLANE], 第二遍从同一处重读
+        if tl.mode == "lm":      # 每步一个 BD: [行][m 组][PLANE]; 第二遍的步重读同一段
             o0 = base + (BR + tl.band_y0[b]) * ti.frow
-            return [(o0, [tl.n_icb, rows, tl.icp_pad, tl.plane],
-                     [tl.icp_pad * ti.cplane, ti.frow, ti.cplane, 1])] * 2
+            return [(o0 + (tl.steps[o][2] // tl.icp_pad) * tl.icp_pad * ti.cplane,
+                     [rows, tl.icp_pad, tl.plane], [ti.frow, ti.cplane, 1]) for o in range(ob0, ob1)]
         if tl.mode == "ict":     # 不要上下边行; 每份 OC 一个 BD: [IC 步][行][m 组][PLANE]
             o1 = off + ti.frow
             if rows == 1:        # FC: 一行, 所有份合成一个 BD (最外维步长 0)
@@ -797,10 +807,11 @@ class Plan:
 
     def drain_taps(self, k, base, c, t, b, ob0=0, ob1=None):
         tl, to = self.tilings[k], self.tensors[k + 1]
-        if tl.mode == "lm":     # 第二遍: [IC 步][行][每步通道组][640 B]
+        if tl.mode == "lm":     # 只有第二遍的步出输出, 每个通道组一个 640 B 块
             o0 = base + (BR + tl.band_y0[b]) * to.frow + (PAD + t * tl.wt) * 16
-            return [(o0, [tl.n_icb, tl.band_rows[b], tl.icp_pad, CW * 16],
-                     [tl.icp_pad * to.cplane, to.frow, to.cplane, 1])]
+            return [(o0 + (tl.steps[o][2] // tl.icp_pad) * tl.icp_pad * to.cplane,
+                     [tl.band_rows[b], tl.icp_pad, CW * 16], [to.frow, to.cplane, 1])
+                    for o in range(ob0, ob1) if tl.steps[o][7]]
         tl, to = self.tilings[k], self.tensors[k + 1]
         ob1 = tl.n_ob if ob1 is None else ob1
         if tl.mode == "pool":    # core c 的组 c, c+4, … 各一个 640 B 块 (像素 0 = 均值, 其余 0)
@@ -942,7 +953,9 @@ def conv_c16(act: In, wts: In, scratch: InOut, out: Out, *, spec: CompileTime[st
 
     fifos, workers = [], []
     for c in range(N_CORES):
-        f_in = ObjectFifo(in_ty, depth=4, name=f"c16_{c}i")
+        # 输入 fifo 深度: LN 一层要读两遍 (2·n_icb 个元素), 缓冲要够, 否则 fill 会互相覆盖
+        idep = max([4] + [2 * tl.n_icb for tl in P.tilings if tl.mode == "lm"])
+        f_in = ObjectFifo(in_ty, depth=idep, name=f"c16_{c}i")
         f_w = ObjectFifo(w_ty, depth=P.w_depth, name=f"c16_{c}w")
         f_out = ObjectFifo(out_ty, depth=2, name=f"c16_{c}o")
         acc = Buffer(acc_ty, name=f"c16_{c}acc")
@@ -1105,9 +1118,10 @@ def _pack_step(l, tl, full, p, rq, e_w, st, c_own, ws_in=0, sgn_in=False, sc_cp=
     if l.op == 5:                # LayerNorm: gamma/beta/s_in/g_out + eps + D 在权重区
         assert p.ln is not None, "op 5 需要 LParam.ln = (gamma, beta, s_in, g_out)"
         gamma, beta, s_in, g_out = (np.asarray(a, np.float32) for a in p.ln)
+        hdr[56] = int(round(np.log2(l.ic)))            # log2(D): mean 用移位 (h[58] 被 nxc 占了)
         hdr[59] = 1                                   # LN 标记
         hdr[60], hdr[61], hdr[62], hdr[63] = st[7], st[8], icp0, l.ic
-        hdr[24] = int(icp0 == 0)      # 第一块: acc 从零开始  # pass / stats / 组起点 / ic
+        hdr[24] = int(icp0 == 0)                       # 第一块: acc 从零开始
         hdr[:8] = [nicp, 1, tl.wt, 1, 1, 0, tl.nxc, tl.plane]
         buf[:HDR] = hdr.view(np.int8)
         for c, t, b in tl.cores():
@@ -1117,12 +1131,15 @@ def _pack_step(l, tl, full, p, rq, e_w, st, c_own, ws_in=0, sgn_in=False, sc_cp=
             per = np.array([rows, 0, 0, wvalid, nch, int(st[7] == 0), int(st[7] == 1), 0], np.uint16)
             buf[32 + 16 * c: 48 + 16 * c] = per.view(np.int8)
         ic32 = lambda v: np.rint(np.asarray(v, np.float64) * 4096.0).astype(np.int32)
+        assert l.ic & (l.ic - 1) == 0, f"LN 的通道数必须是 2 的幂 (mean 用移位; 实测其他值 AIE2 会挂): {l.ic}"
+        inv_b = np.array([1.0 / (l.ic * 524288.0), 1e-6], np.float32)  # 1/(D·2^19) + eps 备用
         par = np.concatenate([ic32(s_in),                                      # m1  Q12
                               np.rint(np.asarray(s_in, np.float64) ** 2 * 524288.0).astype(np.int32),  # m2 Q19
                               np.rint(np.asarray(gamma, np.float64) * 1024.0).astype(np.int32),        # g10 Q10
                               ic32(beta),                                      # b12 Q12
-                              ic32(g_out)]).astype(np.int32)                   # g5 Q12
+                              np.rint(np.asarray(g_out, np.float64)).astype(np.int32)])  # gq: 整数比例
         buf[HDR: HDR + par.nbytes] = par.view(np.int8)
+        buf[HDR + par.nbytes: HDR + par.nbytes + 8] = inv_b.view(np.int8)
         return buf
     if l.op == 1:                # 池化: 累加步 (每组前 ne-1 个元素) + 收尾步 (每组最后一个), 参数在 int32[33..39, 43]
         m = round((1 << POOL_S) / (l.h * l.w))
@@ -1245,23 +1262,46 @@ def requant(acc, p: LParam | int, act=0):
 
 
 def ln_ref(x_u8: np.ndarray, p: LParam) -> np.ndarray:
-    """LayerNorm 的**定点**参考 (与内核同一阶梯): s1=Σx·m1 (Q12), s2=Σx²·m2 (Q19),
-    mean=s1>>9, r12=round(2^12/sqrt(var+1e-6)), n=(dev·r12)>>12, y=(n·g10)>>10, out=((y+b12)·gq)>>12。
-    注: 内核用位技巧 + 3 次 Newton 求 1/sqrt（AIE2 没有 sqrtf），和这里精确开方可能差 1 LSB。"""
+    """LayerNorm 的定点参考 —— 和内核**逐位同一套**运算 (float32 序列也一样):
+
+      s1 = Σx·m1 (Q12)   s2 = Σx²·m2 (Q19)   mean_q = s1 >> log2(D)
+      var = float32(s2)·inv_b − float32(mean_q)²·2^-16      (inv_b = 1/(D·2^19) 主机算好)
+      r12 = int32(rsqrt_q12(var + eps)·2^12 + 0.5)          (位技巧 + 3 次 Newton, 向零截断)
+      dev = x·m1 − mean_q (Q12) → (dev·r12)>>12 → (·γ10)>>10 → 加 β12 → 乘 gq, >>12
+    """
     gamma, beta, s_in, g_out = (np.asarray(a, np.float64) for a in p.ln)
     c, h, w = x_u8.shape
+    f32 = np.float32
     m1 = np.rint(s_in * 4096).astype(np.int64)
     m2 = np.rint(s_in ** 2 * 524288).astype(np.int64)
     g10 = np.rint(gamma * 1024).astype(np.int64)
     b12 = np.rint(beta * 4096).astype(np.int64)
-    gq = np.rint(g_out * 4096).astype(np.int64)
+    gq = np.rint(g_out).astype(np.int64)                        # 整数比例 (不再乘 2^12)
     x = x_u8.view(np.int8).astype(np.int64)
     s1 = (x * m1.reshape(-1, 1, 1)).sum(0)                     # Q12
     s2 = (x * x * m2.reshape(-1, 1, 1)).sum(0)                 # Q19
-    mean_q = s1 >> int(round(np.log2(c)))                        # / D
-    var = s2 / (c * 524288.0) - (mean_q.astype(np.float64) ** 2) / (4096.0 ** 2)
-    r12 = np.rint(1.0 / np.sqrt(var + 1e-6) * 4096.0).astype(np.int64)
-    dev = x * m1.reshape(-1, 1, 1) - mean_q.reshape(1, h, w)
+    sh = int(np.log2(c))
+    mq = s1 >> sh
+    inv_b = f32(1.0 / (c * 524288.0))
+    # var: 逐元素按 float32 算 (和 C 的表达式求值顺序一致)
+    t1 = f32(s2) * inv_b
+    mf = mq.astype(f32)
+    t3 = (mf * mf) * f32(5.9604644775390625e-08)     # mean_q 是 Q12 → mean² 要乘 2^-24
+    var = t1 - t3
+    # rsqrt_q12: 位技巧 + 3 次 Newton, 全部 float32
+    v = var + f32(1e-06)
+    v = np.where(v > f32(0.0), v, f32(1e-06)).astype(f32)
+    hh = f32(0.5) * v
+    bits = v.view(np.int32).astype(np.int64)                    # 位模式
+    bits = (0x5F3759DF - (bits >> 1)).astype(np.int64)
+    bits = np.where(bits >= (1 << 31), bits - (1 << 32), bits)   # 回 int32
+    rs = bits.astype(np.int32).view(np.float32)
+    for _ in range(3):
+        rs = rs * (f32(1.5) - hh * rs * rs)
+    rr = rs * f32(4096.0) + f32(0.5)
+    rr = np.where((rr > f32(-2.0e9)) & (rr < f32(2.0e9)), rr, f32(0.0))
+    r12 = np.trunc(rr).astype(np.int64)                          # C 的 f2i 向零截断
+    dev = x * m1.reshape(-1, 1, 1) - mq.reshape(1, h, w)
     n12 = (dev * r12.reshape(1, h, w)) >> 12
     y12 = (n12 * g10.reshape(-1, 1, 1)) >> 10
     o = ((y12 + b12.reshape(-1, 1, 1)) * gq.reshape(-1, 1, 1)) >> 12

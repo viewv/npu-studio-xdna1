@@ -462,15 +462,46 @@ __attribute__((noinline)) void post_act(uint8_t *o, int act, int nv, const int8_
 }
 
 #ifndef NO_LM
-// LayerNorm 一步 (op 5): 一行一个 core、全部通道组; 定点阶梯见 docs/npu-models.md §14.5。
-//   参数在权重区: m1(Q12) m2(Q19) g10(Q10) b12(Q12) gq(Q12)，各 ic 个 int32。
-//   acc 前 2·CW 个 int32: [Σx·m1, Σx²·m2] → 最后一块换成 [mean_q, r12]。
-//   注: AIE2 没有 sqrtf / 整数除法 / double —— 1/sqrt 用位技巧 + 3 次 Newton。
+// ---- LayerNorm (op 5, 模式 lm) ------------------------------------------------------------
+// 每个 core 负责一行; 输入分 n_icb 块送。两遍:
+//   pass 0: 逐像素累加 Σx·m1 (Q12) / Σx²·m2 (Q19) 到 acc
+//   pass 1: 逐像素算 mean/rstd, 再逐 16 通道组归一化输出
+// 参数在权重区 (每个 ic 个 int32): m1(Q12) m2(Q19) γ10(Q10) β12(Q12) gq(整数) + 2 个 fp32:
+//   1/(D·2^19) 和 eps。AIE2 没有 sqrtf / 整数除法 / double, 也不支持 float 向量的 reduce_add。
+
+// 1/sqrt(v) 的 Q12 定点: 位技巧初值 + 3 次 Newton。单独一个 noinline 函数 —— 和 var 的计算
+// 挤在同一个循环里时, 编译器生成出来的代码会让核心挂死 (实测)。
+__attribute__((noinline)) static int32_t rsqrt_q12(float v) {
+  if (!(v > 0.0f)) v = 1e-6f;                 // var 可能被定点误差压成负数
+  const float hh = 0.5f * v;
+  int32_t bits = *(int32_t *)&v;
+  bits = 0x5f3759df - (bits >> 1);
+  float rs = *(float *)&bits;
+  rs = rs * (1.5f - hh * rs * rs);
+  rs = rs * (1.5f - hh * rs * rs);
+  rs = rs * (1.5f - hh * rs * rs);
+  float rr = rs * 4096.0f + 0.5f;
+  if (!(rr > -2.0e9f && rr < 2.0e9f)) rr = 0.0f;      // NaN / 越界 → 0
+  return (int32_t)rr;                                 // C 的 f2i 是向零截断
+}
+
+// (Σx·m1, Σx²·m2) → (mean_q, r12)。mean_q 是 Q12, 所以 mean² 要乘 2^-24。
+__attribute__((noinline)) static void mean_rstd_q12(int32_t s1, int32_t s2, float inv_b, int sh,
+                                                    int32_t *mean_q, int32_t *r12) {
+  const int32_t mq = s1 >> sh;                        // / D (D 是 2 的幂)
+  const float mf = (float)mq;
+  const float var = (float)s2 * inv_b - mf * mf * 5.9604644775390625e-08f;
+  *mean_q = mq;
+  *r12 = rsqrt_q12(var + 1e-6f);
+}
+
 __attribute__((noinline)) void ln_step(const int8_t *in, const int32_t *h, const int8_t *w, uint8_t *out,
                                        int32_t *acc, int j, int wvalid) {
-  const int pass = h[60], stats = h[61], g0 = h[62], icp = h[0], plane = h[7], ic = h[63];
+  const int pass = h[60], g0 = h[62], icp = h[0], plane = h[7], ic = h[63];
+  const int sh = h[56];                               // log2(D), 主机给出
   const int32_t *q = (const int32_t *)w;
   const int32_t *m1 = q, *m2 = q + ic, *g10 = q + 2 * ic, *b12 = q + 3 * ic, *gq = q + 4 * ic;
+  const float inv_b = *(const float *)(q + 5 * ic);
   int32_t *af = acc;
   if (pass == 0) {
     for (int p = 0; p < wvalid; p++) {
@@ -483,32 +514,15 @@ __attribute__((noinline)) void ln_step(const int8_t *in, const int32_t *h, const
           s2 += xv * xv * m2[ch * 16 + c];
         }
       }
-      if (h[24]) { af[2 * p] = s1; af[2 * p + 1] = s2; }     // 第一块清零重来
+      if (h[24]) { af[2 * p] = s1; af[2 * p + 1] = s2; }     // 第一块从零开始
       else { af[2 * p] += s1; af[2 * p + 1] += s2; }
-    }
-    if (stats) {
-      for (int p = 0; p < wvalid; p++) {
-        const int sh = ic == 512 ? 9 : ic == 256 ? 8 : ic == 128 ? 7 : ic == 384 ? 8 : 9;
-        const int32_t mean_q = af[2 * p] >> sh;                     // / D
-        const float var = (float)af[2 * p + 1] / (float)(ic * 524288) -
-                          (float)((int32_t)(((int64_t)mean_q * mean_q) >> 5)) / 16777216.0f;
-        const float v = var + 1e-6f;
-        const float hh = 0.5f * v;
-        int32_t bits = *(int32_t *)&v;
-        bits = 0x5f3759df - (bits >> 1);
-        float rs = *(float *)&bits;
-        rs = rs * (1.5f - hh * rs * rs);
-        rs = rs * (1.5f - hh * rs * rs);
-        rs = rs * (1.5f - hh * rs * rs);
-        af[2 * p] = mean_q;
-        af[2 * p + 1] = (int32_t)(rs * 4096.0f + 0.5f);
-      }
     }
     return;
   }
   const int gp = g0 + j;
   for (int p = 0; p < wvalid; p++) {
-    const int32_t mean_q = af[2 * p], r12 = af[2 * p + 1];
+    int32_t mean_q, r12;
+    mean_rstd_q12(af[2 * p], af[2 * p + 1], inv_b, sh, &mean_q, &r12);   // 每块自己重算 (35 像素)
     int8_t *px = (int8_t *)out + p * 16;
     const int8_t *src = in + j * plane + (PAD + p) * 16;
     for (int c = 0; c < 16; c++) {

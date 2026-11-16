@@ -46,6 +46,7 @@ def _cases(quick: bool):
     yield "chain_c16 alias 就地写", lambda: chain_c16.selftest("alias", 10)
     yield "chain_c16 cat3 分两次调用", lambda: chain_c16.selftest("cat3", 10, parts=[(0, 2), (2, 6)])
     yield "chain_c16 gelu 查表", lambda: chain_c16.selftest("gelu", 10)   # AIE2 并行 LUT (act 5)
+    yield "chain_c16 lm LayerNorm", lambda: chain_c16.selftest("lm", 10)  # 两遍 + acc 累加 + 定点 rsqrt
     if not quick:
         yield "chain_c16 low 25 层", lambda: chain_c16.selftest("low", 10)
         yield "chain_c16 deep 13 层", lambda: chain_c16.selftest("deep", 10)   # OC / IC 分块
