@@ -16,12 +16,14 @@ import numpy as np
 
 from npu.chain_c16 import C16Chain, Layer, check, make_case
 
-# 一个 transformer 块的三个 GEMM: (ic, oc)
+# 一个 transformer 块的三个 GEMM: (ic, oc)  —— 探针默认（75% 的块内 GEMM 算力）
 GEMMS = [(512, 512), (512, 2048), (2048, 512)]
+# 真实形状：q/k/v/output_transform 四个 512×512 + filter/output 两个 (2048,512)/(512,2048)
+GEMMS_REAL = [(512, 512), (512, 512), (512, 512), (512, 512), (512, 2048), (2048, 512)]
 
 
-def macs_per_block(T: int) -> int:
-    return sum(T * ic * oc for ic, oc in GEMMS)
+def macs_per_block(T: int, gems=None) -> int:
+    return sum(T * ic * oc for ic, oc in (gems or GEMMS))
 
 
 def probe_layouts(T: int):
@@ -55,21 +57,23 @@ def probe_layouts(T: int):
     return best
 
 
-def build_chain(T: int, blocks: int, h: int):
+def build_chain(T: int, blocks: int, h: int, gems=None):
     """blocks 个 transformer 块的 GEMM 链（不含注意力/layernorm），序列铺成 h×w。"""
     assert T % h == 0
     w = T // h
+    gems = gems or GEMMS
     layers = []
     for _ in range(blocks):
-        for ic, oc in GEMMS:
+        for ic, oc in gems:
             layers.append(Layer(ic, oc, 1, 1, h, w))
     return layers
 
 
-def run(T: int, h: int, blocks: int, iters: int = 30):
-    layers = build_chain(T, blocks, h)
+def run(T: int, h: int, blocks: int, iters: int = 30, real: bool = False):
+    gems = GEMMS_REAL if real else GEMMS
+    layers = build_chain(T, blocks, h, gems)
     print(f"[probe] T={T} 铺成 {h}×{T // h}, {blocks} 块 × 3 GEMM = {len(layers)} 层, "
-          f"{macs_per_block(T) * blocks / 1e9:.3f} GMAC")
+          f"{macs_per_block(T, gems) * blocks / 1e9:.3f} GMAC")
     t0 = time.perf_counter()
     x, params, y = make_case(layers, seed=1)
     ch = C16Chain(layers, params)
@@ -89,7 +93,7 @@ def run(T: int, h: int, blocks: int, iters: int = 30):
     print(f"[probe] 一次 {len(layers)} 层: 中位 {chunk_ms:.2f} ms 最快 {best_t * 1e3:.2f} ms")
     # 换算成 40 块（整个声学模型）和一个流式窗口
     per40 = chunk_ms / blocks * 40
-    gmac = macs_per_block(T) * blocks / 1e9
+    gmac = macs_per_block(T, gems) * blocks / 1e9
     print(f"[probe] 吞吐 {gmac / med:.1f} GMAC/s；40 块全模型 ≈ {per40:.1f} ms"
           f"（每次调用推进 4.0 s 新音频 → {4.0 / (per40 / 1e3):.0f}× 实时）")
     return d
@@ -100,7 +104,7 @@ if __name__ == "__main__":
         T = int(sys.argv[sys.argv.index("--run") + 1])
         h = int(sys.argv[sys.argv.index("-h") + 1]) if "-h" in sys.argv else 1
         blocks = int(sys.argv[sys.argv.index("-b") + 1]) if "-b" in sys.argv else 4
-        sys.exit(0 if run(T, h, blocks) == 0 else 1)
+        sys.exit(0 if run(T, h, blocks, real="--real" in sys.argv) == 0 else 1)
     import os
     for t in [int(x) for x in os.environ.get('TS', '120 176 180').split()]:
         probe_layouts(t)
