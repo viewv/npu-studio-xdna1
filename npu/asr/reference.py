@@ -17,7 +17,7 @@ from pathlib import Path
 
 import numpy as np
 
-from npu.asr.weights import OUT as NPZ
+from npu.asr.weights import MODEL, OUT as NPZ
 
 D, HEADS, HD, FF, LAYERS = 512, 8, 64, 2048, 40
 FLAT = 192 * 20
@@ -238,7 +238,7 @@ def text(ids: np.ndarray, vocab: list[str]) -> str:
 
 def main() -> int:
     z = dict(np.load(NPZ))
-    vocab = (Path.home() / ".local/share/wetype/asr/model/dict.decoder.utf8.txt").read_text().splitlines()
+    vocab = (MODEL / "dict.decoder.utf8.txt").read_text().splitlines()
     vocab = [l.split(" ", 1)[1] if " " in l else "" for l in vocab]
     if "--random" in sys.argv:
         rng = np.random.default_rng(0)
@@ -287,3 +287,132 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+# ------------------------------------------------------------------ 伪量化（NPU 方案评估）
+#
+# 目标：NPU 上激活是"静态逐通道"（比例在校准集上定好、折进下一层权重），
+# 而 Rust 引擎是"逐行动态"（每 token 自己算 absmax，NPU 上做不到）。
+# 这里用浮点伪量化（照 encoder_q/decoder_q 的方法论）评估两种方案的差距：
+#   把 x 量化成 round(x/s)·s 再算，权重同理；其余算子（LN/softmax/GELU）仍是 fp32。
+
+
+def _q_per_row(x: np.ndarray) -> np.ndarray:
+    m = np.abs(x).max(1)
+    s = np.where(m > 0, m / 127.0, 1.0)
+    return np.rint(x / s[:, None]).clip(-127, 127) * s[:, None]
+
+
+def _q_per_channel(x: np.ndarray, cal: np.ndarray | None = None) -> np.ndarray:
+    m = np.abs(cal if cal is not None else x).max(0)
+    s = np.where(m > 0, m / 127.0, 1.0)
+    return np.rint(x / s).clip(-127, 127) * s
+
+
+def _q_per_tensor(x: np.ndarray) -> np.ndarray:
+    m = np.abs(x).max()
+    s = m / 127.0 if m > 0 else 1.0
+    return np.rint(x / s).clip(-127, 127) * s
+
+
+def forward_fq(frames: np.ndarray, z, mode: str = "pc", cal_frames: np.ndarray | None = None,
+               layers: int = LAYERS) -> np.ndarray:
+    """伪量化前向：mode = row（动态逐行）/ pc（静态逐通道）/ pt（静态逐张量）。
+    pc 时用 cal_frames（默认用 frames 自己）按通道取 absmax 当校准。"""
+    qf = {"row": _q_per_row, "pc": _q_per_channel, "pt": _q_per_tensor}[mode]
+    # 校准：把整段 fbank 先过一遍前端拿特征，按通道统计（简化：用当前窗口）
+    t1, y3 = frontend(frames, z)
+    if mode == "pc" and cal_frames is not None:
+        _, y3c = frontend(cal_frames, z)
+    else:
+        y3c = y3
+    acc = {"cal": y3c}
+
+    def Q(x: np.ndarray) -> np.ndarray:
+        if mode == "pc":
+            return _q_per_channel(x, acc["cal"])
+        return qf(x)
+
+    def mm(x: np.ndarray, W: np.ndarray, ws: float, b) -> np.ndarray:
+        y = Q(x) @ (W.T * ws)
+        return y + b if b is not None else y
+
+    h = mm(y3, z["lin_w"], float(z["lin_s"]), z["lin_b"])
+    acc["cal"] = h      # 之后的校准用同形状的上一窗口近似（仅为量级检查）
+    for l in range(layers):
+        p = f"l{l}_"
+        y = _norm(h, z[p + "png"], z[p + "pnb"])
+        acc["cal"] = y
+        qm = mm(y, z[p + "q"], float(z[p + "q_s"]), None)
+        km = mm(y, z[p + "k"], float(z[p + "k_s"]), None)
+        vm = mm(y, z[p + "v"], float(z[p + "v_s"]), None)
+        att = _attention(qm, km, vm, t1)
+        acc["cal"] = att
+        h = h + mm(att, z[p + "o"], float(z[p + "o_s"]), None)
+        acc["cal"] = _norm(h, z[p + "mng"], z[p + "mnb"])
+        f = mm(acc["cal"], z[p + "f1"], float(z[p + "f1_s"]), z[p + "f1b"])
+        f = _gelu(f)
+        acc["cal"] = f
+        h = h + mm(f, z[p + "f2"], float(z[p + "f2_s"]), z[p + "f2b"])
+    acc["cal"] = h
+    lo = mm(h, z["out_w"], float(z["out_s"]), z["out_b"])
+    return lo
+
+
+# ------------------------------------------------------------------ NPU 方案端到端
+
+
+def forward_npu(frames: np.ndarray, z, layers: int = LAYERS) -> np.ndarray:
+    """整条 NPU 方案的伪量化前向：
+
+    激活 静态逐通道比例（逐张量比例给 LN 的输入，因为 LN 对缩放不变）、
+    LayerNorm / softmax / GELU 走整数定义（npu/asr/ops_int.py）。
+    返回 logits（float，可和 row 参考比余弦/argmax）。
+    """
+    from npu.asr.ops_int import gelu_int8, layernorm_int8, softmax_int8
+
+    def qpc(x):
+        m = np.abs(x).max(0)
+        s = np.where(m > 0, m / 127.0, 1.0)
+        return np.rint(x / s).clip(-127, 127) * s
+
+    def mm(x, W, ws, b):
+        y = qpc(x) @ (W.T * ws)
+        return y + b if b is not None else y
+
+    def ln(x, g, b):
+        # LN 输入：逐张量比例（LN 对均匀缩放不变，所以逐通道没有额外收益）
+        m = np.abs(x).max()
+        s = m / 127.0 if m > 0 else 1.0
+        xq = np.clip(np.rint(x / s), -127, 127).astype(np.int8)
+        return layernorm_int8(xq, s, g, b)
+
+    t1, y3 = frontend(frames, z)
+    h = mm(y3, z["lin_w"], float(z["lin_s"]), z["lin_b"])
+    for l in range(layers):
+        p = f"l{l}_"
+        y = ln(h, z[p + "png"], z[p + "pnb"])
+        qm = mm(y, z[p + "q"], float(z[p + "q_s"]), None)
+        km = mm(y, z[p + "k"], float(z[p + "k_s"]), None)
+        vm = mm(y, z[p + "v"], float(z[p + "v_s"]), None)
+        # ── 注意力：int32 分数（·0.125 折进量化比例）→ 查表 softmax → uint8 权重 × V
+        qh = qm.reshape(t1, HEADS, HD).transpose(1, 0, 2)
+        kh = km.reshape(t1, HEADS, HD).transpose(1, 0, 2)
+        vh = vm.reshape(t1, HEADS, HD).transpose(1, 0, 2)
+        sc = (qh @ kh.transpose(0, 2, 1)) * 0.125
+        m = np.abs(sc).max()
+        s_sc = m / 1000.0 if m > 0 else 1.0          # 分数留 1000 级动态范围
+        sc_q = np.rint(sc / s_sc).astype(np.int64)
+        w = softmax_int8(sc_q, out_frac=8).astype(np.float64) / 255.0
+        att = (w @ vh).transpose(1, 0, 2).reshape(t1, D)   # [h][t][hd] → [t][D]
+        h = h + mm(att, z[p + "o"], float(z[p + "o_s"]), None)
+        nf = ln(h, z[p + "mng"], z[p + "mnb"])
+        f = mm(nf, z[p + "f1"], float(z[p + "f1_s"]), z[p + "f1b"])
+        # ── GELU：int8 查表（输入/输出各一个逐张量比例）
+        mf = np.abs(f).max()
+        sf = mf / 127.0 if mf > 0 else 1.0
+        fq = np.clip(np.rint(f / sf), -127, 127).astype(np.int8)
+        so = sf                                      # 输出比例同输入（range 相近）
+        f = gelu_int8(fq, sf, so).astype(np.float64) * so
+        h = h + mm(f, z[p + "f2"], float(z[p + "f2_s"]), z[p + "f2b"])
+    return mm(h, z["out_w"], float(z["out_s"]), z["out_b"])

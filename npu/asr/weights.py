@@ -16,8 +16,27 @@ from pathlib import Path
 import numpy as np
 
 ELEM = {6: 1, 2: 1, 3: 1, 4: 2, 5: 2, 1: 4, 7: 4, 8: 4, 11: 4, 9: 8, 10: 8, 12: 8}
-MODEL = Path.home() / ".local/share/wetype/asr/model"
-XNET = MODEL / "embed_140m_kld43wh_test_78000_1_merge_4.kv.conv1d.dyQu.onnx.xnet"
+def find_model_dir() -> Path:
+    """离线模型目录：环境变量优先，然后依次找常见位置（项目改名 wetype→minime 过）。"""
+    import os
+    for var in ("MINIME_ASR_MODEL", "WETYPE_ASR_MODEL"):
+        if (v := os.environ.get(var)):
+            return Path(v)
+    home = Path.home()
+    cands = [home / ".local/share/minime/asr/model",
+             home / ".local/share/wetype/asr/model",
+             home / ".local/share/wowtype/wtlocal"]
+    for c in cands:
+        if list(c.glob("*.xnet")):
+            return c
+    hits = sorted(home.glob(".local/share/*/asr/model/*.xnet")) + sorted(home.glob(".local/share/*/*/*.xnet"))
+    if hits:
+        return hits[0].parent
+    raise FileNotFoundError("找不到离线语音模型（设 MINIME_ASR_MODEL 指向模型目录）")
+
+
+MODEL = find_model_dir()
+XNET = next(MODEL.glob("*.xnet"))
 OUT = MODEL / "wtmodel.npz"
 
 D, HEADS, HD, FF, LAYERS, VOCAB = 512, 8, 64, 2048, 40, 10502
