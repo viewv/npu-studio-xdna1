@@ -42,7 +42,7 @@ namespace {
 
 struct Desc {
   int icp, ocp, wt, stride, k, shift, nxc, plane;
-  int act;    // 0 / 4 ReLU (int8, 0..127)  1 HardSigmoid  2 线性  3 hardswish
+  int act;    // 0 / 4 ReLU (int8, 0..127)  1 HardSigmoid  2 线性  3 hardswish  5 GELU(查表)
   int s1, s2; // 重新量化: y = sat8((sat16((acc + 2^(s1-1)) >> s1) · M[c] + 2^(s2-1)) >> s2)
   int lo;     // y 的下限: ReLU 0, 其余 -128
 };
@@ -419,7 +419,8 @@ __attribute__((noinline)) void se_pool(const uint8_t *e, int32_t *acc, uint8_t *
 // 输出块的后处理 (块里已经是 int8 的 y): act 1 HardSigmoid = y + 128 (宽度外的像素清零, HardSigmoid(0) ≠ 0);
 // act 3 hardswish (逐通道, 参数在重新量化表 [384, 576)): yt = y · clamp(y + q3, 0, q6) (int32),
 //       out = sat8((sat16((yt + 2^(t1-1)) >> t1) · M2 + 2^(t2-1)) >> t2)
-__attribute__((noinline)) void post_act(uint8_t *o, int act, int nv, const int8_t *rq, int t1, int t2) {
+__attribute__((noinline)) void post_act(uint8_t *o, int act, int nv, const int8_t *rq, int t1, int t2,
+                                        const int8_t *tbl) {
   if (act == 1) {
     const auto m = ::aie::broadcast<uint8, 64>(0x80);
 #pragma clang loop unroll(disable)
@@ -428,6 +429,20 @@ __attribute__((noinline)) void post_act(uint8_t *o, int act, int nv, const int8_
     for (int p = nv < 0 ? 0 : nv; p < CW; p++) ::aie::store_v(o + p * 16, ::aie::zeros<uint8, 16>());
     return;
   }
+#ifndef NO_GELU
+  if (act == 5) {
+    // GELU: AIE2 硬件并行查表 (4 路)。表是 256 项 int8（值按 16 位存，每组 8 个重复两次，
+    // lut_ab / lut_cd 各 1 KB，见 chain_c16.gelu_lut_blob）。
+    // 有符号索引 + bias=128：正好覆盖 int8 全空间，越界检查被优化掉。
+    const ::aie::lut<4, int8> L(256, tbl, tbl + 1024);
+    ::aie::parallel_lookup<int8, ::aie::lut<4, int8>, ::aie::lut_oor_policy::saturate> pl(L, 0, 128);
+    int8_t *q = (int8_t *)o;
+    // fetch 的输入向量最多 32 个元素 (AIE2 的并行查表一次 32 个 int8 索引)
+#pragma clang loop unroll(disable)
+    for (int i = 0; i < CW * 16; i += 32) ::aie::store_v(q + i, pl.fetch(::aie::load_v<32>(q + i)));
+    return;   // 宽度外像素本来就是 0，表中心项 = 0 → 仍是 0
+  }
+#endif
   // 每轮 4 个互不依赖的 32 B (编译器不做软件流水; 一条链 load → … → mul → srs 约 22 个周期, 4 条交错着走)
   int8_t *q = (int8_t *)o;
   const V32S c3 = ::aie::load_v<32>((const int16_t *)(rq + 384));
@@ -454,7 +469,7 @@ extern "C" {
 //        int32[26] dilation  int32[27] depthwise  int32[28] depthwise 输入元素的行步长 (= m·PLANE)
 // 每个 core c 一段 (字节 32 + 16c 起, u16): [0] rows [1] sel_s1 [2] sel_s2 [3] wvalid [4] 每行块数
 //                                          [5] sel_acc [6] sel_fin
-//        int32[29] 输出激活 (0 ReLU uint8, 1 HardSigmoid, 2 线性 int8, 3 hardswish, 4 ReLU int8)
+//        int32[29] 输出激活 (0 ReLU uint8, 1 HardSigmoid, 2 线性 int8, 3 hardswish, 4 ReLU int8, 5 GELU 查表)
 //        [49] [50] 重新量化的 s1 s2  [52] 重新量化表在权重区里的偏移  [53] [54] hardswish 第二次重新量化的 t1 t2  [30] 输入逐通道乘 sc  [31] 这一步的输入通道组起点
 //        [33] 池化 (1 累加步, 2 收尾步)  [34..39] 池化参数  [43] 池化每组元素数 ne  [47] 池化输入是 int8
 //        [57] 双线性 ×2 上采样 (每 core 段的 [7] 是边界标志)  [58] 上采样的 log2(NXC)
@@ -535,9 +550,13 @@ void convC16Chunk(int8_t *r0, int8_t *r1, int8_t *r2, int8_t *wts, uint8_t *out,
   else {
     conv3s1(rows, w + ocp * (9 * d.icp * 256), out, d, px0, wvalid, rq);
   }
-#ifndef NO_PA
-  if ((h[29] == 1 || h[29] == 3) && h[25]) // IC 分块的中间步 (last = 0) 没有输出
-    post_act(out, h[29], wvalid - px0, rq, h[53], h[54]);
+#if !defined(NO_PA) || !defined(NO_GELU)
+  if ((h[29] == 1 || h[29] == 3
+#ifndef NO_GELU
+       || h[29] == 5
+#endif
+       ) && h[25]) // IC 分块的中间步 (last = 0) 没有输出
+    post_act(out, h[29], wvalid - px0, rq, h[53], h[54], w + h[52] + d.ocp * RQB);
 #endif
 }
 
