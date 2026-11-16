@@ -483,12 +483,13 @@ __attribute__((noinline)) void ln_step(const int8_t *in, const int32_t *h, const
           s2 += xv * xv * m2[ch * 16 + c];
         }
       }
-      af[2 * p] += s1;
-      af[2 * p + 1] += s2;
+      if (h[24]) { af[2 * p] = s1; af[2 * p + 1] = s2; }     // 第一块清零重来
+      else { af[2 * p] += s1; af[2 * p + 1] += s2; }
     }
     if (stats) {
       for (int p = 0; p < wvalid; p++) {
-        const int32_t mean_q = af[2 * p] >> 9;                       // D = 512
+        const int sh = ic == 512 ? 9 : ic == 256 ? 8 : ic == 128 ? 7 : ic == 384 ? 8 : 9;
+        const int32_t mean_q = af[2 * p] >> sh;                     // / D
         const float var = (float)af[2 * p + 1] / (float)(ic * 524288) -
                           (float)((int32_t)(((int64_t)mean_q * mean_q) >> 5)) / 16777216.0f;
         const float v = var + 1e-6f;

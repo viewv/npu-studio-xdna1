@@ -1106,7 +1106,8 @@ def _pack_step(l, tl, full, p, rq, e_w, st, c_own, ws_in=0, sgn_in=False, sc_cp=
         assert p.ln is not None, "op 5 需要 LParam.ln = (gamma, beta, s_in, g_out)"
         gamma, beta, s_in, g_out = (np.asarray(a, np.float32) for a in p.ln)
         hdr[59] = 1                                   # LN 标记
-        hdr[60], hdr[61], hdr[62], hdr[63] = st[7], st[8], icp0, l.ic  # pass / stats / 组起点 / ic
+        hdr[60], hdr[61], hdr[62], hdr[63] = st[7], st[8], icp0, l.ic
+        hdr[24] = int(icp0 == 0)      # 第一块: acc 从零开始  # pass / stats / 组起点 / ic
         hdr[:8] = [nicp, 1, tl.wt, 1, 1, 0, tl.nxc, tl.plane]
         buf[:HDR] = hdr.view(np.int8)
         for c, t, b in tl.cores():
@@ -1257,7 +1258,7 @@ def ln_ref(x_u8: np.ndarray, p: LParam) -> np.ndarray:
     x = x_u8.view(np.int8).astype(np.int64)
     s1 = (x * m1.reshape(-1, 1, 1)).sum(0)                     # Q12
     s2 = (x * x * m2.reshape(-1, 1, 1)).sum(0)                 # Q19
-    mean_q = s1 >> 9                                            # D = 512
+    mean_q = s1 >> int(round(np.log2(c)))                        # / D
     var = s2 / (c * 524288.0) - (mean_q.astype(np.float64) ** 2) / (4096.0 ** 2)
     r12 = np.rint(1.0 / np.sqrt(var + 1e-6) * 4096.0).astype(np.int64)
     dev = x * m1.reshape(-1, 1, 1) - mean_q.reshape(1, h, w)
