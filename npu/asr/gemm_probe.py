@@ -90,8 +90,8 @@ def run(T: int, h: int, blocks: int, iters: int = 30):
     # 换算成 40 块（整个声学模型）和一个流式窗口
     per40 = chunk_ms / blocks * 40
     gmac = macs_per_block(T) * blocks / 1e9
-    print(f"[probe] 吞吐 {gmac / med / 1e3:.1f} GMAC/s；40 块全模型 ≈ {per40:.1f} ms"
-          f"（窗口 {T} token = {T * 0.04:.1f}s 音频 → {T * 0.04 / (per40 / 1e3):.0f}× 实时）")
+    print(f"[probe] 吞吐 {gmac / med:.1f} GMAC/s；40 块全模型 ≈ {per40:.1f} ms"
+          f"（每次调用推进 4.0 s 新音频 → {4.0 / (per40 / 1e3):.0f}× 实时）")
     return d
 
 
