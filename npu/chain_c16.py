@@ -165,6 +165,7 @@ R = {
     "e12": Layer(128, 32, 1, 1, 12, 20),
     "e13": Layer(32, 32, 3, 1, 12, 20),    # 3×3 s1 @12×20 (补宽列必须是零)
     "gelu1": Layer(64, 128, 1, 1, 12, 20, act=5),   # GELU 查表 (act 5) 的测试层
+    "lm1": Layer(512, 512, 1, 1, 4, 35, op=5),      # LayerNorm 的测试层 (512 通道, 4 行 × 35 像素)
 }
 # RVM 编码器 12×20 段的真实形状 (跳过 depthwise 和 SE; 200/184 补到 208/192), 输入 240 通道
 _T = [(240, 80, 1, "Conv_67"), (80, 208, 1, "Conv_68"), (208, 80, 1, "Conv_74"), (80, 480, 1, "Conv_92"),
@@ -241,6 +242,7 @@ def _real(names):
 
 CHAINS = {
     "gelu": ["gelu1"],                                   # GELU 查表 (act 5)
+    "lm": ["lm1"],                                       # LayerNorm (op 5)
     "enc": ENC,
     "head": ENC[:3],
     "low": ENC + ["e11", "e12", "e13"] * 4,           # 12×20 的三层重复
@@ -690,8 +692,8 @@ class Plan:
     @staticmethod
     def _step_wbytes(l, st):
         _, nocp, _, nicp = st[:4]
-        if l.op == 5:                # LN: gamma/beta/s_in/g_out (各 ic 个 fp32) + eps + D
-            return 4 * 4 * l.ic + 8
+        if l.op == 5:                # LN: m1/m2/g10/b12/gq (各 ic 个 int32)
+            return 5 * 4 * l.ic
         if l.op:
             return 0
         if l.dw:
@@ -846,7 +848,8 @@ class Plan:
             if l.act == 1:
                 kind += " HardSigmoid"
             extra = {"dw": f" 每步 {tl.nocp} 组 × {tl.n_ob} 步", "full": "", "oc": f" OC 分 {tl.n_ob} 块×{tl.nocp} 组" + (" (OC 并行)" if tl.ocpar else ""),
-                     "ict": f" IC 分 {tl.n_icb} 步×{tl.icp_pad} 组, OC 分 {tl.n_ob} 份×{tl.nocp} 组"}[tl.mode]
+                     "ict": f" IC 分 {tl.n_icb} 步×{tl.icp_pad} 组, OC 分 {tl.n_ob} 份×{tl.nocp} 组",
+             "lm": f" LayerNorm {tl.n_icb} 块×2 遍, 每块 {tl.icp_pad} 组"}[tl.mode]
             out.append(f"{l.ic}→{l.oc} {kind} {l.h}×{l.w}→{l.ho}×{l.wo}: {tl.n_tw}条×{tl.n_bands}段 "
                        f"WT {tl.wt} 行 {tl.band_rows} ICPpad {tl.icp_pad} PLANE {tl.plane}{extra}")
         return out
@@ -1112,8 +1115,12 @@ def _pack_step(l, tl, full, p, rq, e_w, st, c_own, ws_in=0, sgn_in=False, sc_cp=
             nch = 1 if st[7] == 0 else nicp             # 第一遍每行一次调用；第二遍每个通道组一次
             per = np.array([rows, 0, 0, wvalid, nch, int(st[7] == 0), int(st[7] == 1), 0], np.uint16)
             buf[32 + 16 * c: 48 + 16 * c] = per.view(np.int8)
-        par = np.concatenate([gamma, beta, s_in, g_out,
-                              np.array([1e-6, float(l.ic)], np.float32)])
+        ic32 = lambda v: np.rint(np.asarray(v, np.float64) * 4096.0).astype(np.int32)
+        par = np.concatenate([ic32(s_in),                                      # m1  Q12
+                              np.rint(np.asarray(s_in, np.float64) ** 2 * 524288.0).astype(np.int32),  # m2 Q19
+                              np.rint(np.asarray(gamma, np.float64) * 1024.0).astype(np.int32),        # g10 Q10
+                              ic32(beta),                                      # b12 Q12
+                              ic32(g_out)]).astype(np.int32)                   # g5 Q12
         buf[HDR: HDR + par.nbytes] = par.view(np.int8)
         return buf
     if l.op == 1:                # 池化: 累加步 (每组前 ne-1 个元素) + 收尾步 (每组最后一个), 参数在 int32[33..39, 43]
@@ -1237,14 +1244,27 @@ def requant(acc, p: LParam | int, act=0):
 
 
 def ln_ref(x_u8: np.ndarray, p: LParam) -> np.ndarray:
-    """LayerNorm 的整数参考: 输入 int8 [C][H][W] (逐通道 s_in)，输出 int8 (逐通道 g_out = 1/s_out)。"""
+    """LayerNorm 的**定点**参考 (与内核同一阶梯): s1=Σx·m1 (Q12), s2=Σx²·m2 (Q19),
+    mean=s1>>9, r12=round(2^12/sqrt(var+1e-6)), n=(dev·r12)>>12, y=(n·g10)>>10, out=((y+b12)·gq)>>12。
+    注: 内核用位技巧 + 3 次 Newton 求 1/sqrt（AIE2 没有 sqrtf），和这里精确开方可能差 1 LSB。"""
     gamma, beta, s_in, g_out = (np.asarray(a, np.float64) for a in p.ln)
     c, h, w = x_u8.shape
-    x = x_u8.view(np.int8).astype(np.float64) * s_in.reshape(-1, 1, 1)
-    mean = x.mean(0, keepdims=True)
-    var = np.maximum(((x - mean) ** 2).mean(0, keepdims=True), 0.0)
-    y = (x - mean) / np.sqrt(var + 1e-6) * gamma.reshape(-1, 1, 1) + beta.reshape(-1, 1, 1)
-    return np.clip(np.rint(y * g_out.reshape(-1, 1, 1)), -128, 127).astype(np.int8).view(np.uint8)
+    m1 = np.rint(s_in * 4096).astype(np.int64)
+    m2 = np.rint(s_in ** 2 * 524288).astype(np.int64)
+    g10 = np.rint(gamma * 1024).astype(np.int64)
+    b12 = np.rint(beta * 4096).astype(np.int64)
+    gq = np.rint(g_out * 4096).astype(np.int64)
+    x = x_u8.view(np.int8).astype(np.int64)
+    s1 = (x * m1.reshape(-1, 1, 1)).sum(0)                     # Q12
+    s2 = (x * x * m2.reshape(-1, 1, 1)).sum(0)                 # Q19
+    mean_q = s1 >> 9                                            # D = 512
+    var = s2 / (c * 524288.0) - (mean_q.astype(np.float64) ** 2) / (4096.0 ** 2)
+    r12 = np.rint(1.0 / np.sqrt(var + 1e-6) * 4096.0).astype(np.int64)
+    dev = x * m1.reshape(-1, 1, 1) - mean_q.reshape(1, h, w)
+    n12 = (dev * r12.reshape(1, h, w)) >> 12
+    y12 = (n12 * g10.reshape(-1, 1, 1)) >> 10
+    o = ((y12 + b12.reshape(-1, 1, 1)) * gq.reshape(-1, 1, 1)) >> 12
+    return np.clip(o, -128, 127).astype(np.int8).view(np.uint8)
 
 
 def pool_ref(x_u8: np.ndarray, sgn=False) -> np.ndarray:

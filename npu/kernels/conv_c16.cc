@@ -461,6 +461,68 @@ __attribute__((noinline)) void post_act(uint8_t *o, int act, int nv, const int8_
   }
 }
 
+#ifndef NO_LM
+// LayerNorm 一步 (op 5): 一行一个 core、全部通道组; 定点阶梯见 docs/npu-models.md §14.5。
+//   参数在权重区: m1(Q12) m2(Q19) g10(Q10) b12(Q12) gq(Q12)，各 ic 个 int32。
+//   acc 前 2·CW 个 int32: [Σx·m1, Σx²·m2] → 最后一块换成 [mean_q, r12]。
+//   注: AIE2 没有 sqrtf / 整数除法 / double —— 1/sqrt 用位技巧 + 3 次 Newton。
+__attribute__((noinline)) void ln_step(const int8_t *in, const int32_t *h, const int8_t *w, uint8_t *out,
+                                       int32_t *acc, int j, int wvalid) {
+  const int pass = h[60], stats = h[61], g0 = h[62], icp = h[0], plane = h[7], ic = h[63];
+  const int32_t *q = (const int32_t *)w;
+  const int32_t *m1 = q, *m2 = q + ic, *g10 = q + 2 * ic, *b12 = q + 3 * ic, *gq = q + 4 * ic;
+  int32_t *af = acc;
+  if (pass == 0) {
+    for (int p = 0; p < wvalid; p++) {
+      int32_t s1 = 0, s2 = 0;
+      for (int g = 0; g < icp; g++) {
+        const int8_t *px = in + g * plane + (PAD + p) * 16;
+        for (int c = 0; c < 16; c++) {
+          const int32_t xv = px[c], ch = g0 + g;
+          s1 += xv * m1[ch * 16 + c];
+          s2 += xv * xv * m2[ch * 16 + c];
+        }
+      }
+      af[2 * p] += s1;
+      af[2 * p + 1] += s2;
+    }
+    if (stats) {
+      for (int p = 0; p < wvalid; p++) {
+        const int32_t mean_q = af[2 * p] >> 9;                       // D = 512
+        const float var = (float)af[2 * p + 1] / (float)(ic * 524288) -
+                          (float)((int32_t)(((int64_t)mean_q * mean_q) >> 5)) / 16777216.0f;
+        const float v = var + 1e-6f;
+        const float hh = 0.5f * v;
+        int32_t bits = *(int32_t *)&v;
+        bits = 0x5f3759df - (bits >> 1);
+        float rs = *(float *)&bits;
+        rs = rs * (1.5f - hh * rs * rs);
+        rs = rs * (1.5f - hh * rs * rs);
+        rs = rs * (1.5f - hh * rs * rs);
+        af[2 * p] = mean_q;
+        af[2 * p + 1] = (int32_t)(rs * 4096.0f + 0.5f);
+      }
+    }
+    return;
+  }
+  const int gp = g0 + j;
+  for (int p = 0; p < wvalid; p++) {
+    const int32_t mean_q = af[2 * p], r12 = af[2 * p + 1];
+    int8_t *px = (int8_t *)out + p * 16;
+    const int8_t *src = in + j * plane + (PAD + p) * 16;
+    for (int c = 0; c < 16; c++) {
+      const int32_t ch = gp * 16 + c;
+      const int32_t dev = src[c] * m1[ch] - mean_q;                 // Q12
+      const int32_t n12 = (dev * r12) >> 12;                        // Q12
+      const int32_t y12 = (n12 * g10[ch]) >> 10;                    // Q12
+      int32_t o = ((y12 + b12[ch]) * gq[ch]) >> 12;
+      px[c] = (int8_t)(o < -128 ? -128 : (o > 127 ? 127 : o));
+    }
+  }
+  for (int p = wvalid < 0 ? 0 : wvalid; p < CW; p++) ::aie::store_v(out + p * 16, ::aie::zeros<uint8, 16>());
+}
+#endif
+
 } // namespace
 
 extern "C" {
@@ -509,6 +571,9 @@ void convC16Chunk(int8_t *r0, int8_t *r1, int8_t *r2, int8_t *wts, uint8_t *out,
   const int wvalid = pc[3];
   const int ocp = j / d.nxc, xc = j - ocp * d.nxc;
   const int px0 = xc * CW;
+#ifndef NO_LM
+  if (h[59] == 1) { ln_step(r1, h, wts + HDR, out, acc, j, wvalid - px0); return; }
+#endif
   int8_t *rows[3] = {r0, r1, r2};
   const int8_t *w = wts + HDR;
   const int8_t *rq = w + h[52] + ocp * RQB; // 这个输出通道组的重新量化表
