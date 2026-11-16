@@ -239,7 +239,8 @@ def text(ids: np.ndarray, vocab: list[str]) -> str:
 def main() -> int:
     z = dict(np.load(NPZ))
     vocab = (MODEL / "dict.decoder.utf8.txt").read_text().splitlines()
-    vocab = [l.split(" ", 1)[1] if " " in l else "" for l in vocab]
+    # 字典行格式：`id token 标志`（标志 W/P 只对解码策略有用，不是词的一部分）
+    vocab = [l.split()[1] if len(l.split()) >= 2 else "" for l in vocab]
     if "--random" in sys.argv:
         rng = np.random.default_rng(0)
         frames = rng.normal(0, 1, (70, 40)).astype(np.float32)
@@ -275,12 +276,23 @@ def main() -> int:
         return 0 if ok else 1
     if "--wav" in sys.argv:
         path = sys.argv[sys.argv.index("--wav") + 1]
+        expect = sys.argv[sys.argv.index("--expect") + 1] if "--expect" in sys.argv else None
         with wave.open(path) as w:
             pcm = np.frombuffer(w.readframes(w.getnframes()), np.int16)
         frames = fbank(pcm)
-        ids = forward(frames, z, int_path=True)
-        print(text(ids, vocab))
-        return 0
+        out = {}
+        for tag, logits in (("int", None), ("npu", None)):
+            pass
+        ref = text(forward(frames, z, int_path=True), vocab)
+        npu = text(forward_npu(frames, z).argmax(1).astype(np.uint32), vocab)
+        print(f"int : {ref}")
+        print(f"npu : {npu}")
+        if expect:
+            import difflib
+            for tag, got in (("int", ref), ("npu", npu)):
+                cer = 1 - difflib.SequenceMatcher(None, expect, got).ratio()
+                print(f"  {tag} CER {cer * 100:.1f}%")
+        return 0 if ref == npu and (not expect or ref == expect) else 1
     print(__doc__)
     return 1
 
@@ -381,11 +393,8 @@ def forward_npu(frames: np.ndarray, z, layers: int = LAYERS) -> np.ndarray:
         return y + b if b is not None else y
 
     def ln(x, g, b):
-        # LN 输入：逐张量比例（LN 对均匀缩放不变，所以逐通道没有额外收益）
-        m = np.abs(x).max()
-        s = m / 127.0 if m > 0 else 1.0
-        xq = np.clip(np.rint(x / s), -127, 127).astype(np.int8)
-        return layernorm_int8(xq, s, g, b)
+        # LN 输入：逐通道比例（实测逐张量会在 40 层后丢字，见 ops_int 的说明）
+        return layernorm_int8(x, g, b)
 
     t1, y3 = frontend(frames, z)
     h = mm(y3, z["lin_w"], float(z["lin_s"]), z["lin_b"])
@@ -400,10 +409,7 @@ def forward_npu(frames: np.ndarray, z, layers: int = LAYERS) -> np.ndarray:
         kh = km.reshape(t1, HEADS, HD).transpose(1, 0, 2)
         vh = vm.reshape(t1, HEADS, HD).transpose(1, 0, 2)
         sc = (qh @ kh.transpose(0, 2, 1)) * 0.125
-        m = np.abs(sc).max()
-        s_sc = m / 1000.0 if m > 0 else 1.0          # 分数留 1000 级动态范围
-        sc_q = np.rint(sc / s_sc).astype(np.int64)
-        w = softmax_int8(sc_q, out_frac=8).astype(np.float64) / 255.0
+        w = softmax_int8(sc).astype(np.float64) / 255.0
         att = (w @ vh).transpose(1, 0, 2).reshape(t1, D)   # [h][t][hd] → [t][D]
         h = h + mm(att, z[p + "o"], float(z[p + "o_s"]), None)
         nf = ln(h, z[p + "mng"], z[p + "mnb"])
@@ -412,7 +418,10 @@ def forward_npu(frames: np.ndarray, z, layers: int = LAYERS) -> np.ndarray:
         mf = np.abs(f).max()
         sf = mf / 127.0 if mf > 0 else 1.0
         fq = np.clip(np.rint(f / sf), -127, 127).astype(np.int8)
-        so = sf                                      # 输出比例同输入（range 相近）
+        # 输出比例按 gelu 实际输出范围校准（负半轴会被压到 -0.17 附近）
+        g = 0.5 * f * (1 + np.tanh(0.7978846 * (f + 0.044715 * f ** 3)))
+        mg = np.abs(g).max()
+        so = mg / 127.0 if mg > 0 else 1.0
         f = gelu_int8(fq, sf, so).astype(np.float64) * so
         h = h + mm(f, z[p + "f2"], float(z[p + "f2_s"]), z[p + "f2b"])
     return mm(h, z["out_w"], float(z["out_s"]), z["out_b"])

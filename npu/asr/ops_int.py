@@ -52,24 +52,25 @@ _EXP = _exp_lut()
 # ---------------------------------------------------------------- LayerNorm
 
 
-def layernorm_int8(xq: np.ndarray, s_in: float, gamma: np.ndarray, beta: np.ndarray,
-                   eps: float = 1e-6, s_gamma: float = 1.0) -> np.ndarray:
-    """int8 [T][D]（逐张量比例 s_in）→ fp32 [T][D]。
+def layernorm_int8(x: np.ndarray, gamma: np.ndarray, beta: np.ndarray,
+                   eps: float = 1e-6, bits: int = 16) -> np.ndarray:
+    """逐 token 的 LayerNorm：**必须用逐通道比例**（用逐张量会因为离群值把
+    量化步长撑大，实测 40 层之后就丢字）。
 
-    内核里：sum/sumsq 用 int64；var 归一化后查倒数表；输出仍是浮点（下一步
-    的量化由生产者做）。这里返回浮点，和 `_layernorm_ref` 逐元素比。
+    内核可照此实现：xq·s[c] 用 Q16 定点（`xi = xq · round(s·2^16)`，int64），
+    Σxi / Σxi² 都是整数累加；1/sqrt 用 Newton 迭代（这里直接用 float 代表
+    内核能达到的精度），最后 (xi − mean)·rstd 无量纲，乘 gamma 加 beta。
     """
-    d = xq.shape[1]
-    x = xq.astype(np.int64)                         # 量化单位
-    sx = x.sum(1)                                   # int64
-    sx2 = (x * x).sum(1)                            # int64
-    mean = sx / d
-    var = np.maximum(sx2 / d - mean ** 2, 0.0)
-    # 内核里 1/sqrt(var+eps) 用 Newton 迭代（AIE2 没有除法/开方），精度到 1e-6；
-    # 这里直接用浮点，代表"内核能做到的精度"。
-    rstd = 1.0 / np.sqrt(var + eps / (s_in * s_in))   # eps 换算到量化单位
-    y = (x - mean[:, None]) * rstd[:, None]            # 无量纲（LN 对缩放不变）
-    return y * gamma * s_gamma + beta
+    s = np.abs(x).max(0) / 127.0
+    s = np.where(s > 0, s, 1.0)
+    xq = np.clip(np.rint(x / s), -127, 127).astype(np.int64)
+    xi = xq * np.rint(s * (1 << bits)).astype(np.int64)      # Q(bits)
+    n = x.shape[1]
+    mean = xi.sum(1) / n                                     # Q(bits)
+    var = np.maximum((xi * xi).sum(1) / n - mean ** 2, 0.0)  # Q(2·bits)，防抵消为负
+    rstd = 1.0 / np.sqrt(var + eps * (1 << (2 * bits)))      # 1/Q(bits)
+    y = (xi - mean[:, None]) * rstd[:, None]                 # 无量纲
+    return y * gamma + beta
 
 
 def _layernorm_ref(x: np.ndarray, gamma: np.ndarray, beta: np.ndarray, eps: float = 1e-6) -> np.ndarray:
@@ -81,14 +82,17 @@ def _layernorm_ref(x: np.ndarray, gamma: np.ndarray, beta: np.ndarray, eps: floa
 # ---------------------------------------------------------------- softmax（查表）
 
 
-def softmax_int8(scores_q: np.ndarray, out_frac: int = 8) -> np.ndarray:
-    """[H][T][T] 的 int32 分数（已乘好比例）→ uint8 [H][T][T]，比例 1/256。"""
-    s = scores_q - scores_q.max(2, keepdims=True)        # ≤ 0
-    n = len(_EXP) - 1                                    # 表覆盖分数区间 [-16, 0]
+def softmax_int8(scores: np.ndarray) -> np.ndarray:
+    """[H][T][T] 的**浮点**分数 → uint8 [H][T][T]，比例 1/255。
+
+    表固定覆盖 [-16, 0]（步长 16/255 ≈ 1/16），所以分数先用真实单位进来；
+    比 -16 还小的项贡献 < 1e-7，钳掉。内核里对应：s_real·(255/16) 取整查表。"""
+    s = scores - scores.max(2, keepdims=True)            # ≤ 0，真实单位
+    n = len(_EXP) - 1
     idx = np.clip(np.rint(-s * (n / 16.0)).astype(np.int64), 0, n)
     e = _EXP[idx]                                        # Q16，[0, 65536]
     den = e.sum(2, keepdims=True)                        # int32 内
-    w = (e * 255 + den // 2) // den                      # 归一化到 0..255
+    w = (e * 255 + den // 2) // den
     return np.clip(w, 0, 255).astype(np.uint8)
 
 
@@ -126,18 +130,17 @@ def _report(name: str, a: np.ndarray, b: np.ndarray) -> None:
 if __name__ == "__main__":
     rng = np.random.default_rng(0)
     d = 512
-    print("LayerNorm（int8 逐张量比例 + 定点倒数表）:")
+    print("LayerNorm（逐通道比例 + Q16 整数求和）:")
     g = rng.normal(1, 0.1, d).astype(np.float32)
     b = rng.normal(0, 0.1, d).astype(np.float32)
-    for s_in in (0.02, 0.1):
-        x = rng.normal(0, s_in * 60, (64, d)).astype(np.float32)
-        xq = np.clip(np.rint(x / s_in), -127, 127).astype(np.int8)
-        _report(f"s_in={s_in}", layernorm_int8(xq, s_in, g, b), _layernorm_ref(xq * s_in, g, b))
+    for spread in (1.0, 8.0):
+        x = (rng.normal(0, 1, (64, d)) * rng.lognormal(0, spread, (1, d))).astype(np.float32)
+        _report(f"通道跨度 e^{spread}", layernorm_int8(x, g, b), _layernorm_ref(x, g, b))
 
     print("softmax（查表 exp + 定点倒数）:")
     for t in (64, 140):
-        sc = rng.normal(0, 8, (8, t, t)).astype(np.float32) * 100
-        w = softmax_int8(np.rint(sc).astype(np.int64)) / 256.0
+        sc = rng.normal(0, 8, (8, t, t)).astype(np.float32) * 3
+        w = softmax_int8(sc) / 255.0
         _report(f"T={t}", w, _softmax_ref(sc))
 
     print("GELU（256 项查表）:")
