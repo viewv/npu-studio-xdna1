@@ -440,6 +440,23 @@ def choose_tiling(l: Layer, ws_in: int | None = None, w_max: int = 0) -> Tiling:
                     n_ob=1, n_icb=cdiv(l.h, kr))
         tl.steps = [(0, l.icp, 0, l.icp, 1, 0), (0, l.icp, 0, l.icp, 0, 1)]
         return tl
+    if l.op == 5:                # LayerNorm: 一行一个 core、读全部通道组 (跨组归约不能按通道分核)
+        wt = cdiv(l.wo, CW) * CW
+        bands = min(N_CORES, l.ho)
+        q, r = divmod(l.ho, bands)
+        rows = [q + (1 if b < r else 0) for b in range(bands)]
+        tl = Tiling(1, bands, wt, [sum(rows[:b]) for b in range(bands)], rows)
+        we = min(wt, cdiv(min(l.wo, wt), 8) * 8)
+        need = (we + 2 * PAD) * 16
+        m = max(p for p in range(1, 65) if E_IN % p == 0 and need <= E_IN // p <= MAX_PLANE
+                and (E_IN // p) % 64 == 0 and l.icp % p == 0)
+        tl.mode, tl.icp_pad, tl.plane = "lm", m, E_IN // m
+        tl.nocp, tl.n_ob, tl.n_icb = 1, 1, cdiv(l.icp, m)
+        # 步: (ocp0, nocp, icp0, nicp, first, last, 行段, pass, stats)
+        tl.steps = ([(0, 1, i * m, min(m, l.icp - i * m), 0, 0, 0, 0, int(i == tl.n_icb - 1))
+                     for i in range(tl.n_icb)]
+                    + [(0, 1, i * m, min(m, l.icp - i * m), 0, 0, 0, 1, 0) for i in range(tl.n_icb)])
+        return tl
     if l.op == 2:
         return _up_tiling(l)
     if l.op == 3:                # 外部输入: 不算, 没有步
@@ -673,6 +690,8 @@ class Plan:
     @staticmethod
     def _step_wbytes(l, st):
         _, nocp, _, nicp = st[:4]
+        if l.op == 5:                # LN: gamma/beta/s_in/g_out (各 ic 个 fp32) + eps + D
+            return 4 * 4 * l.ic + 8
         if l.op:
             return 0
         if l.dw:
@@ -712,6 +731,7 @@ class Plan:
             "S2": any(not l.op and not l.dw and l.k == 3 and l.s == 2 for l in L),
             "PA": any(l.act in (1, 3) for l in L),
             "GELU": any(l.act == 5 for l in L),
+            "LM": any(l.op == 5 for l in L),
         }
         return [f"-DNO_{k}" for k, v in use.items() if not v]
 
@@ -753,6 +773,10 @@ class Plan:
             return [(o0 + tl.steps[o][0] * ti.cplane + l.s * r0 * ti.frow,
                      [min(64, rows - r0), l.k, tl.icp_pad, tl.plane], [l.s * ti.frow, l.d * ti.frow, ti.cplane, 1])
                     for o in range(ob0, ob1) for r0 in range(0, rows, 64)]
+        if tl.mode == "lm":      # 两遍: 每遍一个 BD [IC 步][行][m 组][PLANE], 第二遍从同一处重读
+            o0 = base + (BR + tl.band_y0[b]) * ti.frow
+            return [(o0, [tl.n_icb, rows, tl.icp_pad, tl.plane],
+                     [tl.icp_pad * ti.cplane, ti.frow, ti.cplane, 1])] * 2
         if tl.mode == "ict":     # 不要上下边行; 每份 OC 一个 BD: [IC 步][行][m 组][PLANE]
             o1 = off + ti.frow
             if rows == 1:        # FC: 一行, 所有份合成一个 BD (最外维步长 0)
@@ -770,6 +794,11 @@ class Plan:
                 for _ in range(nob) for r0 in range(0, rows, 64)]
 
     def drain_taps(self, k, base, c, t, b, ob0=0, ob1=None):
+        tl, to = self.tilings[k], self.tensors[k + 1]
+        if tl.mode == "lm":     # 第二遍: [IC 步][行][每步通道组][640 B]
+            o0 = base + (BR + tl.band_y0[b]) * to.frow + (PAD + t * tl.wt) * 16
+            return [(o0, [tl.n_icb, tl.band_rows[b], tl.icp_pad, CW * 16],
+                     [tl.icp_pad * to.cplane, to.frow, to.cplane, 1])]
         tl, to = self.tilings[k], self.tensors[k + 1]
         ob1 = tl.n_ob if ob1 is None else ob1
         if tl.mode == "pool":    # core c 的组 c, c+4, … 各一个 640 B 块 (像素 0 = 均值, 其余 0)
@@ -1004,6 +1033,7 @@ class LParam:
     t2: int = 0
     inp: np.ndarray | None = None   # 外部输入层 (op 3) 的数据 (C, H, W), 构造 C16Chain 时写进 act 缓冲区
     gelu: np.ndarray | None = None  # act 5 用: 256 项 int8 查表（int8 值 → int8 值）
+    ln: tuple | None = None         # op 5 用: (gamma, beta, s_in, g_out)，各 ic 个 fp32
 
     def arr(self, name, n, default):
         v = getattr(self, name)
@@ -1068,6 +1098,23 @@ def _pack_step(l, tl, full, p, rq, e_w, st, c_own, ws_in=0, sgn_in=False, sc_cp=
         per = np.array([tl.pre, 0, 0, 0, 1, 1, 0, 0], np.uint16)
         buf[:HDR] = hdr.view(np.int8)
         buf[32 + 16 * c_own: 48 + 16 * c_own] = per.view(np.int8)
+        return buf
+    if l.op == 5:                # LayerNorm: gamma/beta/s_in/g_out + eps + D 在权重区
+        assert p.ln is not None, "op 5 需要 LParam.ln = (gamma, beta, s_in, g_out)"
+        gamma, beta, s_in, g_out = (np.asarray(a, np.float32) for a in p.ln)
+        hdr[59] = 1                                   # LN 标记
+        hdr[60], hdr[61], hdr[62], hdr[63] = st[7], st[8], icp0, l.ic  # pass / stats / 组起点 / ic
+        hdr[:8] = [nicp, 1, tl.wt, 1, 1, 0, tl.nxc, tl.plane]
+        buf[:HDR] = hdr.view(np.int8)
+        for c, t, b in tl.cores():
+            rows = tl.band_rows[b]
+            wvalid = min(max(l.wo - t * tl.wt, 0), tl.wt)
+            nch = 1 if st[7] == 0 else nicp             # 第一遍每行一次调用；第二遍每个通道组一次
+            per = np.array([rows, 0, 0, wvalid, nch, int(st[7] == 0), int(st[7] == 1), 0], np.uint16)
+            buf[32 + 16 * c: 48 + 16 * c] = per.view(np.int8)
+        par = np.concatenate([gamma, beta, s_in, g_out,
+                              np.array([1e-6, float(l.ic)], np.float32)])
+        buf[HDR: HDR + par.nbytes] = par.view(np.int8)
         return buf
     if l.op == 1:                # 池化: 累加步 (每组前 ne-1 个元素) + 收尾步 (每组最后一个), 参数在 int32[33..39, 43]
         m = round((1 << POOL_S) / (l.h * l.w))
@@ -1189,6 +1236,17 @@ def requant(acc, p: LParam | int, act=0):
     return y.astype(np.int8).view(np.uint8)
 
 
+def ln_ref(x_u8: np.ndarray, p: LParam) -> np.ndarray:
+    """LayerNorm 的整数参考: 输入 int8 [C][H][W] (逐通道 s_in)，输出 int8 (逐通道 g_out = 1/s_out)。"""
+    gamma, beta, s_in, g_out = (np.asarray(a, np.float64) for a in p.ln)
+    c, h, w = x_u8.shape
+    x = x_u8.view(np.int8).astype(np.float64) * s_in.reshape(-1, 1, 1)
+    mean = x.mean(0, keepdims=True)
+    var = np.maximum(((x - mean) ** 2).mean(0, keepdims=True), 0.0)
+    y = (x - mean) / np.sqrt(var + 1e-6) * gamma.reshape(-1, 1, 1) + beta.reshape(-1, 1, 1)
+    return np.clip(np.rint(y * g_out.reshape(-1, 1, 1)), -128, 127).astype(np.int8).view(np.uint8)
+
+
 def pool_ref(x_u8: np.ndarray, sgn=False) -> np.ndarray:
     c, h, w = x_u8.shape
     m = round((1 << POOL_S) / (h * w))
@@ -1258,6 +1316,14 @@ def make_case(layers, seed=0, rq=False):
             ts.append(up_ref(cur, l.ho))
             continue
         Wq = rng.integers(-12, 13, (l.oc, 1 if l.dw else l.ic, l.k, l.k)).astype(np.int8)
+        if l.op == 5:                # LN: 随机参数 (gamma≈1, beta≈0, s_in≈0.02, g_out≈40)
+            p_ = LParam(None, ln=(rng.normal(1, 0.1, l.ic).astype(np.float32),
+                                  rng.normal(0, 0.1, l.ic).astype(np.float32),
+                                  np.full(l.ic, 0.02, np.float32),
+                                  np.full(l.ic, 40.0, np.float32)))
+            params.append(p_)
+            ts.append(ln_ref(cur.view(np.uint8), p_))
+            continue
         gelu = None
         if l.act == 5:               # GELU 查表: 随机表（任何一个 bank 摆错都会露出来）；
             gelu = rng.integers(-120, 121, 256).astype(np.int8)
