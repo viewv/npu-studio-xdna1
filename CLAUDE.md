@@ -5,7 +5,7 @@ Linux 桌面 NPU 实验工具箱（目标硬件：AMD Ryzen 7 7840HS / Phoenix X
 ## 快速命令
 
 ```bash
-# 1. NPU 内核与 19 项回归测试 (每次改 npu/ 后必跑)
+# 1. NPU 内核与 20 项回归测试 (每次改 npu/ 后必跑)
 source npu/env.sh
 .venv-iron/bin/python -m npu.check --quick
 

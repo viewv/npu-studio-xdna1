@@ -12,7 +12,7 @@
 
 借助 AI 辅助编写 AIE2 算子内核与编译器调度（`mlir-aie` / IRON + XRT + `amdxdna`），这个项目想亲自验证一件事：**这块早期 NPU 在 Linux 上到底能不能跑出真正实用的实时任务，把 CPU 或 GPU 的负载 offload 掉？**
 
-实测下来，答案是可以的。本项目基于自研的 AIE2 C++ 核内算子（`aie::mmul<4,8,8>`、定点 LayerNorm、LUT GELU、Attention）和 Rust + Slint 桌面界面，目前跑通了两套可直接使用的实用工具。
+实测下来，答案是可以的。本项目基于自研的 AIE2 C++ 核内算子（`aie::mmul<4,8,8>`、非对称步长 DWConv、定点 LayerNorm、LUT GELU、Attention）和 Rust + Slint 桌面界面，目前跑通了三套可直接使用的实用工具。
 
 ---
 
@@ -38,9 +38,16 @@
     - `W=35`（≤7 秒）：端到端 **`320.0 ms`**
 - 界面同时保留 **CPU 参考后端（OpenBLAS `float32`）** 供直接对比。
 
-### 3. NPU Studio 桌面工具箱（`app/`）
+### 3. 屏幕框选 OCR（`npu/ocr/` + `app/src/ocr.rs`）
+- 异构 **PP-OCRv4 Mobile** 中英文文本检测与识别：
+  - **NPU（int8）**：49 层 MobileNetV3 检测主干（`480×640` 块约 `35 ms`）+ 50 层 PP-LCNet 识别主干（`max_diff == 0`，单行约 `20 ms`，支持 `s=(2,1)/(1,2)` 非对称步长 DWConv）。
+  - **CPU（`onnxruntime`）**：负责 FPN + DBHead（约 `13 ms`）与 SVTR + 6625 类 CTC 头（每行约 `1–3 ms`）。
+- **1:1 分块推理**：大图自动按 `480×640` 重叠滑窗检测，超宽文本行按空白列智能切分为 `48×320` 识别，避免 `1000+ px` 宽图被压扁失真。
+- 桌面端集成屏幕框选截图（KDE Wayland 下调用 `spectacle -r`，兼容 `grim+slurp` / `gnome-screenshot`）、缩略图预览、可编辑文本输出与一键复制。
+
+### 4. NPU Studio 桌面工具箱（`app/`）
 - 基于 **Rust + Slint 1.18** 构建。
-- 采用模块化 **Toolbox** 导航：*工具箱首页*、*背景虚化*、*实时语音转写*。
+- 采用模块化 **Toolbox** 导航：*工具箱首页*、*背景虚化*、*实时语音转写*、*屏幕 OCR*。
 - 支持 **中文 / English** 一键切换（配置保存在 `~/.config/npu-studio/settings.json`）。
 
 ---
@@ -53,7 +60,7 @@
 |---|---|---|
 | **处理器 / NPU** | AMD Ryzen 7 7840HS (Phoenix) | 第一代 XDNA1 AIE2 NPU (~10 TOPS) + Radeon 780M |
 | **Linux 内核** | `7.4.0-rc2-1-cachyos-rc` | 启用 `amdxdna` 内核驱动 |
-| **XRT 运行时** | `1:2.21.75-14` | Xilinx Runtime |
+| **XRT 运行时** | `1:2.21.75-14` | Xilinx Runtime（Arch/CachyOS 若仓库 `xrt` 超前，建议在 `pacman.conf` 加 `IgnorePkg = xrt` 与插件保持同版本） |
 | **XRT XDNA 插件** | `1:2.21.75-2.1` | `xrt-plugin-amdxdna` |
 | **MLIR-AIE (IRON)** | `1.3.4` | AIE2 编译与 Python 运行时 |
 | **Python 环境** | `3.14.10` | `numpy 2.5.4`、`opencv-python-headless 5.0.0.93` |
@@ -68,7 +75,7 @@
 ### 1. 运行 NPU 内核回归测试
 ```bash
 source npu/env.sh
-.venv-iron/bin/python -m npu.check --quick   # 预期 19/19 通过 (max_diff == 0)
+.venv-iron/bin/python -m npu.check --quick   # 预期 20/20 通过 (max_diff == 0)
 ```
 
 ### 2. 导出并编译 C++ 四档语音识别后端

@@ -6,8 +6,9 @@ Experimental Ryzen AI (Phoenix / Ryzen 7 7840HS, XDNA1 AIE2, ~10 TOPS) NPU playg
 
 - `npu/chain_c16.py`: 4-core / 16-core MLIR-AIE (`IRON`) chain compiler & packer (`Conv1x1`, `DWConv`, `Upsample2x`, `SE`, `LayerNorm`, `Attn`, `GELU`, `Residual`).
 - `npu/kernels/conv_c16.cc`: AIE2 C++ tile kernels (`aie::mmul<4,8,8>`, `parallel_lookup`, fixed-point `ln_step`, `attn_step`).
-- `npu/check.py`: Full kernel/chain self-test suite (`19/19`, bit-exact `max_diff == 0` against numpy integer reference).
+- `npu/check.py`: Full kernel/chain self-test suite (`20/20`, bit-exact `max_diff == 0` against numpy integer reference).
 - `npu/rvm/`: RobustVideoMatting (RVM) MobileNetV3 int8 NPU encoder (`encoder_npu.py`).
+- `npu/ocr/`: PP-OCRv4 Mobile heterogeneous Chinese+English OCR (`det_npu.py`, `rec_npu.py`, `calibrate.py`, persistent `worker.py` with 1:1 wide-image tiling).
 - `npu/asr/`:
   - `encoder_npu.py`: 4-core 40-layer Transformer ASR (`2/3/5/7s` buckets, `132/146/204/290 ms` NPU-only, `from_cache`).
   - `encoder_16c.py`: Experimental 16-core (`4×4`) executor (`~216 ms` NPU-only).
@@ -15,7 +16,7 @@ Experimental Ryzen AI (Phoenix / Ryzen 7 7840HS, XDNA1 AIE2, ~10 TOPS) NPU playg
   - `asr_npu.cpp`: Standalone C++ XRT + OpenBLAS daemon (`136.7 / 159.5 / 219.4 / 320.0 ms` end-to-end, `~0.7s` cold start, `PCM <n>` streaming protocol).
   - `shell_asr.py`: Interactive microphone CLI (`--cpp` and `--cpu-daemon`).
 - `studio/`: Python virtual camera + RVM/MediaPipe matting + `v4l2loopback` output.
-- `app/`: Rust + Slint desktop Toolbox GUI (`NPU Studio`), supporting English/Chinese toggle, Video Blur, and Live ASR.
+- `app/`: Rust + Slint desktop Toolbox GUI (`NPU Studio`), supporting English/Chinese toggle, Video Blur, Live ASR, and Screen Snip OCR.
 - `docs/`: Technical notes & benchmarks (`docs/asr-npu.md`, `docs/npu-spikes/`).
 
 ## Developer & Agent Rules

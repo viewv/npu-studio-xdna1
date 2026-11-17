@@ -12,7 +12,7 @@ The **AMD Ryzen 7 7840HS** ("Phoenix") shipped with AMD's first-generation **XDN
 
 With AI-assisted kernel and compiler engineering (`mlir-aie` / IRON + XRT + `amdxdna`), this project explores a simple question: **can this early XDNA1 NPU actually run practical real-time workloads on Linux and offload CPU/GPU?**
 
-It turns out it can — here are two working end-to-end tools built directly on custom AIE2 C++ tile kernels (`aie::mmul<4,8,8>`, fixed-point LayerNorm, LUT GELU, Attention) and a Rust + Slint desktop UI.
+It turns out it can — here are three working end-to-end tools built directly on custom AIE2 C++ tile kernels (`aie::mmul<4,8,8>`, asymmetric-stride DWConv, fixed-point LayerNorm, LUT GELU, Attention) and a Rust + Slint desktop UI.
 
 ---
 
@@ -38,9 +38,16 @@ It turns out it can — here are two working end-to-end tools built directly on 
     - `W=35` (≤7s): **`320.0 ms`** end-to-end
 - Also includes a CPU reference backend (`OpenBLAS float32`) in the GUI for direct comparison.
 
-### 3. NPU Studio Desktop Toolbox (`app/`)
+### 3. Screen Snip OCR (`npu/ocr/` + `app/src/ocr.rs`)
+- Heterogeneous **PP-OCRv4 Mobile** Chinese + English OCR:
+  - **NPU (int8)**: 49-layer MobileNetV3 detection backbone (`~35 ms` per `480×640` tile) + 50-layer PP-LCNet recognition backbone (`max_diff == 0`, `~20 ms` per text line, using asymmetric `s=(2,1)/(1,2)` DWConv).
+  - **CPU (`onnxruntime`)**: FPN + DBHead (`~13 ms`) and SVTR + 6625-class CTC head (`~1–3 ms`/line).
+- **1:1 Tiled Inference**: Overlapping `480×640` detection tiles + whitespace-gap line splitting (`48×320` chunks) so `1000+ px` wide screenshots and small UI fonts stay sharp.
+- Integrated region-snip capture (`spectacle -r` on KDE Wayland, with `grim+slurp` / `gnome-screenshot` fallbacks), thumbnail preview, editable output, and one-click clipboard copy.
+
+### 4. NPU Studio Desktop Toolbox (`app/`)
 - Built with **Rust + Slint 1.18**.
-- Modular **Toolbox** navigation: *Toolbox Overview*, *Background Blur*, and *Live Speech Recognition (ASR)*.
+- Modular **Toolbox** navigation: *Toolbox Overview*, *Background Blur*, *Live Speech Recognition (ASR)*, and *Screen OCR*.
 - Built-in **English / 中文** language switch (persisted in `~/.config/npu-studio/settings.json`).
 
 ---
@@ -53,7 +60,7 @@ All results and builds in this repository were verified on the following stack:
 |---|---|---|
 | **APU / NPU** | AMD Ryzen 7 7840HS (Phoenix) | 1st-gen XDNA1 AIE2 NPU (~10 TOPS) + Radeon 780M |
 | **Linux Kernel** | `7.4.0-rc2-1-cachyos-rc` | With `amdxdna` kernel driver |
-| **XRT** | `1:2.21.75-14` | Xilinx Runtime |
+| **XRT** | `1:2.21.75-14` | Xilinx Runtime (keep matched with `xrt-plugin-amdxdna` via `IgnorePkg = xrt` on Arch/CachyOS if repo `xrt` is ahead) |
 | **XRT XDNA Plugin** | `1:2.21.75-2.1` | `xrt-plugin-amdxdna` |
 | **MLIR-AIE (IRON)** | `1.3.4` | Python AIE2 compiler/runtime |
 | **Python** | `3.14.10` | With `numpy 2.5.4`, `opencv-python-headless 5.0.0.93` |
@@ -68,7 +75,7 @@ All results and builds in this repository were verified on the following stack:
 ### 1. Verify NPU Kernels
 ```bash
 source npu/env.sh
-.venv-iron/bin/python -m npu.check --quick   # Expect 19/19 passing (max_diff == 0)
+.venv-iron/bin/python -m npu.check --quick   # Expect 20/20 passing (max_diff == 0)
 ```
 
 ### 2. Build the C++ 4-Bucket ASR Backend
