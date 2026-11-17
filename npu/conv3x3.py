@@ -18,7 +18,7 @@ from pathlib import Path
 import numpy as np
 
 import aie.iron as iron
-from aie.iron import CompileTime, In, ObjectFifo, Out, Program, Runtime, Worker
+from aie.iron import CompileTime, In, ObjectFifo, Out, Program, Runtime, TaskGroup, Worker
 from aie.iron.controlflow import range_
 from aie.iron.kernel import ExternalFunction
 
@@ -35,7 +35,7 @@ def _tap(n_total, off, size):
     return TensorAccessPattern((1, n_total), off, [1, 1, 1, size], [0, 0, 0, 1])
 
 
-@iron.jit(aiecc_flags=["--alloc-scheme=basic-sequential"])
+@iron.jit
 def conv3x3_relu(act: In, wts: In, out: Out, *, height: CompileTime[int], wt: CompileTime[int],
                  n_tw: CompileTime[int], n_bands: CompileTime[int], icb: CompileTime[int],
                  shift: CompileTime[int]):
@@ -71,19 +71,24 @@ def conv3x3_relu(act: In, wts: In, out: Out, *, height: CompileTime[int], wt: Co
 
     n_act = n_tw * (height + 2) * in_row
     n_out = n_tw * height * out_row
-    rt = Runtime()
-    with rt.sequence(np.ndarray[(n_act,), i8], w_ty, np.ndarray[(n_out,), u8]) as (a, w, o):
-        rt.start(*workers)
-        tg = rt.task_group()
-        for t, b, f_in, f_w, _ in fifos:
-            rt.fill(f_w.prod(), w, task_group=tg)
-            rt.fill(f_in.prod(), a, tap=_tap(n_act, (t * (height + 2) + b * rows) * in_row, (rows + 2) * in_row),
-                    task_group=tg)
-        for t, b, _, _, f_out in fifos:
-            rt.drain(f_out.cons(), o, tap=_tap(n_out, (t * height + b * rows) * out_row, rows * out_row),
-                     wait=True, task_group=tg)
-        rt.finish_task_group(tg)
-    return Program(iron.get_current_device(), rt).resolve_program()
+    nf = len(fifos)
+    in_h = [f_in.prod() for _, _, f_in, _, _ in fifos]
+    w_h = [f_w.prod() for _, _, _, f_w, _ in fifos]
+    out_h = [f_out.cons() for _, _, _, _, f_out in fifos]
+
+    def seq(a, w, o, *handles):
+        tg = TaskGroup()
+        for idx, (t, b, _, _, _) in enumerate(fifos):
+            handles[nf + idx].fill(w, group=tg)
+            handles[idx].fill(a, tap=_tap(n_act, (t * (height + 2) + b * rows) * in_row, (rows + 2) * in_row),
+                              group=tg)
+        for idx, (t, b, _, _, _) in enumerate(fifos):
+            handles[2 * nf + idx].drain(o, tap=_tap(n_out, (t * height + b * rows) * out_row, rows * out_row),
+                                        wait=True, group=tg)
+        tg.finish()
+
+    rt = Runtime(seq, [np.ndarray[(n_act,), i8], w_ty, np.ndarray[(n_out,), u8], *in_h, *w_h, *out_h])
+    return Program(iron.get_current_device(), rt, workers=workers).resolve_program()
 
 
 # ---------------------------------------------------------------- 主机端打包

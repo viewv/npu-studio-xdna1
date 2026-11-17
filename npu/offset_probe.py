@@ -23,7 +23,7 @@ SRC = str(Path(__file__).resolve().parent / "kernels" / "offset_probe.cc")
 W, H = 256, 4
 
 
-@iron.jit(aiecc_flags=["--alloc-scheme=basic-sequential"])
+@iron.jit
 def _probe(inp: In, out: Out, *, plane: CompileTime[int], launder: CompileTime[int]):
     in_b, out_b = plane * 4, W * 2
     k = external_row_kernel("offsetProbeLine", SRC, [np.ndarray[(in_b,), np.dtype[np.uint8]]],
@@ -32,10 +32,7 @@ def _probe(inp: In, out: Out, *, plane: CompileTime[int], launder: CompileTime[i
                             compile_flags=[f"-DPLANE={plane}", f"-DLAUNDER={launder}"])
     pl = RowPipeline(k, [in_b], out_b, height=H, n_cols=1, extra_args=[W], prefix=f"op{launder}")
     pl.build()
-    rt = Runtime()
-    with rt.sequence(*pl.tensor_types()) as bufs:
-        pl.stream(rt, bufs)
-    return Program(iron.get_current_device(), rt).resolve_program()
+    return pl.resolve()
 
 
 def wrong_fraction(plane: int = 512, launder: bool = False) -> float:

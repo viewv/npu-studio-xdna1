@@ -18,7 +18,7 @@ from pathlib import Path
 import numpy as np
 
 import aie.iron as iron
-from aie.iron import CompileTime, In, Out, Program, Runtime
+from aie.iron import CompileTime, In, Out, Program, Runtime, TaskGroup
 
 from .harness import RowPipeline, SelfTestResult, external_row_kernel
 
@@ -45,7 +45,7 @@ def low_row_bytes(ls: int) -> int:
 WP = np.array([3, 1, 0, 0]); WC = np.array([5, 7, 7, 5]); WN = np.array([0, 0, 1, 3])
 
 
-@iron.jit(aiecc_flags=["--alloc-scheme=basic-sequential"])
+@iron.jit
 def fused_composite(px: In, low: In, out: Out, *,
                     width: CompileTime[int], height: CompileTime[int],
                     low_stride: CompileTime[int], n_cols: CompileTime[int] = 4):
@@ -62,14 +62,10 @@ def fused_composite(px: In, low: In, out: Out, *,
     pl = RowPipeline(kern, [row, low_row], row, height=height, n_cols=n_cols,
                      extra_args=[width], prefix="fx")
     pl.build()
-
-    rt = Runtime()
-    with rt.sequence(*pl.tensor_types()) as bufs:
-        pl.stream(rt, bufs)
-    return Program(iron.get_current_device(), rt).resolve_program()
+    return pl.resolve()
 
 
-@iron.jit(aiecc_flags=["--alloc-scheme=basic-sequential"])
+@iron.jit
 def fused_composite_v(px: In, low: In, out: Out, *,
                       width: CompileTime[int], height: CompileTime[int],
                       low_stride: CompileTime[int], n_cols: CompileTime[int] = 4):
@@ -119,20 +115,24 @@ def fused_composite_v(px: In, low: In, out: Out, *,
     def tap(n_total, off, size):
         return TensorAccessPattern((1, n_total), off, [1, 1, 1, size], [0, 0, 0, 1])
 
-    rt = Runtime()
-    with rt.sequence(np.ndarray[(row * height,), u8], np.ndarray[(low_row * (lh + 2),), u8],
-                     np.ndarray[(row * height,), u8]) as (b_px, b_low, b_out):
-        rt.start(*workers)
-        tg = rt.task_group()
-        for c, (fp, fl, fo) in enumerate(fifos):
-            rt.fill(fp.prod(), b_px, tap=tap(row * height, c * rows * row, rows * row), task_group=tg)
-            rt.fill(fl.prod(), b_low, tap=tap(low_row * (lh + 2), c * lrows * low_row,
-                                              (lrows + 2) * low_row), task_group=tg)
-        for c, (fp, fl, fo) in enumerate(fifos):
-            rt.drain(fo.cons(), b_out, tap=tap(row * height, c * rows * row, rows * row),
-                     wait=True, task_group=tg)
-        rt.finish_task_group(tg)
-    return Program(iron.get_current_device(), rt).resolve_program()
+    in_px_h = [fp.prod() for fp, _, _ in fifos]
+    in_low_h = [fl.prod() for _, fl, _ in fifos]
+    out_h = [fo.cons() for _, _, fo in fifos]
+
+    def seq(b_px, b_low, b_out, *handles):
+        tg = TaskGroup()
+        for c in range(n_cols):
+            handles[c].fill(b_px, tap=tap(row * height, c * rows * row, rows * row), group=tg)
+            handles[n_cols + c].fill(b_low, tap=tap(low_row * (lh + 2), c * lrows * low_row,
+                                                    (lrows + 2) * low_row), group=tg)
+        for c in range(n_cols):
+            handles[2 * n_cols + c].drain(b_out, tap=tap(row * height, c * rows * row, rows * row),
+                                          wait=True, group=tg)
+        tg.finish()
+
+    rt = Runtime(seq, [np.ndarray[(row * height,), u8], np.ndarray[(low_row * (lh + 2),), u8],
+                       np.ndarray[(row * height,), u8], *in_px_h, *in_low_h, *out_h])
+    return Program(iron.get_current_device(), rt, workers=workers).resolve_program()
 
 
 # ---------------------------------------------------------------- 主机端封装

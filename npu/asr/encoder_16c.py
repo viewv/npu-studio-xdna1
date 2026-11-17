@@ -18,7 +18,7 @@ from pathlib import Path
 import numpy as np
 import pyxrt
 import aie.iron as iron
-from aie.iron import ObjectFifo, Worker, Runtime, Program, ExternalFunction, Buffer, CompileTime
+from aie.iron import ObjectFifo, Worker, Runtime, Program, ExternalFunction, Buffer, CompileTime, TaskGroup
 from aie.iron.device.tile import Tile
 from aie.iron.controlflow import range_
 from aie.helpers.taplib import TensorAccessPattern
@@ -110,7 +110,7 @@ def _build_16c_schedule(layers: list[c.Layer], params: list[c.LParam]):
     return P, ops, n_col_steps, w_packed, np.array(vt_flat, dtype=np.int64)
 
 
-@iron.jit(aiecc_flags=["--alloc-scheme=basic-sequential"])
+@iron.jit
 def transformer_16c(act: c.In, wts: c.In, scratch: c.InOut, out: c.Out, *,
                     spec: CompileTime[str], part: CompileTime[str] = ""):
     layers = c.from_spec_str(spec)
@@ -203,13 +203,17 @@ def transformer_16c(act: c.In, wts: c.In, scratch: c.InOut, out: c.Out, *,
                 stack_size=st_sz,
             ))
 
-    rt = Runtime()
     nw = n_col_steps * 4 * P.e_w
     tap = lambda n, o_, sz, st: TensorAccessPattern((1, n), o_, sz, st)
-    with rt.sequence(np.ndarray[(P.size["act"],), i8], np.ndarray[(nw,), i8],
-                     np.ndarray[(P.size["s"],), i8], np.ndarray[(P.size["out"],), u8]) as (a, w, s, o):
+    in_h = [f.prod() for f in f_in_shim]
+    w_h = [f.prod() for f in f_w]
+    out_h = [f.cons() for f in f_out_shim]
+
+    def seq(a, w, s, o, *handles):
         bufs = {"act": a, "s": s, "out": o}
-        rt.start(*workers)
+        h_in = handles[:4]
+        h_w = handles[4:8]
+        h_out = handles[8:12]
         pending = []
         s_cur = 0
 
@@ -225,52 +229,52 @@ def transformer_16c(act: c.In, wts: c.In, scratch: c.InOut, out: c.Out, *,
             if kind == "conv1":
                 _, _, ng, spo, nocp = op_desc
                 for g in range(ng):
-                    tg = rt.task_group()
+                    tg = TaskGroup()
                     pending.append(tg)
                     for col in range(4):
-                        rt.fill(f_w[col].prod(), w,
-                                tap=tap(nw, (s_cur * 4 + col) * P.e_w, [1, spo, P.e_w // 256, 256], [0, 4 * P.e_w, 256, 1]),
-                                task_group=tg)
+                        h_w[col].fill(w,
+                                      tap=tap(nw, (s_cur * 4 + col) * P.e_w, [1, spo, P.e_w // 256, 256], [0, 4 * P.e_w, 256, 1]),
+                                      group=tg)
                     for row in range(4):
                         for o_, sz, st in P.fill_taps(k, soff, row, 0, row, g * 4, g * 4 + 1):
-                            rt.fill(f_in_shim[row].prod(), bufs[src], tap=tap(P.size[src], o_, sz, st), task_group=tg)
+                            h_in[row].fill(bufs[src], tap=tap(P.size[src], o_, sz, st), group=tg)
                     for col in range(4):
                         ob = g * 4 + col
                         off0 = doff + (c.BR * (tout_ctot // 16) + ob * nocp) * out_plane_stride + c.PAD * 16
-                        rt.drain(f_out_shim[col].cons(), bufs[dst],
-                                 tap=tap(P.size[dst], off0, [1, nocp, 4, c.CW * 16], [0, out_plane_stride, out_row_stride, 1]),
-                                 wait=True, task_group=tg)
+                        h_out[col].drain(bufs[dst],
+                                         tap=tap(P.size[dst], off0, [1, nocp, 4, c.CW * 16], [0, out_plane_stride, out_row_stride, 1]),
+                                         wait=True, group=tg)
                     s_cur += spo
                     while pending:
-                        rt.finish_task_group(pending.pop(0))
+                        pending.pop(0).finish()
 
             elif kind == "ln":
                 _, _, n_ln, nicp = op_desc
                 # 4 步 pass 0 (无 drain), 4 步 pass 1 (有 drain)
                 for si in range(n_ln):
-                    tg = rt.task_group()
+                    tg = TaskGroup()
                     pending.append(tg)
                     has_drain = (si >= 4)
                     for col in range(4):
-                        rt.fill(f_w[col].prod(), w,
-                                tap=tap(nw, (s_cur * 4 + col) * P.e_w, [1, 1, P.e_w // 256, 256], [0, 4 * P.e_w, 256, 1]),
-                                task_group=tg)
+                        h_w[col].fill(w,
+                                      tap=tap(nw, (s_cur * 4 + col) * P.e_w, [1, 1, P.e_w // 256, 256], [0, 4 * P.e_w, 256, 1]),
+                                      group=tg)
                     for row in range(4):
                         ftaps = P.fill_taps(k, soff, row, 0, row, si, si + 1)
                         for ti_i, (o_, sz, st) in enumerate(ftaps):
-                            rt.fill(f_in_shim[row].prod(), bufs[src], tap=tap(P.size[src], o_, sz, st),
-                                    wait=(not has_drain and ti_i == len(ftaps) - 1), task_group=tg)
+                            h_in[row].fill(bufs[src], tap=tap(P.size[src], o_, sz, st),
+                                           wait=(not has_drain and ti_i == len(ftaps) - 1), group=tg)
                     if has_drain:
                         g_start = (si - 4) * nicp
                         # 分 2 个 BD (每 BD 4×2560=10240 B < 16384 B)
                         for half in range(2):
                             off0 = doff + (c.BR * (tout_ctot // 16) + g_start + half * 4) * out_plane_stride + c.PAD * 16
-                            rt.drain(f_out_shim[0].cons(), bufs[dst],
-                                     tap=tap(P.size[dst], off0, [1, 4, 4, c.CW * 16], [0, out_plane_stride, out_row_stride, 1]),
-                                     wait=(half == 1), task_group=tg)
+                            h_out[0].drain(bufs[dst],
+                                           tap=tap(P.size[dst], off0, [1, 4, 4, c.CW * 16], [0, out_plane_stride, out_row_stride, 1]),
+                                           wait=(half == 1), group=tg)
                     s_cur += 1
                     while pending:
-                        rt.finish_task_group(pending.pop(0))
+                        pending.pop(0).finish()
 
             elif kind == "attn":
                 tin = P.tensors[k + 1 + layers[k].src]
@@ -280,53 +284,56 @@ def transformer_16c(act: c.In, wts: c.In, scratch: c.InOut, out: c.Out, *,
                 for h_idx in range(HEADS):
                     active_col = h_idx // 2
                     # sub=0: 无 drain
-                    tg0 = rt.task_group()
+                    tg0 = TaskGroup()
                     pending.append(tg0)
                     for col in range(4):
-                        rt.fill(f_w[col].prod(), w,
-                                tap=tap(nw, (s_cur * 4 + col) * P.e_w, [1, 1, P.e_w // 256, 256], [0, 4 * P.e_w, 256, 1]),
-                                task_group=tg0)
+                        h_w[col].fill(w,
+                                      tap=tap(nw, (s_cur * 4 + col) * P.e_w, [1, 1, P.e_w // 256, 256], [0, 4 * P.e_w, 256, 1]),
+                                      group=tg0)
                     for row in range(4):
                         q_off = soff + ((c.BR + row) * (tin_ctot // 16) + h_idx * 4) * in_plane_stride + (c.PAD - 4) * 16
                         k_off = soff + (c.BR * (tin_ctot // 16) + 32 + h_idx * 4) * in_plane_stride + (c.PAD - 4) * 16
-                        rt.fill(f_in_shim[row].prod(), bufs[src],
-                                tap=tap(P.size[src], q_off, [1, 1, 8, 960], [0, in_row_stride, in_plane_stride, 1]),
-                                task_group=tg0)
-                        rt.fill(f_in_shim[row].prod(), bufs[src],
-                                tap=tap(P.size[src], k_off, [1, 4, 4, 960], [0, in_row_stride, in_plane_stride, 1]),
-                                wait=True, task_group=tg0)
+                        h_in[row].fill(bufs[src],
+                                       tap=tap(P.size[src], q_off, [1, 1, 8, 960], [0, in_row_stride, in_plane_stride, 1]),
+                                       group=tg0)
+                        h_in[row].fill(bufs[src],
+                                       tap=tap(P.size[src], k_off, [1, 4, 4, 960], [0, in_row_stride, in_plane_stride, 1]),
+                                       wait=True, group=tg0)
                     s_cur += 1
                     while pending:
-                        rt.finish_task_group(pending.pop(0))
+                        pending.pop(0).finish()
 
                     # sub=1: active_col 产出 4 个 row 的该 head (4 个通道组)
-                    tg1 = rt.task_group()
+                    tg1 = TaskGroup()
                     pending.append(tg1)
                     for col in range(4):
-                        rt.fill(f_w[col].prod(), w,
-                                tap=tap(nw, (s_cur * 4 + col) * P.e_w, [1, 1, P.e_w // 256, 256], [0, 4 * P.e_w, 256, 1]),
-                                task_group=tg1)
+                        h_w[col].fill(w,
+                                      tap=tap(nw, (s_cur * 4 + col) * P.e_w, [1, 1, P.e_w // 256, 256], [0, 4 * P.e_w, 256, 1]),
+                                      group=tg1)
                     for row in range(4):
                         v0_off = soff + (c.BR * (tin_ctot // 16) + 64 + h_idx * 4) * in_plane_stride + (c.PAD - 4) * 16
                         v1_off = v0_off + 2 * in_plane_stride
-                        rt.fill(f_in_shim[row].prod(), bufs[src],
-                                tap=tap(P.size[src], v0_off, [1, 4, 2, 960], [0, in_row_stride, in_plane_stride, 1]),
-                                task_group=tg1)
-                        rt.fill(f_in_shim[row].prod(), bufs[src],
-                                tap=tap(P.size[src], v1_off, [1, 4, 2, 960], [0, in_row_stride, in_plane_stride, 1]),
-                                task_group=tg1)
+                        h_in[row].fill(bufs[src],
+                                       tap=tap(P.size[src], v0_off, [1, 4, 2, 960], [0, in_row_stride, in_plane_stride, 1]),
+                                       group=tg1)
+                        h_in[row].fill(bufs[src],
+                                       tap=tap(P.size[src], v1_off, [1, 4, 2, 960], [0, in_row_stride, in_plane_stride, 1]),
+                                       group=tg1)
                     off0 = doff + (c.BR * (tout_ctot // 16) + h_idx * 4) * out_plane_stride + c.PAD * 16
-                    rt.drain(f_out_shim[active_col].cons(), bufs[dst],
-                             tap=tap(P.size[dst], off0, [1, 4, 4, c.CW * 16], [0, out_plane_stride, out_row_stride, 1]),
-                             wait=True, task_group=tg1)
+                    h_out[active_col].drain(bufs[dst],
+                                            tap=tap(P.size[dst], off0, [1, 4, 4, c.CW * 16], [0, out_plane_stride, out_row_stride, 1]),
+                                            wait=True, group=tg1)
                     s_cur += 1
                     while pending:
-                        rt.finish_task_group(pending.pop(0))
+                        pending.pop(0).finish()
 
             while pending:
-                rt.finish_task_group(pending.pop(0))
+                pending.pop(0).finish()
 
-    return Program(iron.get_current_device(), rt).resolve_program()
+    rt = Runtime(seq, [np.ndarray[(P.size["act"],), i8], np.ndarray[(nw,), i8],
+                       np.ndarray[(P.size["s"],), i8], np.ndarray[(P.size["out"],), u8],
+                       *in_h, *w_h, *out_h])
+    return Program(iron.get_current_device(), rt, workers=workers).resolve_program()
 
 
 class NPUTransformer40_16c:

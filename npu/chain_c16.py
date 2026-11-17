@@ -77,7 +77,7 @@ from pathlib import Path
 import numpy as np
 
 import aie.iron as iron
-from aie.iron import Buffer, CompileTime, In, InOut, ObjectFifo, Out, Program, Runtime, Worker
+from aie.iron import Buffer, CompileTime, In, InOut, ObjectFifo, Out, Program, Runtime, TaskGroup, Worker
 from aie.iron.controlflow import range_
 from aie.iron.kernel import ExternalFunction
 
@@ -958,7 +958,7 @@ def _i32(iv):
     return arith.index_cast(IntegerType.get_signless(32), iv)
 
 
-@iron.jit(aiecc_flags=["--alloc-scheme=basic-sequential"])
+@iron.jit
 def conv_c16(act: In, wts: In, scratch: InOut, out: Out, *, spec: CompileTime[str],
              reps: CompileTime[int] = 1, part: CompileTime[str] = ""):
     layers = from_spec_str(spec)
@@ -1038,23 +1038,27 @@ def conv_c16(act: In, wts: In, scratch: InOut, out: Out, *, spec: CompileTime[st
         workers.append(Worker(make_core(c), [f_in.cons(), f_w.cons(), f_out.prod(), kern, acc, dummy, sc],
                               stack_size=st_sz))
 
-    rt = Runtime()
     nw = P.n_steps * N_CORES * P.e_w                # 权重缓冲区 [槽][core][e_w]
-    with rt.sequence(np.ndarray[(P.size["act"],), i8], np.ndarray[(nw,), i8],
-                     np.ndarray[(P.size["s"],), i8], np.ndarray[(P.size["out"],), u8]) as (a, w, s, o):
+    in_h = [f_in.prod() for f_in, _, _ in fifos]
+    out_h = [f_out.cons() for _, _, f_out in fifos]
+    w_h = [f_wb.prod()] if f_wb is not None else [f_w.prod() for _, f_w, _ in fifos]
+
+    def seq(a, w, s, o, *handles):
         bufs = {"act": a, "s": s, "out": o}
-        rt.start(*workers)
+        h_in = handles[:N_CORES]
+        h_out = handles[N_CORES:2 * N_CORES]
+        h_w = handles[2 * N_CORES:]
         pending, pre_tg = [], None
 
         def wfill(k, ci, tg, wait=False):           # 层 k 第 ci 组的权重 (每个 core 一个 BD, 连续 ns 个槽)
             _, _, ns, s0 = P.chunks(k)[ci]
             if f_wb is not None:                    # 广播: 只读 core 0 那份
-                rt.fill(f_wb.prod(), w, tap=_tap(nw, s0 * N_CORES * P.e_w, [1, ns, P.e_w // 256, 256],
-                                                 [0, N_CORES * P.e_w, 256, 1]), wait=wait, task_group=tg)
+                h_w[0].fill(w, tap=_tap(nw, s0 * N_CORES * P.e_w, [1, ns, P.e_w // 256, 256],
+                                        [0, N_CORES * P.e_w, 256, 1]), wait=wait, group=tg)
                 return
-            for c, (_, f_w, _) in enumerate(fifos):
-                rt.fill(f_w.prod(), w, tap=_tap(nw, (s0 * N_CORES + c) * P.e_w, [1, ns, P.e_w // 256, 256],
-                                                [0, N_CORES * P.e_w, 256, 1]), wait=wait, task_group=tg)
+            for c in range(N_CORES):
+                h_w[c].fill(w, tap=_tap(nw, (s0 * N_CORES + c) * P.e_w, [1, ns, P.e_w // 256, 256],
+                                        [0, N_CORES * P.e_w, 256, 1]), wait=wait, group=tg)
 
         for k in range(k0, k1):
             l = layers[k]
@@ -1063,37 +1067,41 @@ def conv_c16(act: In, wts: In, scratch: InOut, out: Out, *, spec: CompileTime[st
             (src, soff), (dst, doff) = P.io[k]
             tl = P.tilings[k]
             for ci, (ob0, ob1, _, _) in enumerate(P.chunks(k)):
-                # 没有 drain 的 task group (如 LN 的 pass 0) 必须在 fill 上设 wait=True, 否则 finish_task_group
+                # 没有 drain 的 task group (如 LN 的 pass 0) 必须在 fill 上设 wait=True, 否则 finish
                 # 只发 dma_free_task 不发 dma_await_task, 后续组会直接覆写尚在传输中的 shim DMA BD
                 has_drain = any(P.drain_taps(k, doff, c, t, b, ob0, ob1) for c, t, b in tl.cores())
                 if ci == 0 and pre_tg is not None:          # 权重在上一层屏障之前就发了
                     tg, pre_tg = pre_tg, None
                 else:
-                    tg = rt.task_group()
+                    tg = TaskGroup()
                     wfill(k, ci, tg)
                 pending.append(tg)
                 if l.sc and ob0 == 0:                        # SE 缩放向量: 每个 core 层的第一步之前
                     ssrc, sbase = P.loc[k + 1 + l.sc]
                     for c, t, b in tl.cores():
-                        rt.fill(fifos[c][0].prod(), bufs[ssrc], tap=_tap(P.size[ssrc], *P.scale_tap(k, sbase)),
-                                task_group=tg)
+                        h_in[c].fill(bufs[ssrc], tap=_tap(P.size[ssrc], *P.scale_tap(k, sbase)),
+                                     group=tg)
                 for c, t, b in tl.cores():
                     ftaps = P.fill_taps(k, soff, c, t, b, ob0, ob1)
                     for ti_idx, (o_, sz, st) in enumerate(ftaps):
-                        rt.fill(fifos[c][0].prod(), bufs[src], tap=_tap(P.size[src], o_, sz, st),
-                                wait=(not has_drain and ti_idx == len(ftaps) - 1), task_group=tg)
+                        h_in[c].fill(bufs[src], tap=_tap(P.size[src], o_, sz, st),
+                                     wait=(not has_drain and ti_idx == len(ftaps) - 1), group=tg)
                 for c, t, b in tl.cores():
                     for o_, sz, st in P.drain_taps(k, doff, c, t, b, ob0, ob1):
-                        rt.drain(fifos[c][2].cons(), bufs[dst], tap=_tap(P.size[dst], o_, sz, st), wait=True,
-                                 task_group=tg)
+                        h_out[c].drain(bufs[dst], tap=_tap(P.size[dst], o_, sz, st), wait=True,
+                                       group=tg)
                 while len(pending) >= TG_INFLIGHT:          # 下一组已经排上了, 再等前一组 (队列不空)
-                    rt.finish_task_group(pending.pop(0))
+                    pending.pop(0).finish()
             if W_PREFETCH and k + 1 < k1 and P.chunks(k + 1):   # 下一层第一组的权重不依赖这一层, 先发
-                pre_tg = rt.task_group()
+                pre_tg = TaskGroup()
                 wfill(k + 1, 0, pre_tg)
             while pending:                                   # 层间屏障: 下一层要读这一层的输出
-                rt.finish_task_group(pending.pop(0))
-    return Program(iron.get_current_device(), rt).resolve_program()
+                pending.pop(0).finish()
+
+    rt = Runtime(seq, [np.ndarray[(P.size["act"],), i8], np.ndarray[(nw,), i8],
+                       np.ndarray[(P.size["s"],), i8], np.ndarray[(P.size["out"],), u8],
+                       *in_h, *out_h, *w_h])
+    return Program(iron.get_current_device(), rt, workers=workers).resolve_program()
 
 
 # ---------------------------------------------------------------- 主机端

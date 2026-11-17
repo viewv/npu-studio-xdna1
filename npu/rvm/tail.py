@@ -46,7 +46,7 @@ def _round_up(v: int, m: int = 32) -> int:
     return -(-v // m) * m
 
 
-@iron.jit(aiecc_flags=["--alloc-scheme=basic-sequential"])
+@iron.jit
 def rvm_tail(src: In, low: In, out: Out, *, width: CompileTime[int],
              height: CompileTime[int], low_stride: CompileTime[int],
              n_cols: CompileTime[int] = 4):
@@ -63,11 +63,7 @@ def rvm_tail(src: In, low: In, out: Out, *, width: CompileTime[int],
     pl = RowPipeline(kern, [row, low_row], row, height=height, n_cols=n_cols,
                      extra_args=[width], prefix="rv", stack_size=12288)
     pl.build()
-
-    rt = Runtime()
-    with rt.sequence(*pl.tensor_types()) as bufs:
-        pl.stream(rt, bufs)
-    return Program(iron.get_current_device(), rt).resolve_program()
+    return pl.resolve()
 
 
 # ---------------------------------------------------------------- 主机端

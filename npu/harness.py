@@ -34,7 +34,7 @@ import sys
 
 import numpy as np
 
-from aie.iron import ObjectFifo, Worker
+from aie.iron import ObjectFifo, Program, Runtime, TaskGroup, Worker, get_current_device
 
 _HARNESS = os.path.abspath(__file__)
 
@@ -129,34 +129,47 @@ class RowPipeline:
         self._workers, self._fifos = workers, fifos
         return workers, fifos
 
-    def stream(self, rt, bufs):
-        """start → 各列 fill → 各列 drain → finish (bufs 是 rt.sequence 解出来的)"""
+    def stream(self, *args):
+        """各列 fill → 各列 drain → finish (由 Runtime 调用)"""
         if self._workers is None:
             raise RuntimeError("先调用 build()")
+        n_buf = len(self.in_bytes) + 1
+        bufs = args[:n_buf]
+        handles = args[n_buf:]
         ins, outs = tuple(bufs[:-1]), bufs[-1]
+        n_in = len(self.in_bytes)
+        in_handles = handles[:self.n_cols * n_in]
+        out_handles = handles[self.n_cols * n_in:]
         rows = self.rows_per_col
         if os.environ.get("NPU_HARNESS_DEBUG"):
             print(f"[harness] {self.prefix}: {len(bufs)} 个缓冲区 ({len(ins)} 入 + 1 出), "
                   f"{self.n_cols} 列 × {rows} 行, 行字节 {self.in_bytes} → {self.out_bytes}",
                   file=sys.stderr)
-        rt.start(*self._workers)
-        tg = rt.task_group()
-        for c, fifo in enumerate(self._fifos):
-            for i, (f, buf) in enumerate(zip(fifo[:-1], ins)):
+        tg = TaskGroup()
+        for c in range(self.n_cols):
+            for i, buf in enumerate(ins):
                 step = self.in_bytes[i]
                 off, size = c * rows * step, rows * step
                 if os.environ.get("NPU_HARNESS_DEBUG"):
                     print(f"[harness]   fill 入{i} 列{c}: n={step * self.h} off={off} size={size} "
                           f"buf={getattr(buf, 'shape', '?')}", file=sys.stderr)
-                rt.fill(f.prod(), buf, tap=_slice(step * self.h, off, size),
-                        task_group=tg)
-        for c, fifo in enumerate(self._fifos):
+                in_handles[c * n_in + i].fill(buf, tap=_slice(step * self.h, off, size), group=tg)
+        for c in range(self.n_cols):
             step = self.out_bytes
             off, size = c * rows * step, rows * step
             if os.environ.get("NPU_HARNESS_DEBUG"):
                 print(f"[harness]   drain 出 列{c}: n={step * self.h} off={off} size={size}",
                       file=sys.stderr)
-            rt.drain(fifo[-1].cons(), outs,
-                     tap=_slice(step * self.h, off, size),
-                     wait=True, task_group=tg)
-        rt.finish_task_group(tg)
+            out_handles[c].drain(outs,
+                                 tap=_slice(step * self.h, off, size),
+                                 wait=True, group=tg)
+        tg.finish()
+
+    def resolve(self, device=None):
+        """构建 Runtime 与 Program 并 resolve_program()"""
+        if self._workers is None:
+            raise RuntimeError("先调用 build()")
+        in_handles = [f.prod() for fifo in self._fifos for f in fifo[:-1]]
+        out_handles = [fifo[-1].cons() for fifo in self._fifos]
+        rt = Runtime(self.stream, [*self.tensor_types(), *in_handles, *out_handles])
+        return Program(device or get_current_device(), rt, workers=self._workers).resolve_program()

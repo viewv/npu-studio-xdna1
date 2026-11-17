@@ -15,7 +15,7 @@ from pathlib import Path
 import numpy as np
 
 import aie.iron as iron
-from aie.iron import CompileTime, In, ObjectFifo, Out, Program, Runtime, Worker
+from aie.iron import CompileTime, In, ObjectFifo, Out, Program, Runtime, TaskGroup, Worker
 from aie.iron.kernel import ExternalFunction
 
 HERE = Path(__file__).resolve().parent
@@ -25,7 +25,7 @@ MLIR_AIE = Path(os.environ.get("MLIR_AIE_INSTALL_DIR", "")) if os.environ.get("M
 KERNEL_INC = str(MLIR_AIE / "include" / "aie_kernels")
 
 
-@iron.jit(aiecc_flags=["--alloc-scheme=basic-sequential"])
+@iron.jit
 def alpha_blend(packed: In, out: Out, *,
                 width: CompileTime[int], height: CompileTime[int], n_cols: CompileTime[int] = 1):
     line = width * 3
@@ -56,17 +56,20 @@ def alpha_blend(packed: In, out: Out, *,
     out_ty = np.ndarray[(line * height,), np.dtype[np.uint8]]
     chunk_in, chunk_out = line * 3 * rows_per_col, line * rows_per_col
 
-    rt = Runtime()
-    with rt.sequence(in_ty, out_ty) as (a, b):
-        rt.start(*workers)
-        tg = rt.task_group()
+    in_h = [f.prod() for f in ins]
+    out_h = [f.cons() for f in outs]
+
+    def seq(a, b, *handles):
+        tg = TaskGroup()
         for c in range(n_cols):
-            rt.fill(ins[c].prod(), a, tap=_slice(in_ty, c * chunk_in, chunk_in), task_group=tg)
+            handles[c].fill(a, tap=_slice(in_ty, c * chunk_in, chunk_in), group=tg)
         for c in range(n_cols):
-            rt.drain(outs[c].cons(), b, tap=_slice(out_ty, c * chunk_out, chunk_out),
-                     wait=True, task_group=tg)
-        rt.finish_task_group(tg)
-    return Program(iron.get_current_device(), rt).resolve_program()
+            handles[n_cols + c].drain(b, tap=_slice(out_ty, c * chunk_out, chunk_out),
+                                      wait=True, group=tg)
+        tg.finish()
+
+    rt = Runtime(seq, [in_ty, out_ty, *in_h, *out_h])
+    return Program(iron.get_current_device(), rt, workers=workers).resolve_program()
 
 
 def _slice(tensor_ty, offset: int, size: int):
