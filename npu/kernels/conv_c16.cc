@@ -471,7 +471,7 @@ __attribute__((noinline)) void post_act(uint8_t *o, int act, int nv, const int8_
 
 // 1/sqrt(v) 的 Q12 定点: 位技巧初值 + 3 次 Newton。单独一个 noinline 函数 —— 和 var 的计算
 // 挤在同一个循环里时, 编译器生成出来的代码会让核心挂死 (实测)。
-__attribute__((noinline)) static int32_t rsqrt_q12(float v) {
+__attribute__((noinline, minsize)) static int32_t rsqrt_q12(float v) {
   if (!(v > 0.0f)) v = 1e-6f;                 // var 可能被定点误差压成负数
   const float hh = 0.5f * v;
   int32_t bits = *(int32_t *)&v;
@@ -486,7 +486,7 @@ __attribute__((noinline)) static int32_t rsqrt_q12(float v) {
 }
 
 // (Σx·m1, Σx²·m2) → (mean_q, r12)。mean_q 是 Q12, 所以 mean² 要乘 2^-24。
-__attribute__((noinline)) static void mean_rstd_q12(int32_t s1, int32_t s2, float inv_b, int sh,
+__attribute__((noinline, minsize)) static void mean_rstd_q12(int32_t s1, int32_t s2, float inv_b, int sh,
                                                     int32_t *mean_q, int32_t *r12) {
   const int32_t mq = s1 >> sh;                        // / D (D 是 2 的幂)
   const float mf = (float)mq;
@@ -494,6 +494,15 @@ __attribute__((noinline)) static void mean_rstd_q12(int32_t s1, int32_t s2, floa
   *mean_q = mq;
   *r12 = rsqrt_q12(var + 1e-6f);
 }
+
+// 向量版: 一次 16 个通道 (一个通道组)。所有乘法用 64 位累加器、移位按向下取整 —— 和整数参考 (int64) 逐位一致,
+// 不依赖 int32 不溢出。
+using V16B = ::aie::vector<int8, 16>;
+using V16H = ::aie::vector<int16, 16>;
+using V16I = ::aie::vector<int32, 16>;
+using A64 = ::aie::accum<acc64, 16>;
+
+inline V16I ld_x32(const int8_t *p) { return ::aie::unpack(::aie::unpack(::aie::load_v<16>(p))); }
 
 __attribute__((noinline)) void ln_step(const int8_t *in, const int32_t *h, const int8_t *w, uint8_t *out,
                                        int32_t *acc, int j, int wvalid) {
@@ -503,38 +512,279 @@ __attribute__((noinline)) void ln_step(const int8_t *in, const int32_t *h, const
   const int32_t *m1 = q, *m2 = q + ic, *g10 = q + 2 * ic, *b12 = q + 3 * ic, *gq = q + 4 * ic;
   const float inv_b = *(const float *)(q + 5 * ic);
   int32_t *af = acc;
+  ::aie::set_rounding(::aie::rounding_mode::floor);
   if (pass == 0) {
+    #pragma clang loop unroll(disable)
     for (int p = 0; p < wvalid; p++) {
-      int32_t s1 = 0, s2 = 0;
+      A64 a1 = ::aie::zeros<acc64, 16>(), a2 = ::aie::zeros<acc64, 16>();
+      #pragma clang loop unroll(disable)
       for (int g = 0; g < icp; g++) {
-        const int8_t *px = in + g * plane + (PAD + p) * 16;
-        for (int c = 0; c < 16; c++) {
-          const int32_t xv = px[c], ch = g0 + g;
-          s1 += xv * m1[ch * 16 + c];
-          s2 += xv * xv * m2[ch * 16 + c];
-        }
+        const V16I x = ld_x32(in + g * plane + (PAD + p) * 16);
+        const int ch = (g0 + g) * 16;
+        a1 = ::aie::mac(a1, x, ::aie::load_v<16>(m1 + ch));
+        const V16I xx = ::aie::mul(x, x).template to_vector<int32>(0);
+        a2 = ::aie::mac(a2, xx, ::aie::load_v<16>(m2 + ch));
       }
+      // 每个通道 (lane) 的部分和都在 int32 范围内 (s1 ≤ 127·Σm1, s2 各项非负且 ≤ 总和 < 2^31, 主机按此选 s_in)
+      const int32_t s1 = ::aie::reduce_add(a1.template to_vector<int32>(0));
+      const int32_t s2 = ::aie::reduce_add(a2.template to_vector<int32>(0));
       if (h[24]) { af[2 * p] = s1; af[2 * p + 1] = s2; }     // 第一块从零开始
       else { af[2 * p] += s1; af[2 * p + 1] += s2; }
     }
+    ::aie::set_rounding(::aie::rounding_mode::positive_inf);
+    if (h[61]) {
+      for (int p = 0; p < wvalid; p++)
+        mean_rstd_q12(af[2 * p], af[2 * p + 1], inv_b, sh, &af[2 * p], &af[2 * p + 1]);
+    }
     return;
   }
-  const int gp = g0 + j;
+  const int ch = (g0 + j) * 16;
+  const V16I vm1 = ::aie::load_v<16>(m1 + ch), vg10 = ::aie::load_v<16>(g10 + ch);
+  const V16I vb12 = ::aie::load_v<16>(b12 + ch), vgq = ::aie::load_v<16>(gq + ch);
+  #pragma clang loop unroll(disable)
   for (int p = 0; p < wvalid; p++) {
-    int32_t mean_q, r12;
-    mean_rstd_q12(af[2 * p], af[2 * p + 1], inv_b, sh, &mean_q, &r12);   // 每块自己重算 (35 像素)
-    int8_t *px = (int8_t *)out + p * 16;
-    const int8_t *src = in + j * plane + (PAD + p) * 16;
-    for (int c = 0; c < 16; c++) {
-      const int32_t ch = gp * 16 + c;
-      const int32_t dev = src[c] * m1[ch] - mean_q;                 // Q12
-      const int32_t n12 = (dev * r12) >> 12;                        // Q12
-      const int32_t y12 = (n12 * g10[ch]) >> 10;                    // Q12
-      int32_t o = ((y12 + b12[ch]) * gq[ch]) >> 12;
-      px[c] = (int8_t)(o < -128 ? -128 : (o > 127 ? 127 : o));
+    const int32_t mean_q = af[2 * p], r12 = af[2 * p + 1];
+    const V16I x = ld_x32(in + j * plane + (PAD + p) * 16);
+    const V16I dev = ::aie::sub(::aie::mul(x, vm1).template to_vector<int32>(0), mean_q);       // Q12
+    const V16I n12 = ::aie::mul(dev, ::aie::broadcast<int32, 16>(r12)).template to_vector<int32>(12);
+    const V16I y12 = ::aie::mul(n12, vg10).template to_vector<int32>(10);
+    const V16I o32 = ::aie::mul(::aie::add(y12, vb12), vgq).template to_vector<int32>(12);
+    const V16I oc = ::aie::max(::aie::min(o32, (int32_t)127), (int32_t)-128);
+    const V16H o16 = ::aie::accum<acc32, 16>(oc).template to_vector<int16>(0);
+    ::aie::store_v((int8_t *)out + p * 16, ::aie::pack(o16));
+  }
+  ::aie::set_rounding(::aie::rounding_mode::positive_inf);
+  for (int p = wvalid < 0 ? 0 : wvalid; p < CW; p++) ::aie::store_v(out + p * 16, ::aie::zeros<uint8, 16>());
+}
+#endif
+
+#ifndef NO_ATTN
+using MM_U8 = ::aie::mmul<4, 8, 8, uint8, int8>;
+
+// 把分段行缓冲 (每行 W 像素, 行距 row_stride*960) 连续拷到 dst[n_rows*W*16] 并补零到 pad_px
+__attribute__((noinline, minsize)) void gather_rows_16(const int8_t *in, int n_rows, int row_stride, int g_off, int pad_px,
+                                              int8_t *dst, int W) {
+  #pragma clang loop unroll(disable)
+  for (int rr = 0; rr < n_rows; rr++) {
+    const int8_t *src = in + (rr * row_stride + g_off) * 960 + 64;
+    int8_t *d = dst + rr * (W * 16);
+    #pragma clang loop unroll(disable)
+    for (int kt = 0; kt < W; kt++) {
+      ::aie::store_v(d + kt * 16, ::aie::load_v<16>(src + kt * 16));
     }
   }
-  for (int p = wvalid < 0 ? 0 : wvalid; p < CW; p++) ::aie::store_v(out + p * 16, ::aie::zeros<uint8, 16>());
+  ::aie::vector<int8, 16> z16 = ::aie::zeros<int8, 16>();
+  #pragma clang loop unroll(disable)
+  for (int k = n_rows * W; k < pad_px; k++) {
+    ::aie::store_v(dst + k * 16, z16);
+  }
+}
+
+// 多头自注意力 (op 6): 步 2h (h[60]=0: QKᵀ + softmax → W_u8 存 acc) / 步 2h+1 (h[60]=1: W@V → out[40][16])
+// W = 每行 token 数 (= 本 core 的 wvalid, 1..35), 4 行共 T = 4W 个 key。缓冲区按 W=35 的最大值排 (行距 70 / 140 / 18 块),
+// 循环次数按 W 算 —— 短窗口 (W<35) 时 QKᵀ / softmax / W@V 都只算有效部分。
+__attribute__((noinline)) void attn_step(const int8_t *__restrict in, const int32_t *__restrict h,
+                                         const int8_t *__restrict w, uint8_t *__restrict out,
+                                         int32_t *__restrict acc, uint8_t *__restrict sc_buf, int r, int j, int core,
+                                         int W) {
+  // acc = 7680 B: [192..5091] S01 (r=2 按 qb 依次被 [0..5183] w_blk 覆写), [5376..7679] q_buf
+  // sc_buf = 6144 B: [0..4607] kt_buf, [4608..5183] s23_qb / w_tmp, [5184..5503] s_row, [5504..5823] e_row
+  int8_t *q_buf = ((int8_t *)acc) + 5376;                 // 9 * 8 * 32 = 2304 B
+  int16_t *s01_all = (int16_t *)(((int8_t *)acc) + 192);   // 35 * 70 * 2 = 4900 B
+  uint8_t *w_blk = (uint8_t *)acc;                         // 9 * 18 * 32 = 5184 B
+  int8_t *kt_buf = (int8_t *)sc_buf;                       // 9 * 8 * 64 = 4608 B
+  int16_t *s23_qb = (int16_t *)(sc_buf + 4608);            // 4 * 70 * 2 = 560 B
+  const int nqb = (W + 3) >> 2;                            // query 块 (每块 4 个)
+  const int nq_last = W - 4 * (nqb - 1);
+  const int K2 = 2 * W;                                    // 每个 r 的 key 数 (2 行)
+  const int nkb = (K2 + 7) >> 3;                           // key 块 (每块 8 个)
+  const int nk_last = K2 - 8 * (nkb - 1);
+  const int T = 4 * W;
+  const int nkb2 = (T + 7) >> 3;                           // W@V 的 key 块
+
+  if (h[60] == 0) {
+    if (r == 0) {
+      #pragma clang loop unroll(disable)
+      for (int qb = 0; qb < nqb; qb++) {
+        const int q0 = qb * 4;
+        #pragma clang loop unroll(disable)
+        for (int g = 0; g < 4; g++) {
+          V32 lo0, hi0;
+          alignas(32) int8_t tmp[64];
+          ::aie::vector<int8, 16> z16 = ::aie::zeros<int8, 16>();
+          #pragma clang loop unroll(disable)
+          for (int dq = 0; dq < 4; dq++) {
+            const int q = q0 + dq;
+            ::aie::store_v(tmp + dq * 16, (q < W) ? ::aie::load_v<16>(in + g * 960 + 64 + q * 16) : z16);
+          }
+          split(::aie::load_v<64>(tmp), lo0, hi0);
+          ::aie::store_v(q_buf + qb * 256 + (2 * g) * 32, lo0);
+          ::aie::store_v(q_buf + qb * 256 + (2 * g + 1) * 32, hi0);
+        }
+      }
+      return;
+    }
+
+    int8_t *k_lin = (int8_t *)(sc_buf + 4608);
+    #pragma clang loop unroll(disable)
+    for (int g = 0; g < 4; g++) {
+      gather_rows_16(in, 2, 4, g, nkb * 8, k_lin, W);
+      #pragma clang loop unroll(disable)
+      for (int kb = 0; kb < nkb; kb++) {
+        V32 lo0, hi0, lo1, hi1;
+        split(::aie::load_v<64>(k_lin + kb * 128), lo0, hi0);
+        split(::aie::load_v<64>(k_lin + kb * 128 + 64), lo1, hi1);
+        ::aie::store_v(kt_buf + (kb * 8 + 2 * g) * 64, ::aie::transpose(::aie::concat(lo0, lo1), 8, 8));
+        ::aie::store_v(kt_buf + (kb * 8 + 2 * g + 1) * 64, ::aie::transpose(::aie::concat(hi0, hi1), 8, 8));
+      }
+    }
+
+    const int32_t alpha = h[61];
+    const int32_t valid_t = h[62];
+    const uint16_t *exp_lut = (const uint16_t *)w;
+    int16_t *s_row = (int16_t *)(sc_buf + 5184);
+    uint16_t *e_row = (uint16_t *)(sc_buf + 5504);
+
+    #pragma clang loop unroll(disable)
+    for (int qb = 0; qb < nqb; qb++) {
+      const int8_t *qp = q_buf + qb * 256;
+      V32 qa0 = ::aie::load_v<32>(qp + 0 * 32), qa1 = ::aie::load_v<32>(qp + 1 * 32);
+      V32 qa2 = ::aie::load_v<32>(qp + 2 * 32), qa3 = ::aie::load_v<32>(qp + 3 * 32);
+      V32 qa4 = ::aie::load_v<32>(qp + 4 * 32), qa5 = ::aie::load_v<32>(qp + 5 * 32);
+      V32 qa6 = ::aie::load_v<32>(qp + 6 * 32), qa7 = ::aie::load_v<32>(qp + 7 * 32);
+      const int nq = (qb < nqb - 1) ? 4 : nq_last;
+      int16_t *s_dst_qb = (r == 1) ? (s01_all + qb * 4 * 70) : s23_qb;
+      #pragma clang loop unroll(disable)
+      for (int kb = 0; kb < nkb; kb++) {
+        const int8_t *kp = kt_buf + kb * 512;
+        MM c;
+        c.mul(qa0, ::aie::load_v<64>(kp + 0 * 64));
+        c.mac(qa1, ::aie::load_v<64>(kp + 1 * 64));
+        c.mac(qa2, ::aie::load_v<64>(kp + 2 * 64));
+        c.mac(qa3, ::aie::load_v<64>(kp + 3 * 64));
+        c.mac(qa4, ::aie::load_v<64>(kp + 4 * 64));
+        c.mac(qa5, ::aie::load_v<64>(kp + 5 * 64));
+        c.mac(qa6, ::aie::load_v<64>(kp + 6 * 64));
+        c.mac(qa7, ::aie::load_v<64>(kp + 7 * 64));
+        alignas(32) int32_t tmp_s[32];
+        ::aie::store_v(tmp_s, c.template to_vector<int32>(0));
+        const int k0 = kb * 8;
+        const int nk = (kb < nkb - 1) ? 8 : nk_last;
+        #pragma clang loop unroll(disable)
+        for (int dq = 0; dq < nq; dq++) {
+          int16_t *row_dst = s_dst_qb + dq * 70 + k0;
+          #pragma clang loop unroll(disable)
+          for (int dk = 0; dk < nk; dk++) {
+            int32_t sc = (tmp_s[dq * 8 + dk] * alpha + 2048) >> 12;
+            row_dst[dk] = (int16_t)(sc < -32768 ? -32768 : (sc > 32767 ? 32767 : sc));
+          }
+        }
+      }
+      if (r == 2) {
+        int16_t *s01_qb = (int16_t *)(sc_buf + 5824);
+        const int16_t *s01_src = s01_all + qb * 4 * 70;
+        #pragma clang loop unroll(disable)
+        for (int k = 0; k < nq * 70; k++) s01_qb[k] = s01_src[k];
+        uint8_t *w_qblk = w_blk + qb * (18 * 32);
+        #pragma clang loop unroll(disable)
+        for (int dq = 0; dq < nq; dq++) {
+          const int16_t *s01_q = s01_qb + dq * 70;
+          const int16_t *s23_q = s23_qb + dq * 70;
+          #pragma clang loop unroll(disable)
+          for (int k = 0; k < K2; k++) {
+            s_row[k] = s01_q[k];
+            s_row[K2 + k] = s23_q[k];
+          }
+          #pragma clang loop unroll(disable)
+          for (int k = valid_t; k < T; k++) s_row[k] = -32768;
+          int32_t m = s_row[0];
+          #pragma clang loop unroll(disable)
+          for (int k = 1; k < T; k++) {
+            if (s_row[k] > m) m = s_row[k];
+          }
+          uint32_t den = 0;
+          #pragma clang loop unroll(disable)
+          for (int k = 0; k < T; k++) {
+            int32_t idx = (m - (int32_t)s_row[k] + 8) >> 4;
+            if (idx > 255) idx = 255;
+            uint16_t ek = exp_lut[idx];
+            e_row[k] = ek;
+            den += ek;
+          }
+          uint32_t inv_den = ((255U << 23) + (den >> 1)) / den;
+          uint8_t *w_qbase = w_qblk + dq * 8;
+          #pragma clang loop unroll(disable)
+          for (int k = 0; k < T; k++) {
+            uint32_t wv = ((uint32_t)e_row[k] * inv_den + (1U << 22)) >> 23;
+            w_qbase[(k >> 3) * 32 + (k & 7)] = (uint8_t)(wv > 255U ? 255U : wv);
+          }
+        }
+        // 最后一块里不存在的 query 行 (dq ≥ nq) 全写 0
+        #pragma clang loop unroll(disable)
+        for (int dq = nq; dq < 4; dq++) {
+          #pragma clang loop unroll(disable)
+          for (int kb = 0; kb < nkb2; kb++) {
+            uint8_t *p = w_qblk + kb * 32 + dq * 8;
+            for (int dk = 0; dk < 8; dk++) p[dk] = 0;
+          }
+        }
+        // 最后一个 key 块里 T 之后的 key 写 0
+        const int k_tail = T - 8 * (nkb2 - 1);
+        #pragma clang loop unroll(disable)
+        for (int dq = 0; dq < 4; dq++) {
+          uint8_t *p = w_qblk + (nkb2 - 1) * 32 + dq * 8;
+          for (int dk = k_tail; dk < 8; dk++) p[dk] = 0;
+        }
+      }
+    }
+    return;
+  }
+
+  // sub=1: W_u8[W][T] @ V_i8[T][16] -> out[40][16]
+  int8_t *v_lo = (int8_t *)sc_buf;
+  int8_t *v_hi = (int8_t *)(sc_buf + 1280);
+  int8_t *v_lin = (int8_t *)(sc_buf + 2560); // 144 * 16 = 2304 B (< 6656)
+  gather_rows_16(in, 4, 2, j, nkb2 * 8, v_lin, W);
+  #pragma clang loop unroll(disable)
+  for (int kb = 0; kb < nkb2; kb++) {
+    V32 lo0, hi0, lo1, hi1;
+    split(::aie::load_v<64>(v_lin + kb * 128), lo0, hi0);
+    split(::aie::load_v<64>(v_lin + kb * 128 + 64), lo1, hi1);
+    ::aie::store_v(v_lo + kb * 64, ::aie::concat(lo0, lo1));
+    ::aie::store_v(v_hi + kb * 64, ::aie::concat(hi0, hi1));
+  }
+
+  const int16_t *vm_src = ((const int16_t *)w) + (h[63] ? core * 64 : 0) + (2 * r + j) * 16;
+  ::aie::vector<int16, 16> vm16 = ::aie::load_v<16>(vm_src);
+  ::aie::vector<int16, 8> vm_lo8 = vm16.extract<8>(0), vm_hi8 = vm16.extract<8>(1);
+  ::aie::vector<int16, 32> vm_lo = ::aie::concat(::aie::concat(vm_lo8, vm_lo8), ::aie::concat(vm_lo8, vm_lo8));
+  ::aie::vector<int16, 32> vm_hi = ::aie::concat(::aie::concat(vm_hi8, vm_hi8), ::aie::concat(vm_hi8, vm_hi8));
+
+  #pragma clang loop unroll(disable)
+  for (int qb = 0; qb < nqb; qb++) {
+    const uint8_t *wp = w_blk + qb * (18 * 32);
+    MM_U8 c0, c1;
+    V32U a0 = ::aie::load_v<32>(wp);
+    c0.mul(a0, ::aie::load_v<64>(v_lo));
+    c1.mul(a0, ::aie::load_v<64>(v_hi));
+    #pragma clang loop unroll(disable)
+    for (int kb = 1; kb < nkb2; kb++) {
+      V32U ak = ::aie::load_v<32>(wp + kb * 32);
+      c0.mac(ak, ::aie::load_v<64>(v_lo + kb * 64));
+      c1.mac(ak, ::aie::load_v<64>(v_hi + kb * 64));
+    }
+    V32 o0 = ::aie::mul(c0.template to_vector<int16>(1), vm_lo).template to_vector<int8>(15);
+    V32 o1 = ::aie::mul(c1.template to_vector<int16>(1), vm_hi).template to_vector<int8>(15);
+    auto [p, q] = ::aie::interleave_zip(o0, o1, 8);
+    int8_t *o_ptr = (int8_t *)out + qb * 4 * 16;
+    ::aie::store_v(o_ptr, p);
+    ::aie::store_v(o_ptr + 32, q);
+  }
+  ::aie::vector<int8, 16> z16 = ::aie::zeros<int8, 16>();
+  #pragma clang loop unroll(disable)
+  for (int q = W; q < 40; q++) {
+    ::aie::store_v((int8_t *)out + q * 16, z16);
+  }
 }
 #endif
 
@@ -589,6 +839,9 @@ void convC16Chunk(int8_t *r0, int8_t *r1, int8_t *r2, int8_t *wts, uint8_t *out,
 #ifndef NO_LM
   if (h[59] == 1) { ln_step(r1, h, wts + HDR, out, acc, j, wvalid - px0); return; }
 #endif
+#ifndef NO_ATTN
+  if (h[59] == 2) { attn_step(r1, h, wts + HDR, out, acc, sc, r, j, core, wvalid); return; }
+#endif
   int8_t *rows[3] = {r0, r1, r2};
   const int8_t *w = wts + HDR;
   const int8_t *rq = w + h[52] + ocp * RQB; // 这个输出通道组的重新量化表
@@ -627,9 +880,11 @@ void convC16Chunk(int8_t *r0, int8_t *r1, int8_t *r2, int8_t *wts, uint8_t *out,
     conv3s2(rows, w + ocp * (9 * d.icp * 256), out, d, px0, wvalid, rq);
   }
 #endif
+#ifndef NO_K3
   else {
     conv3s1(rows, w + ocp * (9 * d.icp * 256), out, d, px0, wvalid, rq);
   }
+#endif
 #if !defined(NO_PA) || !defined(NO_GELU)
   if ((h[29] == 1 || h[29] == 3
 #ifndef NO_GELU

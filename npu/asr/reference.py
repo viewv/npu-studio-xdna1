@@ -297,10 +297,6 @@ def main() -> int:
     return 1
 
 
-if __name__ == "__main__":
-    sys.exit(main())
-
-
 # ------------------------------------------------------------------ 伪量化（NPU 方案评估）
 #
 # 目标：NPU 上激活是"静态逐通道"（比例在校准集上定好、折进下一层权重），
@@ -425,3 +421,7 @@ def forward_npu(frames: np.ndarray, z, layers: int = LAYERS) -> np.ndarray:
         f = gelu_int8(fq, sf, so).astype(np.float64) * so
         h = h + mm(f, z[p + "f2"], float(z[p + "f2_s"]), z[p + "f2b"])
     return mm(h, z["out_w"], float(z["out_s"]), z["out_b"])
+
+
+if __name__ == "__main__":
+    sys.exit(main())

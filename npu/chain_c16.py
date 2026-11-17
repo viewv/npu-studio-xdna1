@@ -97,6 +97,7 @@ ACC_CHUNKS = 3                 # acc 缓冲区能放几个输出块的部分和 
 N_CORES = 4
 FILLS_PER_TG = 2               # 一个 task group 里同一个 shim 通道排几个 fill (在途的组合计 ≤ 4, 多了会挂死)
 W_PREFETCH = True              # 下一层第一组的权重在层间屏障之前发出
+W_BCAST = os.environ.get("NPU_W_BCAST", "1") != "0"   # 行并行的链权重广播给 4 个 core (见 Plan.w_bcast)
 TG_INFLIGHT = 2                # 同一层里同时在途的 task group 数 (2 = 发下一组之后再等前一组)
 MAX_PLANE = 4064               # shim BD 最内维上限之内
 SC_BYTES = 1024                # 每 core 的 SE 缩放向量缓冲区 (≤ 64 个通道组)
@@ -148,6 +149,8 @@ class Layer:
             return self.ho * self.wo * self.ic
         if self.op == 3:
             return 0
+        if self.op == 6:
+            return 2 * (self.h * self.w) ** 2 * self.oc
         return self.ho * self.wo * self.oc * (1 if self.dw else self.ic) * self.k * self.k
 
 
@@ -167,9 +170,15 @@ R = {
     "e12": Layer(128, 32, 1, 1, 12, 20),
     "e13": Layer(32, 32, 3, 1, 12, 20),    # 3×3 s1 @12×20 (补宽列必须是零)
     "gelu1": Layer(64, 128, 1, 1, 12, 20, act=5),   # GELU 查表 (act 5) 的测试层
-    # LayerNorm (op 5) 的测试层: 4 行 × 35 像素、256 通道 (2 个 IC 块) —— 与参考逐字节一致。
-    # 注: 512 通道 (语音模型用的形状) 现在跑不起来 (4 个 IC 块时挂死), 见 docs/npu-models.md §14.8
-    "lm1": Layer(256, 256, 1, 1, 4, 35, op=5),
+    # LayerNorm (op 5) 的测试层: 4 行 × 35 像素、512 通道 (语音模型真实形状, 4 个 IC 块) —— 与参考逐字节一致。
+    "lm1": Layer(512, 512, 1, 1, 4, 35, op=5),
+    # 多头自注意力 (op 6) 的测试层: [Q ‖ K ‖ V] 1536→512, 4×35 (140 token, 8 头 × 64 维)
+    "attn1": Layer(1536, 512, 1, 1, 4, 35, op=6),
+    # 短窗口 (按说话长度分档): 每行 W 个 token, 4 行共 4W —— W=15 (60 token, 3 s)、W=10 (40 token, 2 s)、W=13 (不是 4 的倍数)
+    "attn15": Layer(1536, 512, 1, 1, 4, 15, op=6),
+    "attn10": Layer(1536, 512, 1, 1, 4, 10, op=6),
+    "attn13": Layer(1536, 512, 1, 1, 4, 13, op=6),
+    "lm15": Layer(512, 512, 1, 1, 4, 15, op=5),
 }
 # RVM 编码器 12×20 段的真实形状 (跳过 depthwise 和 SE; 200/184 补到 208/192), 输入 240 通道
 _T = [(240, 80, 1, "Conv_67"), (80, 208, 1, "Conv_68"), (208, 80, 1, "Conv_74"), (80, 480, 1, "Conv_92"),
@@ -247,6 +256,9 @@ def _real(names):
 CHAINS = {
     "gelu": ["gelu1"],                                   # GELU 查表 (act 5)
     "lm": ["lm1"],                                       # LayerNorm (op 5)
+    "attn": ["attn1"],                                   # 多头自注意力 (op 6)
+    "attn15": ["attn15"], "attn10": ["attn10"], "attn13": ["attn13"],   # 短窗口注意力
+    "lm15": ["lm15"],
     "enc": ENC,
     "head": ENC[:3],
     "low": ENC + ["e11", "e12", "e13"] * 4,           # 12×20 的三层重复
@@ -301,6 +313,18 @@ LAYER_CHAINS = {
     "alias": [Layer(32, 32, 1, 1, 23, 40), Layer(32, 32, 1, 1, 23, 40),
               Layer(32, 32, 1, 1, 23, 40, src=-2, al=-2), Layer(32, 32, 1, 1, 23, 40, src=-3)],
 }
+
+
+def _tblock(W):
+    """语音模型的一个 Transformer 块 (9 个算子, 和 npu/asr/encoder_npu.make_block_layers 一样), 每行 W 个 token"""
+    return [Layer(512, 512, 1, 1, 4, W, op=5), Layer(512, 512, 1, 1, 4, W, act=2),
+            Layer(512, 512, 1, 1, 4, W, act=2, src=-2, nx=-1), Layer(512, 512, 1, 1, 4, W, act=2, src=-3, nx=-1),
+            Layer(1536, 512, 1, 1, 4, W, op=6, src=-3), Layer(1024, 512, 1, 1, 4, W, act=2, src=-1, cat=-6),
+            Layer(512, 512, 1, 1, 4, W, op=5), Layer(512, 2048, 1, 1, 4, W, act=5),
+            Layer(2560, 512, 1, 1, 4, W, act=2, src=-1, cat=-3)]
+
+
+LAYER_CHAINS.update({"tblk": _tblock(35), "tblk15": _tblock(15)})
 
 
 def chain_layers(spec: str) -> list[Layer]:
@@ -465,6 +489,14 @@ def choose_tiling(l: Layer, ws_in: int | None = None, w_max: int = 0) -> Tiling:
                        for i in range(tl.n_icb)])                     # pass 1: 归一化
         tl.n_ob = len(tl.steps)          # 每步一个 fill 单元 (照 ict: 大 BD 会撞 DMA 限制)
         return tl
+    if l.op == 6:                # 多头自注意力 (Q‖K‖V → O_in): ic = 3·oc, oc = 64·n_heads, H=4, W=35
+        assert l.ic == 3 * l.oc and l.oc % 64 == 0 and l.ho == N_CORES and l.wo <= CW, f"attn 形状不支持: {l}"
+        n_heads = l.oc // 64
+        tl = Tiling(1, N_CORES, CW, [0, 1, 2, 3], [1, 1, 1, 1])
+        tl.mode, tl.icp_pad, tl.plane, tl.nocp = "attn", 8, 960, 4
+        tl.steps = [(4 * h, 4, 4 * h, 4, 0, sub, 0, sub, h) for h in range(n_heads) for sub in (0, 1)]
+        tl.n_ob = len(tl.steps)
+        return tl
     if l.op == 2:
         return _up_tiling(l)
     if l.op == 3:                # 外部输入: 不算, 没有步
@@ -567,7 +599,9 @@ class Plan:
                     cur = self.tensors[i]
                     if l.cat:
                         j = k + 1 + l.cat
-                        assert 0 < j <= k and 0 < i, f"层 {k} 的拼接越界"
+                        assert 0 <= j <= k and 0 < i, f"层 {k} 的拼接越界"
+                        if j == 0:
+                            self.tensors[0].ws = cdiv(l0.w, CW) * CW
                         links.append((i, j))
                     assert l.h == cur.h and l.w == cur.w, f"接不上: {cur} → {l}"
                     assert l.ic % 16 == 0 and l.oc % 16 == 0
@@ -596,6 +630,10 @@ class Plan:
         self.e_w = cdiv(HDR + max(self._step_wbytes(l, st) for l, tl in zip(layers, self.tilings)
                                   for st in tl.steps), 256) * 256
         self.w_depth = 2 if 2 * self.e_w <= W_BUDGET else 1
+        # 权重广播: 所有层都是行并行 (每个 core 同一槽同一步, 没有 OC 并行 / 池化 / SE 缩放装载) 时, 4 个 core 的权重元素
+        # 逐字节相同 —— 只从 DDR 读一份 (core 0 那份), 一个 fifo 广播给 4 个 core, 权重流量 ÷4。C16Chain 打包时核对。
+        self.w_bcast = W_BCAST and all(not tl.ocpar and not tl.pre and tl.mode not in ("pool", "input")
+                                       for l, tl in zip(layers, self.tilings) if l.op != 3)
         self.step0 = np.cumsum([0] + [len(tl.slots()) for tl in self.tilings]).tolist()
         self.io = [(self.loc[self.inp[k]], self.loc[k + 1]) for k in range(len(layers))]
         ends = dict(self._ends)
@@ -698,13 +736,15 @@ class Plan:
     @staticmethod
     def _step_wbytes(l, st):
         _, nocp, _, nicp = st[:4]
-        if l.op == 5:                # LN: m1/m2/g10/b12/gq (各 ic 个 int32) + 2 个 fp32 常量
-            return 5 * 4 * l.ic + 8
+        if l.op == 5:                # LN: 本步 nicp·16 通道的 m1/m2/g10/b12/gq (int32) + 2 个 fp32 常量
+            return 5 * 4 * (nicp * 16) + 8
+        if l.op == 6:                # ATTN: sub=0 放 256 项 uint16 EXP_LUT (512 B); sub=1 放 64 项 int16 mul_v (128 B)
+            return 512
         if l.op:
             return 0
         if l.dw:
-            return nocp * (l.k * l.k * 64 + RQB) + (GELU_TBL if l.act == 5 else 0)
-        return l.k * l.k * nicp * 16 * nocp * 16 + nocp * RQB + (GELU_TBL if l.act == 5 else 0)
+            return nocp * (l.k * l.k * 64 + RQB) + (GELU_TBL if l.act == 5 and st[5] else 0)
+        return l.k * l.k * nicp * 16 * nocp * 16 + nocp * RQB + (GELU_TBL if l.act == 5 and st[5] else 0)
 
     @staticmethod
     def ob_groups(tl, l, wmax=99):
@@ -720,6 +760,8 @@ class Plan:
             per = cdiv(max(tl.band_rows), 64)
         elif tl.mode in ("up", "lm"):
             per = 1
+        elif tl.mode == "attn":
+            per = 2
         else:
             per = 1 if tl.mode == "ict" else (0 if l.s == 1 else cdiv(max(tl.band_rows), 64))
         if per == 0:
@@ -740,9 +782,11 @@ class Plan:
             "DW5": any(l.dw and l.k == 5 and l.d == 1 for l in L),
             "DW5D2": any(l.dw and l.k == 5 and l.d == 2 for l in L),
             "S2": any(not l.op and not l.dw and l.k == 3 and l.s == 2 for l in L),
+            "K3": any(not l.op and not l.dw and l.k == 3 for l in L),
             "PA": any(l.act in (1, 3) for l in L),
             "GELU": any(l.act == 5 for l in L),
             "LM": any(l.op == 5 for l in L),
+            "ATTN": any(l.op == 6 for l in L),
         }
         return [f"-DNO_{k}" for k, v in use.items() if not v]
 
@@ -789,6 +833,20 @@ class Plan:
             o0 = base + (BR + tl.band_y0[b]) * ti.frow
             return [(o0 + (tl.steps[o][2] // tl.icp_pad) * tl.icp_pad * ti.cplane,
                      [rows, tl.icp_pad, tl.plane], [ti.frow, ti.cplane, 1]) for o in range(ob0, ob1)]
+        if tl.mode == "attn":    # 步 2h (sub=0): r=0 读本 core 的 Q 行, r=1..2 读全部 4 行 K; 步 2h+1 (sub=1): r=0..1 读全部 4 行 V
+            q_row = base + (BR + tl.band_y0[b]) * ti.frow
+            k_row0 = base + BR * ti.frow + (l.oc // 16) * ti.cplane
+            v_row0 = base + BR * ti.frow + 2 * (l.oc // 16) * ti.cplane
+            taps = []
+            for o in range(ob0, ob1):
+                sub, h = tl.steps[o][7], tl.steps[o][8]
+                if sub == 0:
+                    taps.append((q_row + 4 * h * ti.cplane, [1, 1, 8, 960], [0, ti.frow, ti.cplane, 1]))
+                    taps.append((k_row0 + 4 * h * ti.cplane, [1, 4, 4, 960], [0, ti.frow, ti.cplane, 1]))
+                else:
+                    taps.append((v_row0 + 4 * h * ti.cplane, [1, 4, 2, 960], [0, ti.frow, ti.cplane, 1]))
+                    taps.append((v_row0 + (4 * h + 2) * ti.cplane, [1, 4, 2, 960], [0, ti.frow, ti.cplane, 1]))
+            return taps
         if tl.mode == "ict":     # 不要上下边行; 每份 OC 一个 BD: [IC 步][行][m 组][PLANE]
             o1 = off + ti.frow
             if rows == 1:        # FC: 一行, 所有份合成一个 BD (最外维步长 0)
@@ -811,6 +869,10 @@ class Plan:
             o0 = base + (BR + tl.band_y0[b]) * to.frow + (PAD + t * tl.wt) * 16
             return [(o0 + (tl.steps[o][2] // tl.icp_pad) * tl.icp_pad * to.cplane,
                      [tl.band_rows[b], tl.icp_pad, CW * 16], [to.frow, to.cplane, 1])
+                    for o in range(ob0, ob1) if tl.steps[o][7]]
+        if tl.mode == "attn":   # 只有 sub=1 的步出输出, 每头 4 个通道组 × 640 B
+            o0 = base + (BR + tl.band_y0[b]) * to.frow + (PAD + t * tl.wt) * 16
+            return [(o0 + 4 * tl.steps[o][8] * to.cplane, [1, 1, 4, CW * 16], [0, to.frow, to.cplane, 1])
                     for o in range(ob0, ob1) if tl.steps[o][7]]
         tl, to = self.tilings[k], self.tensors[k + 1]
         ob1 = tl.n_ob if ob1 is None else ob1
@@ -860,7 +922,8 @@ class Plan:
                 kind += " HardSigmoid"
             extra = {"dw": f" 每步 {tl.nocp} 组 × {tl.n_ob} 步", "full": "", "oc": f" OC 分 {tl.n_ob} 块×{tl.nocp} 组" + (" (OC 并行)" if tl.ocpar else ""),
                      "ict": f" IC 分 {tl.n_icb} 步×{tl.icp_pad} 组, OC 分 {tl.n_ob} 份×{tl.nocp} 组",
-             "lm": f" LayerNorm {tl.n_icb} 块×2 遍, 每块 {tl.icp_pad} 组"}[tl.mode]
+             "lm": f" LayerNorm {tl.n_icb} 块×2 遍, 每块 {tl.icp_pad} 组",
+             "attn": f" 多头自注意力 {l.oc // 64} 头×2 步"}[tl.mode]
             out.append(f"{l.ic}→{l.oc} {kind} {l.h}×{l.w}→{l.ho}×{l.wo}: {tl.n_tw}条×{tl.n_bands}段 "
                        f"WT {tl.wt} 行 {tl.band_rows} ICPpad {tl.icp_pad} PLANE {tl.plane}{extra}")
         return out
@@ -899,7 +962,8 @@ def conv_c16(act: In, wts: In, scratch: InOut, out: Out, *, spec: CompileTime[st
     out_ty = np.ndarray[(CW * 16,), u8]
     w_ty = np.ndarray[(P.e_w,), i8]
     acc_ty = np.ndarray[(ACC_CHUNKS * CW * 16,), i32]
-    sc_ty = np.ndarray[(SC_BYTES,), u8]
+    sc_bytes = 6656 if any(l.op == 6 for l in layers[k0:k1]) else SC_BYTES
+    sc_ty = np.ndarray[(sc_bytes,), u8]
     kern = ExternalFunction("convC16Chunk", source_file=SRC,
                             arg_types=[in_ty, in_ty, in_ty, w_ty, out_ty, acc_ty, sc_ty, np.int32, np.int32,
                                        np.int32],
@@ -952,17 +1016,19 @@ def conv_c16(act: In, wts: In, scratch: InOut, out: Out, *, spec: CompileTime[st
         return core
 
     fifos, workers = [], []
+    f_wb = ObjectFifo(w_ty, depth=P.w_depth, name="c16_wb") if P.w_bcast else None
+    # LN / ATTN 内核调用软浮点或软除法，栈帧较大，超过默认 1 KB 栈会覆写 0x70400 处的首个缓冲区
+    st_sz = 2048 if any(l.op in (5, 6) for l in layers[k0:k1]) else 1024
     for c in range(N_CORES):
-        # 输入 fifo 深度: LN 一层要读两遍 (2·n_icb 个元素), 缓冲要够, 否则 fill 会互相覆盖
-        idep = max([4] + [2 * tl.n_icb for tl in P.tilings if tl.mode == "lm"])
-        f_in = ObjectFifo(in_ty, depth=idep, name=f"c16_{c}i")
-        f_w = ObjectFifo(w_ty, depth=P.w_depth, name=f"c16_{c}w")
+        f_in = ObjectFifo(in_ty, depth=4, name=f"c16_{c}i")
+        f_w = f_wb if f_wb is not None else ObjectFifo(w_ty, depth=P.w_depth, name=f"c16_{c}w")
         f_out = ObjectFifo(out_ty, depth=2, name=f"c16_{c}o")
         acc = Buffer(acc_ty, name=f"c16_{c}acc")
         dummy = Buffer(out_ty, name=f"c16_{c}dummy")
         sc = Buffer(sc_ty, name=f"c16_{c}sc")
         fifos.append((f_in, f_w, f_out))
-        workers.append(Worker(make_core(c), [f_in.cons(), f_w.cons(), f_out.prod(), kern, acc, dummy, sc]))
+        workers.append(Worker(make_core(c), [f_in.cons(), f_w.cons(), f_out.prod(), kern, acc, dummy, sc],
+                              stack_size=st_sz))
 
     rt = Runtime()
     nw = P.n_steps * N_CORES * P.e_w                # 权重缓冲区 [槽][core][e_w]
@@ -972,11 +1038,15 @@ def conv_c16(act: In, wts: In, scratch: InOut, out: Out, *, spec: CompileTime[st
         rt.start(*workers)
         pending, pre_tg = [], None
 
-        def wfill(k, ci, tg):           # 层 k 第 ci 组的权重 (每个 core 一个 BD, 连续 ns 个槽)
+        def wfill(k, ci, tg, wait=False):           # 层 k 第 ci 组的权重 (每个 core 一个 BD, 连续 ns 个槽)
             _, _, ns, s0 = P.chunks(k)[ci]
+            if f_wb is not None:                    # 广播: 只读 core 0 那份
+                rt.fill(f_wb.prod(), w, tap=_tap(nw, s0 * N_CORES * P.e_w, [1, ns, P.e_w // 256, 256],
+                                                 [0, N_CORES * P.e_w, 256, 1]), wait=wait, task_group=tg)
+                return
             for c, (_, f_w, _) in enumerate(fifos):
                 rt.fill(f_w.prod(), w, tap=_tap(nw, (s0 * N_CORES + c) * P.e_w, [1, ns, P.e_w // 256, 256],
-                                                 [0, N_CORES * P.e_w, 256, 1]), task_group=tg)
+                                                [0, N_CORES * P.e_w, 256, 1]), wait=wait, task_group=tg)
 
         for k in range(k0, k1):
             l = layers[k]
@@ -985,6 +1055,9 @@ def conv_c16(act: In, wts: In, scratch: InOut, out: Out, *, spec: CompileTime[st
             (src, soff), (dst, doff) = P.io[k]
             tl = P.tilings[k]
             for ci, (ob0, ob1, _, _) in enumerate(P.chunks(k)):
+                # 没有 drain 的 task group (如 LN 的 pass 0) 必须在 fill 上设 wait=True, 否则 finish_task_group
+                # 只发 dma_free_task 不发 dma_await_task, 后续组会直接覆写尚在传输中的 shim DMA BD
+                has_drain = any(P.drain_taps(k, doff, c, t, b, ob0, ob1) for c, t, b in tl.cores())
                 if ci == 0 and pre_tg is not None:          # 权重在上一层屏障之前就发了
                     tg, pre_tg = pre_tg, None
                 else:
@@ -997,8 +1070,10 @@ def conv_c16(act: In, wts: In, scratch: InOut, out: Out, *, spec: CompileTime[st
                         rt.fill(fifos[c][0].prod(), bufs[ssrc], tap=_tap(P.size[ssrc], *P.scale_tap(k, sbase)),
                                 task_group=tg)
                 for c, t, b in tl.cores():
-                    for o_, sz, st in P.fill_taps(k, soff, c, t, b, ob0, ob1):
-                        rt.fill(fifos[c][0].prod(), bufs[src], tap=_tap(P.size[src], o_, sz, st), task_group=tg)
+                    ftaps = P.fill_taps(k, soff, c, t, b, ob0, ob1)
+                    for ti_idx, (o_, sz, st) in enumerate(ftaps):
+                        rt.fill(fifos[c][0].prod(), bufs[src], tap=_tap(P.size[src], o_, sz, st),
+                                wait=(not has_drain and ti_idx == len(ftaps) - 1), task_group=tg)
                 for c, t, b in tl.cores():
                     for o_, sz, st in P.drain_taps(k, doff, c, t, b, ob0, ob1):
                         rt.drain(fifos[c][2].cons(), bufs[dst], tap=_tap(P.size[dst], o_, sz, st), wait=True,
@@ -1050,6 +1125,7 @@ class LParam:
     inp: np.ndarray | None = None   # 外部输入层 (op 3) 的数据 (C, H, W), 构造 C16Chain 时写进 act 缓冲区
     gelu: np.ndarray | None = None  # act 5 用: 256 项 int8 查表（int8 值 → int8 值）
     ln: tuple | None = None         # op 5 用: (gamma, beta, s_in, g_out)，各 ic 个 fp32
+    attn: tuple | None = None       # op 6 用: (alpha_q20, mul_v[, valid_t])，alpha_q20 为 n_heads 个 int32，mul_v 为 oc 个 int16
 
     def arr(self, name, n, default):
         v = getattr(self, name)
@@ -1115,12 +1191,13 @@ def _pack_step(l, tl, full, p, rq, e_w, st, c_own, ws_in=0, sgn_in=False, sc_cp=
         buf[:HDR] = hdr.view(np.int8)
         buf[32 + 16 * c_own: 48 + 16 * c_own] = per.view(np.int8)
         return buf
-    if l.op == 5:                # LayerNorm: gamma/beta/s_in/g_out + eps + D 在权重区
+    if l.op == 5:                # LayerNorm: 本步 nicp·16 通道的 gamma/beta/s_in/g_out + inv_b/eps 在权重区
         assert p.ln is not None, "op 5 需要 LParam.ln = (gamma, beta, s_in, g_out)"
-        gamma, beta, s_in, g_out = (np.asarray(a, np.float32) for a in p.ln)
+        c0, c1 = icp0 * 16, (icp0 + nicp) * 16
+        gamma, beta, s_in, g_out = (np.asarray(a, np.float32)[c0:c1] for a in p.ln)
         hdr[56] = int(round(np.log2(l.ic)))            # log2(D): mean 用移位 (h[58] 被 nxc 占了)
         hdr[59] = 1                                   # LN 标记
-        hdr[60], hdr[61], hdr[62], hdr[63] = st[7], st[8], icp0, l.ic
+        hdr[60], hdr[61], hdr[62], hdr[63] = st[7], st[8], 0, nicp * 16
         hdr[24] = int(icp0 == 0)                       # 第一块: acc 从零开始
         hdr[:8] = [nicp, 1, tl.wt, 1, 1, 0, tl.nxc, tl.plane]
         buf[:HDR] = hdr.view(np.int8)
@@ -1140,6 +1217,28 @@ def _pack_step(l, tl, full, p, rq, e_w, st, c_own, ws_in=0, sgn_in=False, sc_cp=
                               np.rint(np.asarray(g_out, np.float64)).astype(np.int32)])  # gq: 整数比例
         buf[HDR: HDR + par.nbytes] = par.view(np.int8)
         buf[HDR + par.nbytes: HDR + par.nbytes + 8] = inv_b.view(np.int8)
+        return buf
+    if l.op == 6:                # 多头自注意力: 步 2h (sub=0: QKᵀ+softmax) / 步 2h+1 (sub=1: W@V)
+        assert p.attn is not None, "op 6 需要 LParam.attn = (alpha_q20, mul_v[, valid_t])"
+        alpha_q20, mul_v = p.attn[0], p.attn[1]
+        valid_t = int(p.attn[2]) if len(p.attn) > 2 else l.h * l.w
+        sub, h = st[7], st[8]
+        hdr[59] = 2              # ATTN 标记
+        hdr[60] = sub
+        hdr[61] = int(alpha_q20[h])
+        hdr[62] = valid_t
+        hdr[:8] = [4, 4, tl.wt, 1, 1, 0, tl.nxc, tl.plane]
+        buf[:HDR] = hdr.view(np.int8)
+        for c, t, b in tl.cores():
+            wvalid = min(max(l.wo - t * tl.wt, 0), tl.wt)
+            per = np.array([3, 0, 0, wvalid, 1, 1, 0, 0] if sub == 0 else [2, 0, 0, wvalid, 2, 0, 1, 0], np.uint16)
+            buf[32 + 16 * c: 48 + 16 * c] = per.view(np.int8)
+        if sub == 0:
+            exp_lut = np.rint(np.exp(-np.arange(256) * (16.0 / 255.0)) * (1 << 15)).astype(np.uint16)
+            buf[HDR: HDR + 512] = exp_lut.view(np.int8)
+        else:
+            mv = np.asarray(mul_v[h * 64: (h + 1) * 64], np.int16)
+            buf[HDR: HDR + 128] = mv.view(np.int8)
         return buf
     if l.op == 1:                # 池化: 累加步 (每组前 ne-1 个元素) + 收尾步 (每组最后一个), 参数在 int32[33..39, 43]
         m = round((1 << POOL_S) / (l.h * l.w))
@@ -1194,7 +1293,7 @@ def _pack_step(l, tl, full, p, rq, e_w, st, c_own, ws_in=0, sgn_in=False, sc_cp=
     buf[HDR:HDR + flat.size] = flat
     t = rq[ocp0:ocp0 + nocp].reshape(-1)
     buf[HDR + flat.size: HDR + flat.size + t.size] = t
-    if l.act == 5:               # GELU 查表: 紧跟所有输出组的重新量化表 (内核按 w + h[52] + ocp·RQB 取)
+    if l.act == 5 and last:      # GELU 查表: 只在最后一步 (last=1) 用, 省掉中间 IC 步的 2048 B 使 e_w ≤ 6656 B
         blob = gelu_lut_blob(p.gelu)
         off = HDR + flat.size + t.size
         buf[off: off + blob.size] = blob
@@ -1202,6 +1301,8 @@ def _pack_step(l, tl, full, p, rq, e_w, st, c_own, ws_in=0, sgn_in=False, sc_cp=
 
 
 def conv_acc(l: Layer, x_i8: np.ndarray, Wq: np.ndarray) -> np.ndarray:
+    if l.k == 1 and l.s == 1 and not l.dw:
+        return (Wq[:, :, 0, 0].astype(np.float64) @ x_i8.reshape(l.ic, -1).astype(np.float64)).astype(np.int32).reshape(l.oc, l.ho, l.wo)
     p = l.pad
     xp = np.zeros((l.ic, l.h + 2 * p, l.w + 2 * p), np.int32)
     xp[:, p:p + l.h, p:p + l.w] = x_i8
@@ -1308,6 +1409,39 @@ def ln_ref(x_u8: np.ndarray, p: LParam) -> np.ndarray:
     return np.clip(o, -128, 127).astype(np.int8).view(np.uint8)
 
 
+_ATTN_EXP_U16 = np.rint(np.exp(-np.arange(256) * (16.0 / 255.0)) * (1 << 15)).astype(np.int64)
+
+
+def attn_ref(qkv_u8: np.ndarray, p: LParam) -> np.ndarray:
+    """多头自注意力 (op 6) 的定点参考 —— 与内核 attn_step 逐位一致:
+    输入 qkv_u8 形状 (3·oc, 4, 35)，按通道拆成 Q, K, V 各 (oc, 4, 35)。"""
+    alpha_q20, mul_v = np.asarray(p.attn[0], np.int64), np.asarray(p.attn[1], np.int64)
+    c3, h_rows, w_cols = qkv_u8.shape
+    oc = c3 // 3
+    n_heads = oc // 64
+    T = h_rows * w_cols
+    valid_t = int(p.attn[2]) if len(p.attn) > 2 else T
+    qkv = qkv_u8.view(np.int8).reshape(3, n_heads, 64, T).transpose(0, 1, 3, 2)  # [3, n_heads, T, 64]
+    qi, ki, vi = qkv[0], qkv[1], qkv[2]
+    out = np.zeros((n_heads, T, 64), np.int8)
+    for h in range(n_heads):
+        raw = qi[h].astype(np.int64) @ ki[h].T.astype(np.int64)                  # [T, T]
+        s16 = np.clip((raw * int(alpha_q20[h]) + 2048) >> 12, -32768, 32767)
+        if valid_t < T:
+            s16[:, valid_t:] = -32768
+        m = s16.max(axis=1, keepdims=True)
+        idx = np.clip((m - s16 + 8) >> 4, 0, 255)
+        e = _ATTN_EXP_U16[idx]                                                   # [T, T], uint16 Q15
+        den = e.sum(axis=1, keepdims=True)
+        inv_den = ((255 << 23) + (den >> 1)) // den
+        w_u8 = np.clip((e * inv_den + (1 << 22)) >> 23, 0, 255)
+        acc_v = w_u8 @ vi[h].astype(np.int64)                                    # [T, 64]
+        s_v = np.clip((acc_v + 1) >> 1, -32768, 32767)
+        mv = mul_v[h * 64: (h + 1) * 64].reshape(1, 64)
+        out[h] = np.clip((s_v * mv + (1 << 14)) >> 15, -128, 127).astype(np.int8)
+    return out.transpose(0, 2, 1).reshape(oc, h_rows, w_cols).view(np.uint8)
+
+
 def pool_ref(x_u8: np.ndarray, sgn=False) -> np.ndarray:
     c, h, w = x_u8.shape
     m = round((1 << POOL_S) / (h * w))
@@ -1385,6 +1519,14 @@ def make_case(layers, seed=0, rq=False):
             params.append(p_)
             ts.append(ln_ref(cur.view(np.uint8), p_))
             continue
+        if l.op == 6:                # ATTN: 随机每头分数比例 alpha_q16 和逐通道 V 重新量化比例 mul_v
+            n_heads = l.oc // 64
+            alpha_q16 = rng.integers(50, 100, n_heads, dtype=np.int32)
+            mul_v = rng.integers(220, 300, l.oc, dtype=np.int16)
+            p_ = LParam(None, attn=(alpha_q16, mul_v, l.h * l.w))
+            params.append(p_)
+            ts.append(attn_ref(cur.view(np.uint8), p_))
+            continue
         gelu = None
         if l.act == 5:               # GELU 查表: 随机表（任何一个 bank 摆错都会露出来）；
             gelu = rng.integers(-120, 121, 256).astype(np.int8)
@@ -1418,20 +1560,28 @@ def make_case(layers, seed=0, rq=False):
 class C16Chain:
     """parts: 把链按层号切成几次 NPU 调用 [(k0, k1), …] (每段单独编译, 只编自己用到的内核分支; 共用所有缓冲区)"""
 
-    def __init__(self, layers, params, reps=1, parts=None):
+    def __init__(self, layers, params, reps=1, parts=None, *, w_arr=None):
         self.layers, self.reps = layers, reps
         self.P = P = Plan(layers)
         self.spec = spec_str(layers)
         self.parts = parts or [(0, len(layers))]
         self.t_act = iron.zeros(P.size["act"], dtype=np.int8, device="npu")
-        for k, (l, p) in enumerate(zip(layers, params)):
-            if l.op == 3 and p.inp is not None:
-                self.write_tensor(k + 1, p.inp, sync=False)
+        if params is not None:
+            for k, (l, p) in enumerate(zip(layers, params)):
+                if l.op == 3 and p.inp is not None:
+                    self.write_tensor(k + 1, p.inp, sync=False)
         self.t_act._sync_to_device()
-        steps = [b for k, (l, tl, p) in enumerate(zip(layers, P.tilings, params))
-                 for b in pack_layer(l, tl, p, P.e_w, P.tensors[P.inp[k]].ws, signed_in(layers, k),
-                                     P.tensors[k + 1 + l.sc].c // 16 if l.sc else 0)]
-        self.t_w = iron.tensor(np.concatenate(steps), dtype=np.int8, device="npu")
+        if w_arr is not None:
+            self.t_w = iron.tensor(w_arr, dtype=np.int8, device="npu")
+        else:
+            steps = [b for k, (l, tl, p) in enumerate(zip(layers, P.tilings, params))
+                     for b in pack_layer(l, tl, p, P.e_w, P.tensors[P.inp[k]].ws, signed_in(layers, k),
+                                         P.tensors[k + 1 + l.sc].c // 16 if l.sc else 0)]
+            w_arr = np.concatenate(steps)
+            self.t_w = iron.tensor(w_arr, dtype=np.int8, device="npu")
+        if P.w_bcast:                                # 广播要求每槽 4 个 core 的权重元素相同
+            w4 = np.asarray(w_arr).reshape(-1, N_CORES, P.e_w)
+            assert (w4 == w4[:, :1]).all(), "w_bcast: 各 core 的权重元素不同"
         self.t_s = iron.zeros(P.size["s"], dtype=np.int8, device="npu")
         self.t_out = iron.zeros(P.size["out"], dtype=np.uint8, device="npu")
 

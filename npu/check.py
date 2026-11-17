@@ -47,6 +47,10 @@ def _cases(quick: bool):
     yield "chain_c16 cat3 分两次调用", lambda: chain_c16.selftest("cat3", 10, parts=[(0, 2), (2, 6)])
     yield "chain_c16 gelu 查表", lambda: chain_c16.selftest("gelu", 10)   # AIE2 并行 LUT (act 5)
     yield "chain_c16 lm LayerNorm", lambda: chain_c16.selftest("lm", 10)  # 两遍 + acc 累加 + 定点 rsqrt
+    yield "chain_c16 attn 注意力", lambda: chain_c16.selftest("attn", 10)  # QKᵀ + EXP_LUT softmax + W@V (op 6)
+    yield "chain_c16 attn15 短窗注意力", lambda: chain_c16.selftest("attn15", 10)  # 每行 15 token (3 s 档)
+    yield "chain_c16 attn13 短窗注意力", lambda: chain_c16.selftest("attn13", 10)  # 行宽不是 4 / 8 的倍数
+    yield "chain_c16 lm15 短窗 LayerNorm", lambda: chain_c16.selftest("lm15", 10)
     if not quick:
         yield "chain_c16 low 25 层", lambda: chain_c16.selftest("low", 10)
         yield "chain_c16 deep 13 层", lambda: chain_c16.selftest("deep", 10)   # OC / IC 分块
@@ -60,6 +64,9 @@ def _cases(quick: bool):
         from .rvm import encoder_npu, encoder_ref
         if encoder_ref.ONNX.exists() and encoder_ref.images(1):   # 要 models/ 里的 RVM 模型和系统壁纸 (校准图)
             yield "RVM 编码器 真实权重 70 层", lambda: encoder_npu.selftest(2, 10)   # 和 numpy 整数模拟逐字节一致
+        from .asr import encoder_npu as asr_npu
+        if asr_npu.NPZ.exists() and asr_npu.SAMPLES_DIR.exists():
+            yield "ASR 编码器 真实权重 360 层", lambda: asr_npu.selftest(3)          # 40 层 Transformer 逐字节一致 + CER 0%
 
 
 def _probe():
