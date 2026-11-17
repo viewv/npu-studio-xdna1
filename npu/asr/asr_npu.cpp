@@ -1,9 +1,9 @@
-// Standalone C++ XRT + CBLAS 4-core NPU ASR backend & benchmark/daemon CLI.
+// Standalone C++ XRT + OpenBLAS 4-core NPU ASR backend (2/3/5/7s multi-bucket + daemon CLI).
 // Compile (必须链 OpenBLAS: 系统的 -lcblas 是 netlib 参考实现, 前端 13 ms → 300 ms、out_w 4 ms → 230 ms):
 //   L=$PWD/.venv-iron/lib/python3.14/site-packages/opencv_python_headless.libs
 //   g++ -O3 -std=c++17 -I/usr/include/xrt npu/asr/asr_npu.cpp -lxrt_coreutil $L/libopenblasp-r0-59ffcd50.3.15.so \
 //       -Wl,-rpath,$L -lm -o ~/.npu/asr/asr_npu_cpp
-// 模型包: python -m npu.asr.export_c_bundle → ~/.npu/asr/asr_4c_bundle (只有 7 秒档 W=35; 分档见 encoder_npu --buckets)
+// 模型包: python -m npu.asr.export_c_bundle → ~/.npu/asr/asr_4c_bundle (w10 / w15 / w25 / w35)
 #include <algorithm>
 #include <cctype>
 #include <chrono>
@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <fstream>
 #include <iostream>
 #include <string>
@@ -33,17 +34,21 @@ constexpr int HOP = 160;
 constexpr int NFFT = 512;
 constexpr int CMS_WIN = 50;
 constexpr int FLAT = 3840;
-constexpr int N_CALLS = 8;
 constexpr int BR = 4;
 constexpr int PAD = 4;
 
-struct BundleHeader {
+struct CommonHeader {
     uint32_t magic;
     uint32_t vocab_sz;
-    uint32_t n_vt;
     uint32_t act_bytes;
     uint32_t s_bytes;
     uint32_t out_bytes;
+    uint32_t n_calls;
+};
+
+struct BucketHeader {
+    uint32_t W;
+    uint32_t n_vt;
     uint32_t w_bytes;
     uint32_t n_calls;
 };
@@ -106,7 +111,6 @@ bool read_wav_16k(const std::string &path, std::vector<int16_t> &pcm) {
             if (channels == 1 && sr == 16000 && bits == 16) {
                 pcm = std::move(raw);
             } else {
-                // Simple mono + linear resample fallback for non-16k WAVs
                 size_t n_in = raw.size() / std::max<uint16_t>(1, channels);
                 std::vector<float> mono(n_in);
                 for (size_t i = 0; i < n_in; i++) {
@@ -140,7 +144,24 @@ bool read_wav_16k(const std::string &path, std::vector<int16_t> &pcm) {
 
 class AsrNpuEngine {
 public:
-    bool init(const std::string &bundle_dir) {
+    struct Bucket {
+        int W = 0;
+        std::string dir;
+        xrt::hw_context ctx;
+        xrt::kernel kernel;
+        xrt::bo bo_instr;
+        uint32_t n_insts = 0;
+        uint32_t w_bytes = 0;
+        std::vector<int64_t> vt_idx;
+        std::vector<xrt::bo> bo_w;
+        int last_vt = 0;
+        bool ctx_ready = false;
+        bool weights_loaded = false;
+    };
+
+    bool init(const std::string &bundle_dir, size_t max_cached_buckets = 2) {
+        max_cached_buckets_ = std::max<size_t>(1, max_cached_buckets);
+
         // Load vocab
         {
             std::ifstream vf(bundle_dir + "/vocab.txt");
@@ -149,22 +170,19 @@ public:
             while (std::getline(vf, line)) vocab_.push_back(line);
         }
 
-        // Load weights.bin
-        std::ifstream wf(bundle_dir + "/weights.bin", std::ios::binary);
-        if (!wf) return false;
-        wf.read(reinterpret_cast<char *>(&hdr_), sizeof(hdr_));
-        if (hdr_.magic != 0x41535234) return false;
-
-        vt_idx_.resize(hdr_.n_vt);
-        wf.read(reinterpret_cast<char *>(vt_idx_.data()), hdr_.n_vt * sizeof(int64_t));
+        // Load common.bin
+        std::ifstream cf(bundle_dir + "/common.bin", std::ios::binary);
+        if (!cf) return false;
+        cf.read(reinterpret_cast<char *>(&hdr_), sizeof(hdr_));
+        if (hdr_.magic != 0x41535235) return false;
 
         auto read_f32 = [&](std::vector<float> &v, size_t n) {
             v.resize(n);
-            wf.read(reinterpret_cast<char *>(v.data()), n * sizeof(float));
+            cf.read(reinterpret_cast<char *>(v.data()), n * sizeof(float));
         };
         auto read_f64 = [&](std::vector<double> &v, size_t n) {
             v.resize(n);
-            wf.read(reinterpret_cast<char *>(v.data()), n * sizeof(double));
+            cf.read(reinterpret_cast<char *>(v.data()), n * sizeof(double));
         };
 
         read_f32(sh0_, D);
@@ -179,51 +197,43 @@ public:
         read_f64(ham_, WIN);
         read_f64(mel_mat_, (NFFT / 2) * (NCH + 1));
 
-        // Load insts.bin
-        std::vector<uint8_t> insts;
-        {
-            std::ifstream inf(bundle_dir + "/insts.bin", std::ios::binary | std::ios::ate);
-            if (!inf) return false;
-            size_t sz = inf.tellg();
-            inf.seekg(0);
-            insts.resize(sz);
-            inf.read(reinterpret_cast<char *>(insts.data()), sz);
-        }
-
-        // Init XRT device, xclbin, kernel, BOs
+        // Discover buckets (10, 15, 25, 35)
         device_ = xrt::device(0);
-        auto xclbin = xrt::xclbin(bundle_dir + "/final.xclbin");
-        auto uuid = device_.register_xclbin(xclbin);
-        ctx_ = xrt::hw_context(device_, uuid);
-        kernel_ = xrt::kernel(ctx_, "MLIR_AIE");
+        for (int W : {10, 15, 25, 35}) {
+            std::string bdir = bundle_dir + "/w" + std::to_string(W);
+            std::ifstream bf(bdir + "/bucket.bin", std::ios::binary);
+            if (!bf) continue;
+            Bucket b;
+            b.W = W;
+            b.dir = bdir;
+            b.last_vt = 4 * W;
+            buckets_.push_back(std::move(b));
+        }
+        if (buckets_.empty()) return false;
 
-        n_insts_ = static_cast<uint32_t>(insts.size() / 4);
-        bo_instr_ = xrt::bo(device_, insts.size(), XCL_BO_FLAGS_CACHEABLE, kernel_.group_id(1));
-        std::memcpy(bo_instr_.map<void *>(), insts.data(), insts.size());
-        bo_instr_.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-
-        bo_act_ = xrt::bo(device_, hdr_.act_bytes, XRT_BO_FLAGS_HOST_ONLY, kernel_.group_id(3));
-        bo_s_ = xrt::bo(device_, hdr_.s_bytes, XRT_BO_FLAGS_HOST_ONLY, kernel_.group_id(5));
-        bo_out_ = xrt::bo(device_, hdr_.out_bytes, XRT_BO_FLAGS_HOST_ONLY, kernel_.group_id(6));
-
+        // Register first bucket context so we can allocate shared act / s / out BOs
+        if (!ensure_ctx(buckets_.front())) return false;
+        const auto &k0 = buckets_.front().kernel;
+        bo_act_ = xrt::bo(device_, hdr_.act_bytes, XRT_BO_FLAGS_HOST_ONLY, k0.group_id(3));
+        bo_s_ = xrt::bo(device_, hdr_.s_bytes, XRT_BO_FLAGS_HOST_ONLY, k0.group_id(5));
+        bo_out_ = xrt::bo(device_, hdr_.out_bytes, XRT_BO_FLAGS_HOST_ONLY, k0.group_id(6));
         std::memset(bo_act_.map<void *>(), 0, hdr_.act_bytes);
         std::memset(bo_s_.map<void *>(), 0, hdr_.s_bytes);
         std::memset(bo_out_.map<void *>(), 0, hdr_.out_bytes);
         bo_act_.sync(XCL_BO_SYNC_BO_TO_DEVICE);
         bo_s_.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
-        bo_w_.resize(hdr_.n_calls);
-        for (uint32_t g = 0; g < hdr_.n_calls; g++) {
-            bo_w_[g] = xrt::bo(device_, hdr_.w_bytes, XRT_BO_FLAGS_HOST_ONLY, kernel_.group_id(4));
-            wf.read(bo_w_[g].map<char *>(), hdr_.w_bytes);
-            bo_w_[g].sync(XCL_BO_SYNC_BO_TO_DEVICE);
-        }
+        // Preload default short bucket (first bucket, e.g. w10) so first short sentence is instant
+        if (!ensure_weights(0)) return false;
 
-        // Preallocate scratch buffers for fbank/frontend/output
+        // Preallocate scratch buffers sized to max bucket (7s)
         win_f32_.resize(FRAMES_WIN * (NCH + 1));
+        xp_.assign((FRAMES_WIN + 4) * 44, 0.0f);
         w1_.resize(FRAMES_WIN * 40 * 25);
+        y1_.resize(FRAMES_WIN * 40 * 32);
         y1p_.assign((FRAMES_WIN + 2) * 46 * 32, 0.0f);
         w2_.resize(T_WIN * 40 * 49 * 32);
+        y2_.resize(T_WIN * 40 * 64);
         y2p_.assign((T_WIN + 2) * 41 * 64, 0.0f);
         w3_.resize(T_WIN * 20 * 9 * 64);
         y3_tmp_.resize(T_WIN * 20 * 192);
@@ -235,6 +245,7 @@ public:
     }
 
     struct Timings {
+        int W = 35;
         double fbank_ms = 0.0;
         double frontend_ms = 0.0;
         double npu_ms = 0.0;
@@ -246,9 +257,19 @@ public:
         using clk = std::chrono::steady_clock;
         auto t0 = clk::now();
 
-        // 1. FBank
+        // 1. Determine valid_t & bucket
         int nfr = (n_pcm >= WIN) ? (n_pcm - WIN) / HOP + 1 : 0;
         int m = std::min(nfr, FRAMES_WIN);
+        int valid_t = std::min(T_WIN, (m + 50 - 5) / 5 + 1);
+
+        size_t b_idx = select_bucket_idx(valid_t);
+        Bucket &b = buckets_[b_idx];
+        const int W = b.W;
+        const int T = 4 * W;
+        const int F = 5 * T;
+        m = std::min(m, F);
+
+        // 2. FBank (only up to F frames!)
         std::vector<double> out_raw(m * (NCH + 1));
         std::vector<double> pwr(m * (NFFT / 2));
         std::vector<double> energies(m);
@@ -269,9 +290,9 @@ public:
             fft512(re, im);
             energies[k] = e;
             double *pk = pwr.data() + k * (NFFT / 2);
-            for (int b = 0; b < NFFT / 2; b++) {
-                double rr = re[b + 1], ii = im[b + 1];
-                pk[b] = rr * rr + ii * ii;
+            for (int bin = 0; bin < NFFT / 2; bin++) {
+                double rr = re[bin + 1], ii = im[bin + 1];
+                pk[bin] = rr * rr + ii * ii;
             }
         }
         if (m > 0) {
@@ -284,7 +305,6 @@ public:
                 row[NCH] = std::log(std::max(energies[k], 1e-10));
             }
         }
-        // Sliding CMS mean
         double sum[NCH + 1] = {0};
         for (int k = 0; k < m; k++) {
             const double *row = out_raw.data() + k * (NCH + 1);
@@ -303,33 +323,33 @@ public:
             double sraw = (c == NCH) ? std::log(1e-10) : 0.0;
             sil[c] = static_cast<float>(hcnt > 0 ? (sraw - sum[c] / hcnt) : sraw);
         }
-        for (int k = m; k < FRAMES_WIN; k++) {
+        for (int k = m; k < F; k++) {
             std::memcpy(win_f32_.data() + k * (NCH + 1), sil, sizeof(sil));
         }
-        int valid_t = std::min(T_WIN, (m + 50 - 5) / 5 + 1);
         auto t1 = clk::now();
 
-        // 2. Frontend Conv1 -> Conv2 -> Conv3 -> Lin
-        std::vector<float> xp((FRAMES_WIN + 4) * 44, 0.0f);
-        for (int ti = 0; ti < FRAMES_WIN; ti++) {
-            std::memcpy(xp.data() + (ti + 2) * 44 + 2, win_f32_.data() + ti * 40, 40 * sizeof(float));
+        // 3. Frontend Conv1 -> Conv2 -> Conv3 -> Lin (scaled to F frames, T tokens!)
+        std::fill(xp_.begin(), xp_.begin() + (F + 4) * 44, 0.0f);
+        for (int ti = 0; ti < F; ti++) {
+            std::memcpy(xp_.data() + (ti + 2) * 44 + 2, win_f32_.data() + ti * 40, 40 * sizeof(float));
         }
-        for (int ti = 0; ti < FRAMES_WIN; ti++) {
+        for (int ti = 0; ti < F; ti++) {
             for (int f = 0; f < 40; f++) {
                 float *dst = w1_.data() + (ti * 40 + f) * 25;
                 for (int i = 0; i < 5; i++) {
-                    std::memcpy(dst + i * 5, xp.data() + (ti + i) * 44 + f, 5 * sizeof(float));
+                    std::memcpy(dst + i * 5, xp_.data() + (ti + i) * 44 + f, 5 * sizeof(float));
                 }
             }
         }
-        std::vector<float> y1(FRAMES_WIN * 40 * 32);
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                    FRAMES_WIN * 40, 32, 25, 1.0f, w1_.data(), 25, c1_w_.data(), 32, 0.0f, y1.data(), 32);
-        for (size_t i = 0; i < y1.size(); i++) y1[i] = std::max(y1[i], 0.0f);
-        for (int ti = 0; ti < FRAMES_WIN; ti++) {
-            std::memcpy(y1p_.data() + ((ti + 1) * 46 + 3) * 32, y1.data() + ti * 40 * 32, 40 * 32 * sizeof(float));
+                    F * 40, 32, 25, 1.0f, w1_.data(), 25, c1_w_.data(), 32, 0.0f, y1_.data(), 32);
+        for (int i = 0; i < F * 40 * 32; i++) y1_[i] = std::max(y1_[i], 0.0f);
+
+        std::fill(y1p_.begin(), y1p_.begin() + (F + 2) * 46 * 32, 0.0f);
+        for (int ti = 0; ti < F; ti++) {
+            std::memcpy(y1p_.data() + ((ti + 1) * 46 + 3) * 32, y1_.data() + ti * 40 * 32, 40 * 32 * sizeof(float));
         }
-        for (int ti = 0; ti < T_WIN; ti++) {
+        for (int ti = 0; ti < T; ti++) {
             for (int f = 0; f < 40; f++) {
                 float *dst = w2_.data() + (ti * 40 + f) * (49 * 32);
                 for (int i = 0; i < 7; i++) {
@@ -337,14 +357,15 @@ public:
                 }
             }
         }
-        std::vector<float> y2(T_WIN * 40 * 64);
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                    T_WIN * 40, 64, 49 * 32, 1.0f, w2_.data(), 49 * 32, c2_w_.data(), 64, 0.0f, y2.data(), 64);
-        for (size_t i = 0; i < y2.size(); i++) y2[i] = std::max(y2[i], 0.0f);
-        for (int ti = 0; ti < T_WIN; ti++) {
-            std::memcpy(y2p_.data() + ((ti + 1) * 41) * 64, y2.data() + ti * 40 * 64, 40 * 64 * sizeof(float));
+                    T * 40, 64, 49 * 32, 1.0f, w2_.data(), 49 * 32, c2_w_.data(), 64, 0.0f, y2_.data(), 64);
+        for (int i = 0; i < T * 40 * 64; i++) y2_[i] = std::max(y2_[i], 0.0f);
+
+        std::fill(y2p_.begin(), y2p_.begin() + (T + 2) * 41 * 64, 0.0f);
+        for (int ti = 0; ti < T; ti++) {
+            std::memcpy(y2p_.data() + ((ti + 1) * 41) * 64, y2_.data() + ti * 40 * 64, 40 * 64 * sizeof(float));
         }
-        for (int ti = 0; ti < T_WIN; ti++) {
+        for (int ti = 0; ti < T; ti++) {
             for (int f = 0; f < 20; f++) {
                 float *dst = w3_.data() + (ti * 20 + f) * (9 * 64);
                 for (int i = 0; i < 3; i++) {
@@ -353,8 +374,8 @@ public:
             }
         }
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                    T_WIN * 20, 192, 9 * 64, 1.0f, w3_.data(), 9 * 64, c3_w_.data(), 192, 0.0f, y3_tmp_.data(), 192);
-        for (int ti = 0; ti < T_WIN; ti++) {
+                    T * 20, 192, 9 * 64, 1.0f, w3_.data(), 9 * 64, c3_w_.data(), 192, 0.0f, y3_tmp_.data(), 192);
+        for (int ti = 0; ti < T; ti++) {
             for (int f = 0; f < 20; f++) {
                 for (int ch = 0; ch < 192; ch++) {
                     float v = y3_tmp_[(ti * 20 + f) * 192 + ch];
@@ -363,12 +384,12 @@ public:
             }
         }
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                    T_WIN, D, FLAT, 1.0f, y3_.data(), FLAT, lin_w_.data(), D, 0.0f, h_real_.data(), D);
+                    T, D, FLAT, 1.0f, y3_.data(), FLAT, lin_w_.data(), D, 0.0f, h_real_.data(), D);
         for (int ti = 0; ti < valid_t; ti++) {
             for (int ch = 0; ch < D; ch++) h_real_[ti * D + ch] += lin_b_[ch];
         }
-        // Quantize & write to bo_act
-        // act layout: [12, 64, 48, 16] at rows 4..7, cg 32..63, col 4..38
+
+        // Quantize & write to bo_act (4 rows × W cols)
         uint8_t *act_ptr = bo_act_.map<uint8_t *>();
         for (int ch = 0; ch < D; ch++) {
             int cg = 32 + (ch >> 4);
@@ -376,8 +397,8 @@ public:
             float inv_sh = 1.0f / sh0_[ch];
             for (int r = 0; r < 4; r++) {
                 uint8_t *dst = act_ptr + (((BR + r) * 64 + cg) * 48 + PAD) * 16 + c16;
-                for (int p = 0; p < 35; p++) {
-                    int ti = r * 35 + p;
+                for (int p = 0; p < W; p++) {
+                    int ti = r * W + p;
                     int q = 0;
                     if (ti < valid_t) {
                         q = static_cast<int>(std::lrint(h_real_[ti * D + ch] * inv_sh));
@@ -389,31 +410,31 @@ public:
         }
         auto t2 = clk::now();
 
-        // 3. NPU 8-segment execution
-        set_valid_t(valid_t);
+        // 4. NPU 8-segment execution on bucket b
+        ensure_weights(b_idx);
+        set_valid_t(b, valid_t);
         const uint8_t *out_ptr = bo_out_.map<const uint8_t *>();
         for (uint32_t g = 0; g < hdr_.n_calls; g++) {
             bo_act_.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-            auto run = kernel_(3, bo_instr_, n_insts_, bo_act_, bo_w_[g], bo_s_, bo_out_);
+            auto run = b.kernel(3, b.bo_instr, b.n_insts, bo_act_, b.bo_w[g], bo_s_, bo_out_);
             run.wait();
             bo_out_.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
             if (g + 1 < hdr_.n_calls) {
-                // Copy bo_out [4..7, 0..31, 4..38, 0..15] -> bo_act [4..7, 32..63, 4..38, 0..15]
                 for (int r = 0; r < 4; r++) {
                     for (int cg = 0; cg < 32; cg++) {
                         const uint8_t *src = out_ptr + (((BR + r) * 32 + cg) * 48 + PAD) * 16;
                         uint8_t *dst = act_ptr + (((BR + r) * 64 + (32 + cg)) * 48 + PAD) * 16;
-                        std::memcpy(dst, src, 35 * 16);
+                        std::memcpy(dst, src, W * 16);
                     }
                 }
             }
         }
         auto t3 = clk::now();
 
-        // 4. out_w + CTC greedy decode
+        // 5. out_w + CTC greedy decode
         for (int ti = 0; ti < valid_t; ti++) {
-            int r = ti / 35;
-            int p = ti % 35;
+            int r = ti / W;
+            int p = ti % W;
             float *dst = h_f32_.data() + ti * D;
             for (int cg = 0; cg < 32; cg++) {
                 const int8_t *src = reinterpret_cast<const int8_t *>(
@@ -460,6 +481,7 @@ public:
             auto ms = [](auto a, auto b) {
                 return std::chrono::duration<double, std::milli>(b - a).count();
             };
+            tm->W = W;
             tm->fbank_ms = ms(t0, t1);
             tm->frontend_ms = ms(t1, t2);
             tm->npu_ms = ms(t2, t3);
@@ -470,30 +492,89 @@ public:
     }
 
 private:
-    void set_valid_t(int valid_t) {
-        if (valid_t == last_vt_) return;
-        for (uint32_t g = 0; g < hdr_.n_calls; g++) {
-            int32_t *wp = bo_w_[g].map<int32_t *>();
-            for (int64_t idx : vt_idx_) wp[idx] = valid_t;
-            bo_w_[g].sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    size_t select_bucket_idx(int valid_t) const {
+        for (size_t i = 0; i < buckets_.size(); i++) {
+            if (4 * buckets_[i].W >= valid_t + 2) return i;
         }
-        last_vt_ = valid_t;
+        return buckets_.size() - 1;
     }
 
-    BundleHeader hdr_{};
+    bool ensure_ctx(Bucket &b) {
+        if (b.ctx_ready) return true;
+        std::vector<uint8_t> insts;
+        std::ifstream inf(b.dir + "/insts.bin", std::ios::binary | std::ios::ate);
+        if (!inf) return false;
+        size_t sz = inf.tellg();
+        inf.seekg(0);
+        insts.resize(sz);
+        inf.read(reinterpret_cast<char *>(insts.data()), sz);
+
+        auto xclbin = xrt::xclbin(b.dir + "/final.xclbin");
+        auto uuid = device_.register_xclbin(xclbin);
+        b.ctx = xrt::hw_context(device_, uuid);
+        b.kernel = xrt::kernel(b.ctx, "MLIR_AIE");
+        b.n_insts = static_cast<uint32_t>(insts.size() / 4);
+        b.bo_instr = xrt::bo(device_, insts.size(), XCL_BO_FLAGS_CACHEABLE, b.kernel.group_id(1));
+        std::memcpy(b.bo_instr.map<void *>(), insts.data(), insts.size());
+        b.bo_instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        b.ctx_ready = true;
+        return true;
+    }
+
+    bool ensure_weights(size_t idx) {
+        Bucket &b = buckets_[idx];
+        if (!ensure_ctx(b)) return false;
+        if (b.weights_loaded) {
+            auto it = std::find(lru_.begin(), lru_.end(), idx);
+            if (it != lru_.end()) { lru_.erase(it); lru_.push_back(idx); }
+            return true;
+        }
+        while (lru_.size() >= max_cached_buckets_) {
+            size_t ev = lru_.front();
+            lru_.pop_front();
+            buckets_[ev].bo_w.clear();
+            buckets_[ev].weights_loaded = false;
+        }
+        std::ifstream bf(b.dir + "/bucket.bin", std::ios::binary);
+        if (!bf) return false;
+        BucketHeader bh{};
+        bf.read(reinterpret_cast<char *>(&bh), sizeof(bh));
+        b.w_bytes = bh.w_bytes;
+        b.vt_idx.resize(bh.n_vt);
+        bf.read(reinterpret_cast<char *>(b.vt_idx.data()), bh.n_vt * sizeof(int64_t));
+        b.bo_w.resize(bh.n_calls);
+        for (uint32_t g = 0; g < bh.n_calls; g++) {
+            b.bo_w[g] = xrt::bo(device_, bh.w_bytes, XRT_BO_FLAGS_HOST_ONLY, b.kernel.group_id(4));
+            bf.read(b.bo_w[g].map<char *>(), bh.w_bytes);
+            b.bo_w[g].sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        }
+        b.last_vt = 4 * b.W;
+        b.weights_loaded = true;
+        lru_.push_back(idx);
+        return true;
+    }
+
+    void set_valid_t(Bucket &b, int valid_t) {
+        if (valid_t == b.last_vt) return;
+        for (uint32_t g = 0; g < hdr_.n_calls; g++) {
+            int32_t *wp = b.bo_w[g].map<int32_t *>();
+            for (int64_t idx : b.vt_idx) wp[idx] = valid_t;
+            b.bo_w[g].sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        }
+        b.last_vt = valid_t;
+    }
+
+    CommonHeader hdr_{};
     std::vector<std::string> vocab_;
-    std::vector<int64_t> vt_idx_;
     std::vector<float> sh0_, sh_final_, c1_w_, c2_w_, c3_w_, lin_w_, lin_b_, out_w_, out_b_;
     std::vector<double> ham_, mel_mat_;
-    std::vector<float> win_f32_, w1_, y1p_, w2_, y2p_, w3_, y3_tmp_, y3_, h_real_, h_f32_, logits_;
+    std::vector<float> win_f32_, xp_, w1_, y1_, y1p_, w2_, y2_, y2p_, w3_, y3_tmp_, y3_, h_real_, h_f32_, logits_;
 
     xrt::device device_;
-    xrt::hw_context ctx_;
-    xrt::kernel kernel_;
-    xrt::bo bo_instr_, bo_act_, bo_s_, bo_out_;
-    std::vector<xrt::bo> bo_w_;
-    uint32_t n_insts_ = 0;
-    int last_vt_ = T_WIN;
+    xrt::bo bo_act_, bo_s_, bo_out_;
+    std::vector<Bucket> buckets_;
+    std::deque<size_t> lru_;
+    size_t max_cached_buckets_ = 2;
 };
 
 } // namespace
@@ -501,17 +582,19 @@ private:
 int main(int argc, char **argv) {
     std::string bundle = std::string(std::getenv("HOME") ? std::getenv("HOME") : "") + "/.npu/asr/asr_4c_bundle";
     int iters = 1;
+    size_t cache_buckets = 2;
     std::vector<std::string> wavs;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if (a == "--bundle" && i + 1 < argc) bundle = argv[++i];
         else if (a == "--iters" && i + 1 < argc) iters = std::stoi(argv[++i]);
+        else if (a == "--cache-buckets" && i + 1 < argc) cache_buckets = std::stoul(argv[++i]);
         else wavs.push_back(a);
     }
 
     auto t_init0 = std::chrono::steady_clock::now();
     AsrNpuEngine eng;
-    if (!eng.init(bundle)) {
+    if (!eng.init(bundle, cache_buckets)) {
         std::fprintf(stderr, "Failed to init bundle from %s\n", bundle.c_str());
         return 1;
     }
@@ -526,15 +609,26 @@ int main(int argc, char **argv) {
             if (line.empty()) continue;
             if (line == "quit" || line == "exit") break;
             std::vector<int16_t> pcm;
-            if (!read_wav_16k(line, pcm)) {
+            if (line.rfind("PCM ", 0) == 0) {
+                int n_samples = std::atoi(line.c_str() + 4);
+                if (n_samples <= 0 || n_samples > 16000 * 10) {
+                    std::printf("ERR: bad PCM count %d\n", n_samples);
+                    std::fflush(stdout);
+                    continue;
+                }
+                pcm.resize(n_samples);
+                if (!std::cin.read(reinterpret_cast<char *>(pcm.data()), n_samples * sizeof(int16_t))) {
+                    break;
+                }
+            } else if (!read_wav_16k(line, pcm)) {
                 std::printf("ERR: cannot read %s\n", line.c_str());
                 std::fflush(stdout);
                 continue;
             }
             AsrNpuEngine::Timings tm;
             std::string txt = eng.recognize(pcm.data(), static_cast<int>(pcm.size()), &tm);
-            std::printf("OK %.1fms (fb=%.1f fe=%.1f npu=%.1f out=%.1f) | %s\n",
-                        tm.total_ms, tm.fbank_ms, tm.frontend_ms, tm.npu_ms, tm.out_ms, txt.c_str());
+            std::printf("OK W=%d %.1fms (fb=%.1f fe=%.1f npu=%.1f out=%.1f) | %s\n",
+                        tm.W, tm.total_ms, tm.fbank_ms, tm.frontend_ms, tm.npu_ms, tm.out_ms, txt.c_str());
             std::fflush(stdout);
         }
         return 0;
@@ -560,9 +654,9 @@ int main(int argc, char **argv) {
             txt = eng.recognize(pcm.data(), static_cast<int>(pcm.size()), &tm);
             if (tm.total_ms < best_tot) { best_tot = tm.total_ms; best_tm = tm; }
         }
-        std::printf("%-30s %6.1f ms (fb=%.1f fe=%.1f npu=%.1f out=%.1f) | %s\n",
+        std::printf("%-30s W=%2d %6.1f ms (fb=%.1f fe=%.1f npu=%.1f out=%.1f) | %s\n",
                     w.substr(w.find_last_of('/') + 1).c_str(),
-                    best_tm.total_ms, best_tm.fbank_ms, best_tm.frontend_ms,
+                    best_tm.W, best_tm.total_ms, best_tm.fbank_ms, best_tm.frontend_ms,
                     best_tm.npu_ms, best_tm.out_ms, txt.c_str());
     }
     return 0;

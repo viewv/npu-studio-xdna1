@@ -139,7 +139,7 @@ component Segment inherits Rectangle {
 component FeatureRow inherits Rectangle {
     in property <FeatureData> data;
     callback toggled(bool);
-    min-height: 48px;
+    min-height: 38px;
     HorizontalLayout {
         spacing: 10px;
         VerticalLayout {
@@ -152,9 +152,12 @@ component FeatureRow inherits Rectangle {
                     font-weight: 600;
                     color: root.data.available ? Palette.foreground : Theme.muted;
                 }
-                if root.data.tag != "": Tag {
-                    text: root.data.tag;
-                    tint: root.data.available ? Theme.npu : Theme.muted;
+                if root.data.tag != "": VerticalLayout {
+                    alignment: center;
+                    Tag {
+                        text: root.data.tag;
+                        tint: root.data.available ? Theme.npu : Theme.muted;
+                    }
                 }
                 Rectangle { }
             }
@@ -165,12 +168,74 @@ component FeatureRow inherits Rectangle {
                 wrap: word-wrap;
             }
         }
-        VerticalLayout {
+        if root.data.available: VerticalLayout {
             alignment: center;
             Switch {
-                enabled: root.data.available;
                 checked: root.data.enabled;
                 toggled => { root.toggled(self.checked); }
+            }
+        }
+    }
+}
+
+component ToolCard inherits Rectangle {
+    in property <string> title;
+    in property <string> subtitle;
+    in property <string> tech-tag;
+    in property <string> status-tag;
+    in property <color> status-tint: Theme.muted;
+    callback clicked;
+
+    border-radius: 12px;
+    border-width: 1px;
+    border-color: touch.has-hover ? Theme.npu : Theme.card-border;
+    background: touch.has-hover ? Theme.npu.with-alpha(0.06) : Theme.card;
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+
+    VerticalLayout {
+        padding: 16px;
+        spacing: 10px;
+        HorizontalLayout {
+            spacing: 8px;
+            Text { text: root.title; font-size: 15px; font-weight: 700; vertical-alignment: center; }
+            VerticalLayout {
+                alignment: center;
+                Tag { text: root.status-tag; tint: root.status-tint; }
+            }
+            Rectangle { horizontal-stretch: 1; }
+        }
+        Text {
+            text: root.subtitle;
+            font-size: 12px;
+            color: Theme.muted;
+            wrap: word-wrap;
+        }
+        Rectangle { vertical-stretch: 1; min-height: 4px; }
+        HorizontalLayout {
+            height: 30px;
+            spacing: 8px;
+            VerticalLayout {
+                alignment: center;
+                Tag { text: root.tech-tag; tint: Theme.npu; }
+            }
+            Rectangle { horizontal-stretch: 1; }
+            Rectangle {
+                width: 78px;
+                height: 30px;
+                border-radius: 8px;
+                background: touch.has-hover ? Theme.npu : Theme.npu.with-alpha(0.14);
+                Text {
+                    text: "进入 →";
+                    font-size: 12px;
+                    font-weight: 700;
+                    color: touch.has-hover ? #ffffff : Theme.npu;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
             }
         }
     }
@@ -278,19 +343,117 @@ export component AppWindow inherits Window {
     in property <bool> vcam-autoload;
     in property <bool> vcam-busy;
 
+    // ---- 导航页签: 0 工具箱首页, 1 背景虚化, 2 实时语音转写 ----
+    in-out property <int> active-tab: 0;
+
+    // ---- 实时语音转写 ----
+    in-out property <int> asr-backend: 0; // 0 NPU C++ 四档, 1 CPU Python
+    in-out property <bool> asr-active: false;
+    in-out property <string> asr-status: "未开启";
+    in-out property <string> asr-bucket: "–";
+    in-out property <string> asr-ms: "–";
+    in-out property <string> asr-text;
+    in-out property <string> asr-partial;
+
     callback start-stop();
     callback settings-changed();
     callback pick-image();
     callback load-vcam();
+    callback unload-vcam();
     callback setup-autoload();
     callback feature-toggled(int, bool);
+    callback asr-start-stop();
+    callback asr-clear();
 
     property <bool> locked: root.run-state == 1 || root.run-state == 3;
     property <bool> running: root.run-state == 2;
 
-    HorizontalLayout {
+    VerticalLayout {
         padding: 16px;
-        spacing: 16px;
+        spacing: 12px;
+
+        // ================= 顶部 Toolbox 导航栏 =================
+        HorizontalLayout {
+            spacing: 12px;
+            HorizontalLayout {
+                spacing: 10px;
+                Image {
+                    source: @image-url("../assets/npu-studio.svg");
+                    width: 34px;
+                    height: 34px;
+                }
+                VerticalLayout {
+                    alignment: center;
+                    Text { text: "NPU Studio"; font-size: 18px; font-weight: 800; }
+                    Text { text: "Ryzen AI NPU 工具箱"; font-size: 11px; color: Theme.muted; }
+                }
+            }
+            Rectangle { horizontal-stretch: 1; }
+            HorizontalLayout {
+                width: 380px;
+                spacing: 4px;
+                Segment {
+                    text: "工具箱";
+                    selected: root.active-tab == 0;
+                    clicked => { root.active-tab = 0; }
+                }
+                Segment {
+                    text: root.running ? "背景虚化 ●" : "背景虚化";
+                    selected: root.active-tab == 1;
+                    clicked => { root.active-tab = 1; }
+                }
+                Segment {
+                    text: root.asr-active ? "语音转写 ●" : "语音转写";
+                    selected: root.active-tab == 2;
+                    clicked => { root.active-tab = 2; }
+                }
+            }
+        }
+
+        // ================= Tab 0: 工具箱首页 =================
+        if root.active-tab == 0: VerticalLayout {
+            vertical-stretch: 1;
+            spacing: 14px;
+
+            HorizontalLayout {
+                height: 146px;
+                spacing: 14px;
+                ToolCard {
+                    horizontal-stretch: 1;
+                    title: "背景虚化虚拟摄像头";
+                    subtitle: "实时人像分割 + 背景虚化 / 换图 / 绿幕，输出到 v4l2loopback 虚拟摄像头。";
+                    tech-tag: "NPU / GPU / CPU";
+                    status-tag: root.running ? "运行中" : "未运行";
+                    status-tint: root.running ? Theme.ok : Theme.muted;
+                    clicked => { root.active-tab = 1; }
+                }
+                ToolCard {
+                    horizontal-stretch: 1;
+                    title: "实时语音转写 (ASR)";
+                    subtitle: "麦克风实时流式上屏，支持 NPU 4 核四档分档 (137–320ms) 与 CPU 后端对比。";
+                    tech-tag: "NPU C++ / CPU";
+                    status-tag: root.asr-active ? root.asr-status : "未开启";
+                    status-tint: root.asr-active ? Theme.ok : Theme.muted;
+                    clicked => { root.active-tab = 2; }
+                }
+            }
+
+            Card {
+                title: "实验室 / 更多功能";
+                subtitle: "后续会陆续加入更多在 NPU 上运行的独立工具模块。";
+                for f[i] in root.features: FeatureRow {
+                    data: f;
+                    toggled(v) => { root.feature-toggled(i, v); }
+                }
+            }
+
+            Rectangle { vertical-stretch: 1; }
+        }
+
+        // ================= Tab 1: 背景虚化摄像头 =================
+        if root.active-tab == 1: HorizontalLayout {
+            vertical-stretch: 1;
+            spacing: 16px;
 
         // ================= 左栏: 设置 =================
         ScrollView {
@@ -299,20 +462,6 @@ export component AppWindow inherits Window {
                 spacing: 12px;
                 padding-right: 8px;
 
-                // 标题 + 开关
-                HorizontalLayout {
-                    spacing: 10px;
-                    Image {
-                        source: @image-url("../assets/npu-studio.svg");
-                        width: 36px;
-                        height: 36px;
-                    }
-                    VerticalLayout {
-                        alignment: center;
-                        Text { text: "NPU Studio"; font-size: 20px; font-weight: 800; }
-                        Text { text: "Ryzen AI 背景虚化虚拟摄像头"; font-size: 11px; color: Theme.muted; }
-                    }
-                }
                 StartButton {
                     state: root.run-state;
                     clicked => { root.start-stop(); }
@@ -359,10 +508,12 @@ export component AppWindow inherits Window {
                     title: "抠像模型";
                     subtitle: "决定人物边缘的精细程度。运行中切换会自动重启。";
                     BackendOption {
-                        label: "RVM · 核显";
+                        label: "RVM · 硬件加速";
                         tag: "推荐";
-                        hint: root.rvm-gpu-available ? "头发丝级边缘 · 不拖影 · 跑在 780M 核显上"
-                            : "需先生成 worker 和模型, 见 README";
+                        hint: !root.rvm-gpu-available ? "需先生成 worker 和模型, 见 README"
+                            : root.backend == 0 ? "头发丝级边缘 · 不拖影 · 随上方后端跑在 NPU 上"
+                            : root.backend == 3 ? "头发丝级边缘 · 不拖影 · 将回退到 CPU"
+                            : "头发丝级边缘 · 不拖影 · 随上方后端跑在 780M 核显上";
                         selected: root.matting == 1;
                         available: root.rvm-gpu-available;
                         locked: root.locked;
@@ -484,14 +635,6 @@ export component AppWindow inherits Window {
                     }
                 }
 
-                Card {
-                    title: "更多功能";
-                    subtitle: "后续会陆续加入更多在 NPU 上运行的功能。";
-                    for f[i] in root.features: FeatureRow {
-                        data: f;
-                        toggled(v) => { root.feature-toggled(i, v); }
-                    }
-                }
             }
         }
 
@@ -632,6 +775,15 @@ export component AppWindow inherits Window {
                             clicked => { root.load-vcam(); }
                         }
                     }
+                    if root.vcam-device != "": VerticalLayout {
+                        alignment: center;
+                        horizontal-stretch: 0;
+                        Button {
+                            text: "卸载";
+                            enabled: !root.vcam-busy && !root.running && !root.locked;
+                            clicked => { root.unload-vcam(); }
+                        }
+                    }
                     if !root.vcam-autoload: VerticalLayout {
                         alignment: center;
                         horizontal-stretch: 0;
@@ -639,6 +791,111 @@ export component AppWindow inherits Window {
                             text: "开机自动加载";
                             enabled: !root.vcam-busy;
                             clicked => { root.setup-autoload(); }
+                        }
+                    }
+                }
+            }
+        }
+        }
+
+        // ================= Tab 2: 实时语音转写 =================
+        if root.active-tab == 2: HorizontalLayout {
+            vertical-stretch: 1;
+            spacing: 16px;
+
+            VerticalLayout {
+                width: 360px;
+                spacing: 12px;
+
+                Button {
+                    height: 44px;
+                    text: root.asr-active ? "停止监听" : "开始实时转写";
+                    primary: !root.asr-active;
+                    clicked => { root.asr-start-stop(); }
+                }
+
+                Card {
+                    title: "语音识别后端";
+                    subtitle: "可切换 NPU 或 CPU 实现，运行中切换会先停止当前监听。";
+                    BackendOption {
+                        label: "NPU · 4 核四档 (C++)";
+                        tag: "推荐";
+                        hint: "2/3/5/7 秒自动分档 · 137–320 ms · 不占 CPU";
+                        selected: root.asr-backend == 0;
+                        locked: root.asr-active;
+                        clicked => { root.asr-backend = 0; }
+                    }
+                    BackendOption {
+                        label: "CPU · Python 参考";
+                        hint: "OpenBLAS 浮点参考 · 无需 NPU · 约 1.1 s";
+                        selected: root.asr-backend == 1;
+                        locked: root.asr-active;
+                        clicked => { root.asr-backend = 1; }
+                    }
+                }
+
+                GridLayout {
+                    spacing: 8px;
+                    Row {
+                        StatTile {
+                            label: "当前档位";
+                            value: root.asr-bucket;
+                            unit: "";
+                            accent: root.asr-active ? Theme.npu : Palette.foreground;
+                        }
+                        StatTile {
+                            label: "端到端耗时";
+                            value: root.asr-ms;
+                            unit: "ms";
+                            accent: root.asr-active ? Theme.ok : Palette.foreground;
+                        }
+                    }
+                }
+
+                Rectangle { vertical-stretch: 1; }
+            }
+
+            Card {
+                horizontal-stretch: 1;
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text { text: "实时识别输出"; font-size: 15px; font-weight: 700; vertical-alignment: center; }
+                    VerticalLayout {
+                        alignment: center;
+                        Tag {
+                            text: root.asr-status;
+                            tint: root.asr-active ? Theme.ok : Theme.muted;
+                        }
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                    VerticalLayout {
+                        alignment: center;
+                        Button {
+                            text: "清空";
+                            clicked => { root.asr-clear(); }
+                        }
+                    }
+                }
+                ScrollView {
+                    vertical-stretch: 1;
+                    VerticalLayout {
+                        spacing: 8px;
+                        if root.asr-text != "": Text {
+                            text: root.asr-text;
+                            font-size: 15px;
+                            wrap: word-wrap;
+                        }
+                        if root.asr-partial != "": Text {
+                            text: root.asr-partial;
+                            font-size: 15px;
+                            color: Theme.npu;
+                            wrap: word-wrap;
+                        }
+                        if root.asr-text == "" && root.asr-partial == "": Text {
+                            text: root.asr-active ? "请对着麦克风说话，识别结果会实时显示在这里…" : "点击左侧「开始实时转写」后，对着麦克风说话即可实时上屏。";
+                            font-size: 13px;
+                            color: Theme.muted;
+                            wrap: word-wrap;
                         }
                     }
                 }

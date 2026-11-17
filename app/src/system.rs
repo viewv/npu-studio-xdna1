@@ -121,6 +121,11 @@ pub fn load_loopback() -> Result<(), String> {
     ])
 }
 
+/// 卸载 v4l2loopback (会弹出系统授权窗口)
+pub fn unload_loopback() -> Result<(), String> {
+    pkexec(&["modprobe", "-r", "v4l2loopback"])
+}
+
 /// 写入开机自动加载配置, 并立即加载一次
 pub fn setup_autoload() -> Result<(), String> {
     let script = format!(

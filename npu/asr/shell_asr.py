@@ -65,7 +65,101 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="NPU ASR 极简 Shell 前端")
     ap.add_argument("--wav", type=Path, help="直接识别指定 WAV 文件并退出")
     ap.add_argument("--16c", dest="use_16c", action="store_true", help="使用 16核实验执行器 (默认使用稳定 4核)")
+    ap.add_argument("--cpp", action="store_true", help="使用 C++ 四档常驻后端 (~/.npu/asr/asr_npu_cpp, 0.7s 启动, 137-320ms)")
+    ap.add_argument("--cpu-daemon", action="store_true", help="CPU 参考模式常驻守护 (stdin PCM 协议)")
     args = ap.parse_args()
+
+    if args.cpu_daemon:
+        import sys
+        from npu.asr.reference import fbank as cpu_fbank, forward as cpu_forward
+        z = dict(np.load(NPZ))
+        vocab = [l.split()[1] if len(l.split()) >= 2 else "" for l in (MODEL / "dict.decoder.utf8.txt").read_text().splitlines()]
+        print("READY", flush=True)
+        while True:
+            hdr = sys.stdin.buffer.readline()
+            if not hdr:
+                break
+            line = hdr.decode("utf-8", errors="ignore").strip()
+            if not line:
+                continue
+            if line in ("quit", "exit"):
+                break
+            if line.startswith("PCM "):
+                n_samples = int(line[4:])
+                raw = sys.stdin.buffer.read(n_samples * 2)
+                if len(raw) < n_samples * 2:
+                    break
+                pcm = np.frombuffer(raw, dtype=np.int16)
+            else:
+                pcm = _load_pcm_16k(Path(line))
+            t0 = time.perf_counter()
+            frames = cpu_fbank(pcm)
+            ids = cpu_forward(frames, z, int_path=False)
+            got = text(ids.astype(np.uint32), vocab)
+            ms = (time.perf_counter() - t0) * 1e3
+            print(f"OK W=CPU {ms:.1f}ms | {got}", flush=True)
+        return 0
+
+    if args.cpp:
+        cpp_bin = Path.home() / ".npu" / "asr" / "asr_npu_cpp"
+        if not cpp_bin.exists():
+            raise RuntimeError(f"未找到 C++ 后端: {cpp_bin}")
+        print("[shell-asr] 正在启动 C++ 四档常驻后端...", flush=True)
+        cpp = subprocess.Popen(
+            [str(cpp_bin)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1,
+        )
+        assert cpp.stdout is not None and cpp.stdin is not None
+        while True:
+            line = cpp.stdout.readline()
+            if not line:
+                raise RuntimeError("C++ 后端启动失败")
+            line = line.strip()
+            if line == "READY":
+                break
+            print(line, flush=True)
+        if args.wav:
+            cpp.stdin.write(f"{args.wav}\nquit\n")
+            cpp.stdin.flush()
+            print(cpp.stdout.readline().strip())
+            cpp.wait()
+            return 0
+        print("\n=== NPU C++ 四档语音输入测试 (16kHz, 2/3/5/7s 自动分档) ===")
+        print("操作: 直接按 [Enter] 开始录音 → 再按 [Enter] 停止并识别 | 输入 q 回车退出\n")
+        with tempfile.TemporaryDirectory() as td:
+            wav_path = Path(td) / "rec.wav"
+            while True:
+                try:
+                    cmd = input("▶ 按 [Enter] 开始录音 (q 退出): ").strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    print()
+                    break
+                if cmd == "q":
+                    break
+                proc = subprocess.Popen(_record_cmd(wav_path), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                t_rec = time.perf_counter()
+                try:
+                    input("🎙  录音中... 按 [Enter] 结束录音: ")
+                except (EOFError, KeyboardInterrupt):
+                    print()
+                finally:
+                    proc.send_signal(signal.SIGINT)
+                    try:
+                        proc.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait()
+                dur = time.perf_counter() - t_rec
+                if not wav_path.exists() or wav_path.stat().st_size < 1000:
+                    print("⚠️  录音过短或失败，请重试。\n")
+                    continue
+                cpp.stdin.write(f"{wav_path}\n")
+                cpp.stdin.flush()
+                resp = cpp.stdout.readline().strip()
+                print(f"📝 [按键 {dur:.2f}s] {resp}\n")
+        cpp.stdin.write("quit\n")
+        cpp.stdin.flush()
+        cpp.wait()
+        return 0
 
     mode = "16核" if args.use_16c else "4核"
     print(f"[shell-asr] 正在加载缓存权重与预热 {mode} NPU...", flush=True)

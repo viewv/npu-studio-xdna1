@@ -3,6 +3,7 @@
 //! 界面 (Slint) ── 启动/停止、参数 ──▶ Python 引擎 (python -m studio --status-json)
 //!          ◀── JSON 状态行 / 共享内存预览 ──
 
+mod asr;
 mod engine;
 mod preview;
 mod settings;
@@ -63,6 +64,7 @@ struct App {
     settings: Settings,
     cameras: Vec<(String, String)>,
     engine: Option<Engine>,
+    asr_engine: Option<asr::AsrEngine>,
     next_id: u64,
     restart_pending: bool,
     restart_timer: slint::Timer,
@@ -295,6 +297,9 @@ fn refresh_vcam(ui: &AppWindow) {
 fn quit() {
     with_app(|app, _ui| {
         app.restart_pending = false;
+        if let Some(mut a) = app.asr_engine.take() {
+            a.stop();
+        }
         if let Some(e) = &app.engine {
             e.stop();
             // 等引擎释放摄像头并还原设置 (最多 4 秒)
@@ -366,6 +371,7 @@ fn main() -> Result<(), slint::PlatformError> {
         settings,
         cameras,
         engine: None,
+        asr_engine: None,
         next_id: 0,
         restart_pending: false,
         restart_timer: slint::Timer::default(),
@@ -409,6 +415,30 @@ fn main() -> Result<(), slint::PlatformError> {
         });
     });
 
+    ui.on_asr_start_stop(|| {
+        with_app(|app, ui| {
+            if let Some(mut a) = app.asr_engine.take() {
+                a.stop();
+                ui.set_asr_active(false);
+                ui.set_asr_partial("".into());
+                ui.set_asr_status("已停止".into());
+            } else {
+                let backend = asr::AsrBackend::from_index(ui.get_asr_backend());
+                app.asr_engine = Some(asr::AsrEngine::start(ui.as_weak(), backend));
+                ui.set_asr_active(true);
+            }
+        });
+    });
+
+    ui.on_asr_clear(|| {
+        with_app(|_, ui| {
+            ui.set_asr_text("".into());
+            ui.set_asr_partial("".into());
+            ui.set_asr_bucket("–".into());
+            ui.set_asr_ms("–".into());
+        });
+    });
+
     ui.on_pick_image(|| {
         run_blocking(
             || {
@@ -446,6 +476,7 @@ fn main() -> Result<(), slint::PlatformError> {
         });
     };
     ui.on_load_vcam(move || vcam_action(system::load_loopback));
+    ui.on_unload_vcam(move || vcam_action(system::unload_loopback));
     ui.on_setup_autoload(move || vcam_action(system::setup_autoload));
 
     // 预览刷新 (约 25 fps 轮询, 引擎写入 15 fps)
