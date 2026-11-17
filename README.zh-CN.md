@@ -97,6 +97,7 @@ g++ -O3 -std=c++17 -I/usr/include/xrt npu/asr/asr_npu.cpp -lxrt_coreutil \
 ## 开发者与 Agent 说明
 
 - NPU 内核开发规则与硬件限制：[`AGENTS.md`](AGENTS.md) / [`CLAUDE.md`](CLAUDE.md) / [`.claude/skills/npu-dev/SKILL.md`](.claude/skills/npu-dev/SKILL.md)
+- 可复用 XDNA1 AIE2 C16 内核与算子链库说明：[`docs/kernel-library.md`](docs/kernel-library.md)
 - ASR NPU 详细性能拆解与瓶颈记录：[`docs/asr-npu.md`](docs/asr-npu.md)
 
 ## 开源协议

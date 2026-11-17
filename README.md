@@ -97,6 +97,7 @@ This builds the release binary (`app/target/release/npu-studio`) and installs th
 ## Documentation for Contributors & Agents
 
 - Architecture & hard constraints for NPU kernel development: [`AGENTS.md`](AGENTS.md) / [`CLAUDE.md`](CLAUDE.md) / [`.claude/skills/npu-dev/SKILL.md`](.claude/skills/npu-dev/SKILL.md)
+- Reusable XDNA1 AIE2 C16 Kernel & Chain Library reference: [`docs/kernel-library.md`](docs/kernel-library.md)
 - Detailed ASR NPU benchmarks & bottleneck analysis: [`docs/asr-npu.md`](docs/asr-npu.md)
 
 ## License
