@@ -1,344 +1,100 @@
-# npu-studio-effects
+# NPU Studio — Experimental Ryzen AI (7840HS / XDNA1) Desktop Toolbox
 
-Linux 上的「Windows Studio Effects」：摄像头背景虚化 / 替换，输出成虚拟摄像头，
-任何会议软件（浏览器、Zoom、Teams、OBS）都能直接选用。
+**English** | [简体中文](README.zh-CN.md)
 
-目标硬件：AMD Ryzen 7040 (Phoenix, XDNA NPU)。分阶段把计算从 CPU 挪到 NPU：
+> **Experimental Project Notice**: This repository is a personal experimental playground exploring what AMD's first-generation Ryzen AI NPU can actually do on Linux. The implemented tools work in day-to-day use, but rough edges, hardware-specific quirks, and sharp corners are expected — there is no guarantee of perfection.
 
-| 阶段 | 内容 | 状态 |
+---
+
+## Why This Exists
+
+The **AMD Ryzen 7 7840HS** ("Phoenix") shipped with AMD's first-generation **XDNA1 (AIE2)** NPU (~10 TOPS). As AMD quickly moved on to Hawk Point and Strix Point (XDNA2), this early Phoenix NPU received minimal ecosystem support. On Windows, it at least powered basic *Windows Studio Effects* (background blur, etc.); on Linux — even after the `amdxdna` driver was upstreamed into the Linux `accel` subsystem (around kernel 6.14+) — almost no consumer desktop software used it. Many Linux users joked that it was just an idle "silicon heater" (`电阻丝`) and disabled it in BIOS.
+
+With AI-assisted kernel and compiler engineering (`mlir-aie` / IRON + XRT + `amdxdna`), this project explores a simple question: **can this early XDNA1 NPU actually run practical real-time workloads on Linux and offload CPU/GPU?**
+
+It turns out it can — here are two working end-to-end tools built directly on custom AIE2 C++ tile kernels (`aie::mmul<4,8,8>`, fixed-point LayerNorm, LUT GELU, Attention) and a Rust + Slint desktop UI.
+
+---
+
+## Implemented Modules
+
+### 1. Background Blur & Virtual Camera (`studio/` + `npu/rvm/`)
+- Real-time portrait segmentation (**RVM MobileNetV3 int8** or **MediaPipe**) + background blur / custom image / green screen.
+- Outputs to `v4l2loopback` (`NPU Studio Camera`) for Zoom, OBS, and browsers (tested with Flatpak Zoom; supports one-click **Load / Unload / Autoload** in the UI).
+- Switchable compute backends: **NPU**, **GPU (Mesa rusticl / ROCm OpenCL on Radeon 780M)**, or **CPU**.
+
+### 2. Real-time 40-Layer Transformer Speech Recognition (`npu/asr/`)
+- Full 40-layer quantized int8 Transformer acoustic model running on 4-core NPU (`max_diff == 0` bit-exact against numpy integer reference, `CER 0%` on test samples).
+- Standalone **C++ XRT + OpenBLAS** streaming daemon (`npu/asr/asr_npu.cpp`) with zero Python runtime overhead:
+  - **Cold start**: `0.67–0.95 s`
+  - **Auto 4-bucket sizing (2s / 3s / 5s / 7s)**:
+    - `W=10` (≤2s): **`136.7 ms`** end-to-end (`fb=0.7 / fe=4.1 / npu=130.2 / out=1.7 ms`)
+    - `W=15` (≤3s): **`159.5 ms`** end-to-end
+    - `W=25` (≤5s): **`219.4 ms`** end-to-end
+    - `W=35` (≤7s): **`320.0 ms`** end-to-end
+- Also includes a CPU reference backend (`OpenBLAS float32`) in the GUI for direct comparison.
+
+### 3. NPU Studio Desktop Toolbox (`app/`)
+- Built with **Rust + Slint 1.18**.
+- Modular **Toolbox** navigation: *Toolbox Overview*, *Background Blur*, and *Live Speech Recognition (ASR)*.
+- Built-in **English / 中文** language switch (persisted in `~/.config/npu-studio/settings.json`).
+
+---
+
+## Tested Environment & Dependency Versions
+
+All results and builds in this repository were verified on the following stack:
+
+| Component | Tested Version | Notes |
 |---|---|---|
-| 1 | 人像分割 (MediaPipe ONNX) + 背景模糊/合成, 全部 CPU | ✅ 可用 |
-| 2 | 全分辨率的 放大 + 导向滤波遮罩 + 合成 换成 NPU 融合内核 (IRON) | ✅ 可用 (`--npu`) |
-| 3 | 抠像换成 RVM（时序记忆、头发丝边缘）：RVM 跑在 780M，合成仍在 NPU | ✅ 可用 (`--matting rvm --rvm-gpu --npu`) |
+| **APU / NPU** | AMD Ryzen 7 7840HS (Phoenix) | 1st-gen XDNA1 AIE2 NPU (~10 TOPS) + Radeon 780M |
+| **Linux Kernel** | `7.4.0-rc2-1-cachyos-rc` | With `amdxdna` kernel driver |
+| **XRT** | `1:2.21.75-14` | Xilinx Runtime |
+| **XRT XDNA Plugin** | `1:2.21.75-2.1` | `xrt-plugin-amdxdna` |
+| **MLIR-AIE (IRON)** | `1.3.4` | Python AIE2 compiler/runtime |
+| **Python** | `3.14.10` | With `numpy 2.5.4`, `opencv-python-headless 5.0.0.93` |
+| **BLAS** | `OpenBLAS` (`libopenblasp` / `cblas 3.12.1`) | Required for fast C++ ASR frontend & `out_w` |
+| **Virtual Camera** | `v4l2loopback-dkms 0.15.4-2` | Loaded with `exclusive_caps=1` |
+| **Desktop GUI** | `rustc 1.99.1`, `slint 1.18` | Compiled with `cargo build --release` |
 
-## NPU 后端 (`--npu`)
+---
 
-CPU 只做 1/4 分辨率 (320×180) 的计算：遮罩平滑、导向滤波系数、无光晕模糊；
-全分辨率 (1280×720) 的逐像素工作由一个 NPU 融合内核
-[`npu/kernels/fused_composite.cc`](npu/kernels/fused_composite.cc) 一次完成：
+## Build & Installation
 
-```
-原图一行 (BGRA) + 低分辨率 A/B/背景行
-  → 拆通道算灰度 → A、B、背景水平 ×4 双线性放大 → 遮罩 = A·(I−128)+B (定点)
-  → 遮罩扩展到 4 通道 → alpha 合成 → 输出一行
-```
-
-全部用 2 路 `interleave_zip/unzip` 向量操作, 每次迭代 32 像素; 4 列 NPU 并行, 每列处理 180 行。
-
-垂直方向的 ×4 也在 NPU 上（`fusedCompositeLineV`）：CPU 只写 H/4 + 2 行低分辨率数据，
-每列一个 core 用 3 行滑动窗口的 ObjectFifo（acquire 3 / release 1），一个窗口产出 4 行输出。
-720p 4 列、1080p 3 列（每列行数要是 4 的倍数），与 numpy 参考逐字节一致。
-实测只省 ~0.3 ms/帧 CPU（cv2 的垂直 resize 本来就便宜），NPU 时间 +0.4 ms。
-
-| 实测 (7840HS, 720p) | CPU 后端 | NPU 后端 |
-|---|---|---|
-| 全分辨率阶段 | ~10 ms | **1.6 ms** (NPU, 含同步) |
-| 合成总计 (含 CPU 低分辨率准备) | 10.3 ms | 8.0 ms (CPU 5.6 + NPU 2.0) |
-| **进程 CPU 时间 / 帧** | 122 ms | **70 ms (−43%)** |
-| 与 CPU 版输出差异 | — | 平均 1.2/255, PSNR 46 dB |
-
-NPU 版的主要收益是**省 CPU**（OpenCV 在全分辨率上的多线程运算被整段卸掉了），帧率仍受摄像头限制。
-
-### 分辨率
-
-NPU 合成内核在下面两个尺寸上做过逐字节验证，其他尺寸会被拒绝：
-
-| 分辨率 | NPU 合成 |
-|---|---|
-| 1280×720 | ✅ 1.4 ms，与 numpy 参考逐字节一致 |
-| 1920×1080 | ✅ 2.9 ms，与 numpy 参考逐字节一致 |
-
-1080p 以前是错的（23% 像素错，固定在 x%4∈{0,1} 的 lane），根因是 **llvm-aie 的 AIE2 后端**：
-"基址 + 编译期常量偏移"的非对齐向量加载，偏移 ≥ 1024 字节时被折成 post-increment
-（`vlda wl6, [p2], #1056`，先用基址加载、后加偏移），于是 `up4_i16(bq, …)` 的 v[j-1] 读到了
-Aq 平面。v[j-1] 只在权重 wp={3,1,0,0} 的 lane 0、1 起作用，所以只错这两类 lane。
-1280 宽时 Bq 偏移 704 B 刚好躲过，1920 时 ≥ 1024 B 就挂（探针实测 992 B 对、1024 B 起错，
-与迭代次数、流水线 pragma 都无关）。
-
-绕过：平面偏移一律用 `rowops::plane_stride()` 取成运行时值（一次 volatile 读），见
-[`npu/lib/row_ops.h`](npu/lib/row_ops.h) 文件头。720p 仍是默认：它是会议软件的主流发送分辨率，
-而且 1080p 下 CPU 侧的解码/准备也更贵。`NPU_ALLOW_UNVERIFIED=1` 可放行未验证的尺寸，仅限实验。
-
-**规则**：改内核、改 `npu/lib/*.h`、改 harness、改分辨率、换编译器版本之后，都要跑一键回归再发布——"上次是好的"不算数：
-
+### 1. Verify NPU Kernels
 ```bash
-source npu/env.sh && python -m npu.check        # 约 20 s; --quick 只测 720p
-```
-
-它会清 JIT 缓存，逐字节自检 fused / fused-v / rvm_tail 在 720p 与 1080p 上的结果，
-再跑编译器探针（`npu/offset_probe.py`）：报告常量偏移 bug 是否仍在、`plane_stride` 绕过是否有效。
-全部 ✅ 退出码为 0。
-
-## 可复用的内核骨架
-
-阶段 2 的融合内核被拆成了三块，后面任何"逐行"的 NPU 内核都直接复用：
-
-| 文件 | 作用 |
-|---|---|
-| [`npu/harness.py`](npu/harness.py) | `RowPipeline`：把行内核铺到 n_cols 个 core 上，负责 FIFO、按列切段、fill/drain、`stack_size` |
-| [`npu/lib/row_ops.h`](npu/lib/row_ops.h) | 设备端算子：×4 水平放大（int16 / BGRA）、通道拆分与重组、灰度、mask 扩展、alpha 合成 |
-| [`npu/kernels/fused_composite.cc`](npu/kernels/fused_composite.cc) | 消费者 1：全分辨率合成（与 numpy 参考逐字节一致） |
-| [`npu/kernels/rvm_tail.cc`](npu/kernels/rvm_tail.cc) | 消费者 2：RVM 尾部融合（实验，见下） |
-
-新增一个行内核只需要：
-
-1. 在 `npu/kernels/` 写一个 `void myLine(输入行..., 输出行, 标量...)`，开头 `rowops::init()`；
-2. 用 `external_row_kernel("myLine", SRC, [in_row_ty...], out_row_ty, scalars=[np.int32], include_dirs=[KERNEL_INC, LIB])` 建 `ExternalFunction`；
-3. `pl = RowPipeline(kern, [输入行字节...], 输出行字节, height=H, n_cols=4, extra_args=[width]); pl.build()`；
-4. `with rt.sequence(*pl.tensor_types()) as bufs: pl.stream(rt, bufs)`；
-5. 主机侧仿照 `FusedCompositor` 管理缓冲区（直接 `iron.zeros(...).data.reshape(...)` 拿 numpy 视图，零拷贝写入）。
-
-两个必须知道的坑：
-
-- **JIT 缓存**：缓存键只看内核 `.cc` 的 mtime 和编译参数，改 `row_ops.h` / `harness.py` 不会失效，会静默跑旧二进制。改完执行 `rm -rf ~/.npu/cache/*`。症状是"改了代码结果不变"。
-- **Worker 栈**：默认只有 1 KB。内核里同时活着的向量多（比如 8 个 int16 平面）会溢出，而且不报错，只是结果错乱。用 `RowPipeline(..., stack_size=8192)`。上限大约 16 KB（再大资源分配会失败）。
-- **常量平面偏移**：一行里多个平面（Aq/Bq/bg、P0..P3…）的指针不能写成 `base + 编译期常量`，偏移 ≥ 1024 B 时 llvm-aie 会读错平面，而且不报错。用 `rowops::plane_stride(N)` 取成运行时值（见「分辨率」）。
-
-## RVM 尾部融合（实验，未接入）
-
-`npu/rvm/tail.py` 把 RVM ONNX 图最后一段（两个 4 通道全分辨率 `Resize` + 乘加 + `Split`/`Clip`）
-压成一个 NPU 行扫描，输入只有 1/4 分辨率的两个 4 通道张量（720p 每帧 ~1.8 MB，而不是 ~24 MB fp32）：
-
-```
-fgr_c = clamp((P_c·src_c + Q_c·255) >> 8 + src_c)
-pha   = clamp((P_3·g     + Q_3·255) >> 8)          g = (B+G+R)/3
-out   = (fgr·pha + up(bg)·(255-pha)) >> 8
-```
-
-当前状态：**1280×720 / 1920×1080 都与整数参考逐字节一致**（`python -m npu.rvm.tail`，
-720p NPU 2.7 ms）。以前每 4 个输出像素里第 0、1 个错，和 1080p 合成是同一个编译器 bug
-（P2 以后的平面偏移 ≥ 1408 B，被丢掉后读到了 P0，见上面「分辨率」）；
-当时怀疑的"acc32→uint8 规约"和"跨迭代存活向量上限"都不是原因，`plane_stride()` 绕过之后
-不需要拆成多遍。
-
-还没接进 studio，原因不再是正确性：
-
-- 它要的是带 refiner 的 RVM 部署（全分辨率 src 进模型），而现在只取 320×180 的 `pha`；
-- 主机侧还要把 8 个平面垂直插值到全高度（selftest 里主机侧约 2–3 ms/帧），比现在的导向滤波路径更费 CPU。
-  先把垂直插值挪进 NPU（DMA 行重复）再考虑接入。收益主要是画质（前景去色溢、学到的边缘），不是省 CPU。
-
-
-### 功耗测量
-
-两把尺子，都以**整包 PPT**（`amdgpu/power1_average`，含 CPU+iGPU+NPU）为准：
-
-```bash
-python powerbench.py  --backends cpu,npu --secs 60     # 端到端: 各后端的整机瓦数
-python powerbench_conv.py --secs 20 --rounds 2          # 微基准: 同一份卷积的 ms / W / J/帧
-python powerbench.py --backends rvm-npu,rvm-npu-noprep  # RVM@780M + NPU, 以及"CPU 准备全部去掉"的上限
-```
-
-`rvm-npu-noprep` 设了 `NPU_PREP_ORACLE=1`：低分辨率准备只算第一帧、之后复用（画面会冻住），
-用来量"把准备全部搬走最多能省多少"。桌面在用时 PPT 漂移很大（同一配置前后差 5 W），
-分开跑的几分钟对比不可信；要用同一进程内每 15 s 交替开关、成对相减的办法。
-在 performance 调度下实测（16 对）：去掉准备 CPU 11.3 → 6.8 ms/帧，整包 **−1.5 W（中位 −1.9 W，标准误 0.5 W）**。
-
-据此做了两处 CPU 侧精简（不用 NPU）：
-
-- RVM 为喂模型已经把帧缩到 320×180（INTER_AREA），低分辨率准备直接复用，不再缩第二次（−0.7 ms）；
-- 无光晕背景模糊在再降一半的分辨率（160×90）上做、再放大回来（模糊核 ≥ 9 时）：1.3–2.3 ms → ~0.5 ms，
-  背景区域与原版平均差 0.26/255（95% 的像素 ≤ 1）。
-
-同进程 15 s 交替、16 对：CPU 准备 4.8 → 3.0 ms/帧，整包 **−2.7 W（中位 −2.7，标准误 0.16 W，16 对全为正）**；
-同样方法的 A/A 对照为 −0.57 ± 0.29 W，说明没有偏向"后跑的那个"。这个降幅比上面"去掉全部准备"的上限还大，
-两次是在不同的桌面负载下测的，绝对值只能当量级看：结论是省下来的 CPU 毫秒在 performance 调度下非常值钱。
-
-`powerbench_conv.py` 会直接算出 **J/帧**，以及"NPU 要做到多少 ms 才能在能量上打平 CPU"。
-判据是 `E = (P_空闲 + ΔP) × t`。7840HS 上实测（720p，Conv_290 0.29 GMAC）：
-
-| | ms/帧 | 整包 W | 边际 W | J/帧 |
-|---|---|---|---|---|
-| CPU ×2 | 4.1 | 34.6 | +13.4 | 0.143 |
-| NPU ×4（上游 conv2dk3） | 11.1 | 22.7 | +1.4 | 0.252 |
-| **NPU ×4（自写 conv3x3）** | **0.95** | 18.3 | +8.2 | **0.017** |
-
-用上游 `conv2dk3` 时 NPU 的**边际**功率只有 1.4 W（CPU 13.4 W），但慢 2.7 倍，整机每帧能量反而高 76%；
-打平线是 6.7 ms。换成自写的 [`npu/kernels/conv3x3.cc`](npu/kernels/conv3x3.cc) 之后 0.95 ms，
-**每次卷积的整机能量比 CPU 低 86%**（两次测量的 CPU 行分别是不同日期的底噪，看比例即可）。
-
-#### RVM 编码器：NPU vs CPU（`powerbench_enc.py`）
-
-```bash
-python powerbench_enc.py --secs 15 --rounds 6     # 定速 30 fps, 同一进程按轮交替, 和空闲成对相减
-```
-
-7840HS、performance 调度，6 轮 × 15 s，编码器 MobileNetV3 @ 320×180（不含前处理、不含解码器）：
-
-| 30 fps 定速 | 比空闲多（整包） | 每帧 CPU 时间 |
-|---|---|---|
-| **NPU**（`npu/rvm/encoder_npu`，int8，9.2–11 ms/帧） | **+1.1 W**（中位 +1.0，标准误 0.2） | 1.7 ms（一个核的 5%） |
-| onnxruntime CPU fp32，1 线程（8.5 ms/帧） | +3.9 W（标准误 0.1） | 9.2 ms |
-| onnxruntime CPU fp32，4 线程（4.0 ms/帧） | +4.1 W（标准误 0.1） | 13.2 ms |
-
-NPU 慢一点（单帧延迟高），但在摄像头帧率下每秒省约 **2.9 W**、每帧少 7.5 ms CPU。
-
-**和核显比**（studio 现在的做法，`--backends idle,npu,gpu,cpu×1`，另一天、底噪 9 W，6 轮）：
-
-| 30 fps 定速 | 做的事 | 比空闲多（整包） | 每帧 CPU |
-|---|---|---|---|
-| NPU | 只有编码器（426 MMAC，占 RVM 的 23%） | +0.5（中位）/ +0.9 W（平均，标准误 0.6；第 1 轮有离群） | 1.7 ms |
-| 780M（ncnn + Vulkan fp16） | **RVM 整网**（1.84 GMAC） | +3.3（中位）/ +3.5 W（标准误 0.3） | 2.6 ms（含 worker） |
-| CPU 1 线程 | 只有编码器 | +3.4 W（标准误 0.35） | 8.8 ms |
-
-折成每 MMAC 的边际能量：核显整网约 0.06 mJ，现在的 NPU 编码器约 0.07–0.1 mJ（时间大半是非计算开销）；而计算密集时 NPU 能到约 0.03 mJ（自写 3×3，下表）。解码器（1.4 GMAC，几乎都是高分辨率的稠密 3×3）能不能做到计算密集，决定整网上 NPU 比不比核显省。onnxruntime CPU 单线程跑整网 46 ms/帧（编码器只占 8.5 ms）。
-
-**解码器的卷积放上 NPU 之后**（`npu/rvm/decoder_probe.py`：解码器里 14 个卷积按分辨率串成 5 条链，随机权重、逐字节一致；
-高分辨率 3×3 有 250–300 GMAC/s，编码器只有 ~47；合成一次调用约 5.3 ms）。`--backends idle,npu,npu-full,gpu`，6 轮：
-
-| 30 fps 定速 | 比空闲多（整包） | 每帧 CPU |
-|---|---|---|
-| NPU 编码器 | +0.4（平均）/ +0.55 W（中位） | 1.6 ms |
-| **NPU 编码器 + 解码器的卷积** | **+1.2 W**（去掉第 1 轮；6 轮中位 +1.5） | 2.9 ms |
-| 780M RVM 整网 | +3.3 W（去掉第 1 轮；6 轮中位 +3.1） | 2.6 ms |
-
-第 1 轮每次都偏高（刚做完 40 s 的校准，机器还没稳），要扔掉。还没算进去的：上采样、拼接、ConvGRU 的逐元素门控、
-最后的投影（计算量小，但要新算子）。连续跑满时 NPU 这套是 22.7 ms/帧（6 次调用、含输入同步），30 fps 的预算还够。
-→ **整网放上 NPU 预计比核显每秒省约 2 W**，解码器值得做。
-NPU 每帧那 1.7 ms CPU 是主机侧：输入换布局 + 同步到设备 + XRT 派发。
-（脚本的第二段"连续跑满"每轮只测一次空闲，底噪漂移时边际不可信，只看 ms/帧。）
-
-### 自写 3×3 卷积（`npu/conv3x3.py`）
-
-替代有缺陷的上游 `conv2dk3`（宽度写死 32、int8 版漏声明、第一组输出通道算错）。
-Conv_290（35→16，3×3，180×320，+ReLU）真实数据上与 int8 整数参考**逐字节一致**，0.95–1.2 ms（含同步），
-CPU 上 ONNX Runtime fp32 是 4.1 ms（2 线程）/ 7.3 ms CPU 时间。int8 相对 fp32 的误差 1.9%（量化本身，见 `conv_proto.py`）。
-
-- 布局：每行 `[IC/8][W][8]`（8 通道一块、块内像素优先），权重 `[ky][icb][kx][ocb][8][8]`，正好是 `mmul<4,8,8>` 的 A/B 矩阵；
-- 横向 3 个抽头用 `shuffle_up/down_fill` 在寄存器里移 1 个像素，不做非对齐加载；
-- 每步 8 像素 × 16 输出通道 = 4 个累加器，每块权重、每个激活向量各用两次；
-- 舍入 + ReLU 是一次饱和 `to_vector<uint8>(shift)`（`rounding_mode::positive_inf`）；
-- 4 个 core = 宽度 2 条 × 高度 2 段，行走 3 行滑窗 ObjectFifo。8 个 core 会撞上 shim DMA 通道数（每列 2 进 2 出），
-  要扩展得经 memtile 分发。
-
-目前只支持 OC = 16、IC 为 8 的倍数（bias 用空闲通道的常数 127 × 中心权重注入，见 `QConv`）。
-它是 XDNA1 上跑模型的地基；下一步才是把一个小模型整网搬上来。
-
-⚠ 这台机器的 `BAT0` 没有 `power_now`，`current_now` 的量纲是坏的（1.2 W vs 整包 19 W），
-所以脚本以 PPT 为准、电池值只做交叉验证。
-
-## 环境
-
-```bash
-uv venv --python /usr/bin/python3.14 --system-site-packages .venv-iron   # 需要系统 pyxrt (Arch: xrt 包)
-uv pip install --python .venv-iron/bin/python -r requirements.txt mlir_aie \
-    -f https://github.com/Xilinx/mlir-aie/releases/expanded_assets/latest-wheels-4
-# Peano (llvm-aie): 直接装与 mlir_aie 1.3.4 配套的 nightly wheel
-uv pip install --python .venv-iron/bin/python \
-    'llvm-aie @ https://github.com/Xilinx/llvm-aie/releases/download/nightly/llvm_aie-21.0.0.2026062301%2Bcb664e8c-py3-none-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl'
-
 source npu/env.sh
-python3 -m npu.fused --selftest         # NPU 与 numpy 参考逐字节对比
-python3 -m studio --npu                  # NPU 后端虚拟摄像头
+.venv-iron/bin/python -m npu.check --quick   # Expect 19/19 passing (max_diff == 0)
 ```
 
-首次运行会 JIT 编译 NPU 程序（约 2 秒），结果缓存后再启动很快。
-
-### RVM 抠像 (`--matting rvm`)
-
-默认是轻量的 MediaPipe 分割。加 `--matting rvm` 换成 RVM（Robust Video Matting）：
-头发丝级边缘 + 自带时序记忆（r1..r4 循环状态），所以不再需要 `--smooth` 的 EMA（那反而会拖影），
-`--threshold` 也自动关掉，免得把细发丝切掉。
-
-实现上**不碰合成内核**：摄像头帧直接缩到 320×180 喂给模型，它的 `pha` 天然就是 320×180 ——
-正好是下游需要的 1/4 分辨率遮罩。所以不用截断 ONNX 图，也不用把全分辨率 `fgr`/`pha`
-传回来（那会是每帧 15–33 MB）。只用 `pha`，前景仍然取原始画面。
-
-**RVM 跑在 780M 核显上（ncnn + Vulkan）**，CPU 只剩缩放、1/4 准备和合成：
-
+### 2. Build the C++ 4-Bucket ASR Backend
 ```bash
-# 一次性准备。产物 (models/*.ncnn.*、third_party/rvm_worker) 在 .gitignore 里、只存在本机,
-# 新克隆或换机器后需要重跑这两步
-.venv/bin/python studio/native/convert_rvm.py --pnnx <pnnx> --onnxsim <onnxsim>
-bash studio/native/build_rvm_worker.sh      # 用 Arch 仓库的 ncnn，不需要 sudo/编译 ncnn
-
-# 跑
 source npu/env.sh
-python -m studio --matting rvm --rvm-gpu --npu --high-fps
+.venv-iron/bin/python -m npu.asr.export_c_bundle   # Exports to ~/.npu/asr/asr_4c_bundle
+
+L=$PWD/.venv-iron/lib/python3.14/site-packages/opencv_python_headless.libs
+g++ -O3 -std=c++17 -I/usr/include/xrt npu/asr/asr_npu.cpp -lxrt_coreutil \
+    $L/libopenblasp-r0-59ffcd50.3.15.so -Wl,-rpath,$L -lm -o ~/.npu/asr/asr_npu_cpp
 ```
 
-实测（7840HS，1280×720，RVM@780M + NPU 合成，实测 2291 帧）：
-
-| | 每帧 |
-|---|---|
-| RVM（320×180，Vulkan） | 18.8 ms |
-| 合成（CPU 准备 4.6 + NPU 1.7） | 6.4 ms |
-| 输出 | 0.8 ms |
-| **合计 / 帧率** | **26.1 ms → 30.0 fps** |
-| **CPU 时间** | **13 ms/帧（0.39 核，含 rvm_worker 子进程约 0.08 核）** |
-
-对比同一台机器上的三种抠像方案：
-
-| | 帧率 | CPU |
-|---|---|---|
-| MediaPipe 分割（阶段 1/2） | 30 fps | ~17 ms（0.5 核） |
-| RVM，CPU 4 线程 | 39 fps | 61 ms（2.4 核） |
-| **RVM，780M** | **30 fps** | **13 ms（0.39 核）** |
-
-> CPU 时间口径：引擎统计 = 主进程 `process_time()` + 抠像子进程（`rvm_worker`）的 utime+stime。
-> 早期版本只算了主进程，少算了 worker 的 ~0.08 核，报成了 0.30 核。
->
-> 精度：worker 打开了 ncnn 的 fp16 路径（快 ~7%）。与 ORT fp32 相比，`pha` 平均差 ~5e-4、
-> 最大 ~0.12（个别边缘像素），量化到 8 位后约 2% 像素差几级 —— 看不出来，但**不是逐位相同**。
-
-两个实现都保留：`studio/rvm.py` 是 ORT 版（有 ROCm 时自动走核显，否则 CPU），
-`studio/rvm_gpu.py` 是 ncnn+Vulkan 版（`--rvm-gpu`）。
-
-模型转换是这条路上最麻烦的一步：RVM 的 ONNX 是动态形状（内部尺寸由 `Shape(src)` +
-`downsample_ratio` 运行时算出来），ncnn/pnnx 处理不了。做法是把部署分辨率彻底焊死
-（ratio 变常量 → onnxsim 折叠形状链 → Expand 换 Identity → ORT 逐字节验证 → pnnx），
-全部封装在 `studio/native/convert_rvm.py` 里。
-
-## 安装
-
+(Optional) Test microphone input in terminal:
 ```bash
-uv venv --python /usr/bin/python3.14 .venv
-uv pip install --python .venv/bin/python -r requirements.txt
-
-# 虚拟摄像头内核模块
-sudo pacman -S v4l2loopback-dkms
-sudo modprobe v4l2loopback devices=1 exclusive_caps=1 card_label="NPU Studio Camera"
+.venv-iron/bin/python -m npu.asr.shell_asr --cpp
 ```
 
-开机自动加载：
-
+### 3. Build & Install NPU Studio GUI
 ```bash
-echo v4l2loopback | sudo tee /etc/modules-load.d/v4l2loopback.conf
-echo 'options v4l2loopback devices=1 exclusive_caps=1 card_label="NPU Studio Camera"' | sudo tee /etc/modprobe.d/v4l2loopback.conf
+./app/install.sh
 ```
+This builds the release binary (`app/target/release/npu-studio`) and installs the desktop entry to `~/.local/share/applications/npu-studio.desktop`.
 
-## 使用
+---
 
-```bash
-.venv/bin/python -m studio                        # 背景虚化 → 虚拟摄像头
-.venv/bin/python -m studio --mode image --bg 背景.jpg
-.venv/bin/python -m studio --mode color           # 绿幕
-.venv/bin/python -m studio --blur 51              # 更强的模糊
-.venv/bin/python -m studio --bench 150            # 只测性能
-.venv/bin/python -m studio --snapshot out.png     # 存一张 原图|结果 对比
-```
+## Documentation for Contributors & Agents
 
-然后在会议软件的摄像头列表里选 **NPU Studio Camera**。
+- Architecture & hard constraints for NPU kernel development: [`AGENTS.md`](AGENTS.md) / [`CLAUDE.md`](CLAUDE.md) / [`.claude/skills/npu-dev/SKILL.md`](.claude/skills/npu-dev/SKILL.md)
+- Detailed ASR NPU benchmarks & bottleneck analysis: [`docs/asr-npu.md`](docs/asr-npu.md)
 
-常用参数：`--blur`（模糊强度，默认 61，可到 121+）、`--smooth`（遮罩时间平滑，减少闪烁）、
-`--threshold`（边缘软硬）、`--quality basic`（切回第一版简单算法做对比）。
+## License
 
-默认的 `hq` 质量做了两件事：
-
-- **快速导向滤波**：以原图为参照修正 256×144 的模型遮罩，轮廓贴合头发和衣服边缘
-- **无光晕背景模糊**：归一化卷积，只用背景像素参与模糊，人物颜色不会被抹进背景
-
-## 性能（7840HS, 1280×720, CPU 阶段）
-
-| 步骤 | 耗时 |
-|---|---|
-| 人像分割 (256×144) | ~5–8 ms |
-| 导向滤波 + 模糊 + 合成 (hq) | ~12–16 ms |
-| 合计 | ~18–22 ms / 帧 |
-
-实际帧率通常受摄像头限制：光线暗时 UVC 摄像头会自动降到 15 fps 左右
-（`exposure_dynamic_framerate`）。
-
-## 模型
-
-`models/` 里的人像分割模型来自 [onnx-community/mediapipe_selfie_segmentation](https://huggingface.co/onnx-community/mediapipe_selfie_segmentation)
-与其横屏版，原始模型为 Google MediaPipe Selfie Segmentation，Apache-2.0 许可。
+Licensed under **GNU GPL-3.0-or-later** — see [`LICENSE`](LICENSE).

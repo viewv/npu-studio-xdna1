@@ -104,6 +104,7 @@ pub struct Settings {
     pub bg_image: Option<String>,
     pub camera: String,
     pub high_fps: bool,
+    pub lang: String,
     /// 功能开关 (id → 是否开启), 供后续 NPU 功能使用
     pub features: BTreeMap<String, bool>,
 }
@@ -119,6 +120,7 @@ impl Default for Settings {
             bg_image: None,
             camera: "/dev/video0".into(),
             high_fps: false,
+            lang: "zh".into(),
             features: BTreeMap::new(),
         }
     }

@@ -183,6 +183,7 @@ component ToolCard inherits Rectangle {
     in property <string> subtitle;
     in property <string> tech-tag;
     in property <string> status-tag;
+    in property <string> open-label: "进入 →";
     in property <color> status-tint: Theme.muted;
     callback clicked;
 
@@ -229,7 +230,7 @@ component ToolCard inherits Rectangle {
                 border-radius: 8px;
                 background: touch.has-hover ? Theme.npu : Theme.npu.with-alpha(0.14);
                 Text {
-                    text: "进入 →";
+                    text: root.open-label;
                     font-size: 12px;
                     font-weight: 700;
                     color: touch.has-hover ? #ffffff : Theme.npu;
@@ -266,6 +267,7 @@ component StatTile inherits Rectangle {
 
 component StartButton inherits Rectangle {
     in property <int> state;
+    in property <bool> is-en: false;
     callback clicked;
     height: 48px;
     border-radius: 12px;
@@ -276,7 +278,10 @@ component StartButton inherits Rectangle {
     opacity: root.busy ? 0.6 : 1.0;
     animate background { duration: 150ms; }
     Text {
-        text: root.state == 1 ? "正在启动…" : root.state == 3 ? "正在停止…" : root.running ? "■  停止" : "▶  开启";
+        text: root.state == 1 ? (root.is-en ? "Starting…" : "正在启动…")
+            : root.state == 3 ? (root.is-en ? "Stopping…" : "正在停止…")
+            : root.running ? (root.is-en ? "■  Stop" : "■  停止")
+            : (root.is-en ? "▶  Start" : "▶  开启");
         color: white;
         font-size: 16px;
         font-weight: 700;
@@ -345,6 +350,7 @@ export component AppWindow inherits Window {
 
     // ---- 导航页签: 0 工具箱首页, 1 背景虚化, 2 实时语音转写 ----
     in-out property <int> active-tab: 0;
+    in-out property <bool> is-en: false;
 
     // ---- 实时语音转写 ----
     in-out property <int> asr-backend: 0; // 0 NPU C++ 四档, 1 CPU Python
@@ -364,6 +370,7 @@ export component AppWindow inherits Window {
     callback feature-toggled(int, bool);
     callback asr-start-stop();
     callback asr-clear();
+    callback toggle-lang();
 
     property <bool> locked: root.run-state == 1 || root.run-state == 3;
     property <bool> running: root.run-state == 2;
@@ -385,27 +392,34 @@ export component AppWindow inherits Window {
                 VerticalLayout {
                     alignment: center;
                     Text { text: "NPU Studio"; font-size: 18px; font-weight: 800; }
-                    Text { text: "Ryzen AI NPU 工具箱"; font-size: 11px; color: Theme.muted; }
+                    Text { text: root.is-en ? "Ryzen AI NPU Toolbox" : "Ryzen AI NPU 工具箱"; font-size: 11px; color: Theme.muted; }
                 }
             }
             Rectangle { horizontal-stretch: 1; }
             HorizontalLayout {
-                width: 380px;
+                width: 390px;
                 spacing: 4px;
                 Segment {
-                    text: "工具箱";
+                    text: root.is-en ? "Toolbox" : "工具箱";
                     selected: root.active-tab == 0;
                     clicked => { root.active-tab = 0; }
                 }
                 Segment {
-                    text: root.running ? "背景虚化 ●" : "背景虚化";
+                    text: root.running ? (root.is-en ? "Video Blur ●" : "背景虚化 ●") : (root.is-en ? "Video Blur" : "背景虚化");
                     selected: root.active-tab == 1;
                     clicked => { root.active-tab = 1; }
                 }
                 Segment {
-                    text: root.asr-active ? "语音转写 ●" : "语音转写";
+                    text: root.asr-active ? (root.is-en ? "Speech ASR ●" : "语音转写 ●") : (root.is-en ? "Speech ASR" : "语音转写");
                     selected: root.active-tab == 2;
                     clicked => { root.active-tab = 2; }
+                }
+            }
+            VerticalLayout {
+                alignment: center;
+                Button {
+                    text: root.is-en ? "中文" : "EN";
+                    clicked => { root.toggle-lang(); }
                 }
             }
         }
@@ -420,27 +434,29 @@ export component AppWindow inherits Window {
                 spacing: 14px;
                 ToolCard {
                     horizontal-stretch: 1;
-                    title: "背景虚化虚拟摄像头";
-                    subtitle: "实时人像分割 + 背景虚化 / 换图 / 绿幕，输出到 v4l2loopback 虚拟摄像头。";
+                    title: root.is-en ? "Background Blur Virtual Camera" : "背景虚化虚拟摄像头";
+                    subtitle: root.is-en ? "Real-time portrait matting + blur / background image / green screen via v4l2loopback." : "实时人像分割 + 背景虚化 / 换图 / 绿幕，输出到 v4l2loopback 虚拟摄像头。";
                     tech-tag: "NPU / GPU / CPU";
-                    status-tag: root.running ? "运行中" : "未运行";
+                    status-tag: root.running ? (root.is-en ? "Running" : "运行中") : (root.is-en ? "Stopped" : "未运行");
                     status-tint: root.running ? Theme.ok : Theme.muted;
+                    open-label: root.is-en ? "Open →" : "进入 →";
                     clicked => { root.active-tab = 1; }
                 }
                 ToolCard {
                     horizontal-stretch: 1;
-                    title: "实时语音转写 (ASR)";
-                    subtitle: "麦克风实时流式上屏，支持 NPU 4 核四档分档 (137–320ms) 与 CPU 后端对比。";
+                    title: root.is-en ? "Live Speech Recognition (ASR)" : "实时语音转写 (ASR)";
+                    subtitle: root.is-en ? "Real-time streaming microphone transcription with 4-bucket NPU C++ (137–320ms) or CPU." : "麦克风实时流式上屏，支持 NPU 4 核四档分档 (137–320ms) 与 CPU 后端对比。";
                     tech-tag: "NPU C++ / CPU";
-                    status-tag: root.asr-active ? root.asr-status : "未开启";
+                    status-tag: root.asr-active ? root.asr-status : (root.is-en ? "Idle" : "未开启");
                     status-tint: root.asr-active ? Theme.ok : Theme.muted;
+                    open-label: root.is-en ? "Open →" : "进入 →";
                     clicked => { root.active-tab = 2; }
                 }
             }
 
             Card {
-                title: "实验室 / 更多功能";
-                subtitle: "后续会陆续加入更多在 NPU 上运行的独立工具模块。";
+                title: root.is-en ? "Labs / More Features" : "实验室 / 更多功能";
+                subtitle: root.is-en ? "Experimental NPU workloads to be added in future updates." : "后续会陆续加入更多在 NPU 上运行的独立工具模块。";
                 for f[i] in root.features: FeatureRow {
                     data: f;
                     toggled(v) => { root.feature-toggled(i, v); }
@@ -464,16 +480,17 @@ export component AppWindow inherits Window {
 
                 StartButton {
                     state: root.run-state;
+                    is-en: root.is-en;
                     clicked => { root.start-stop(); }
                 }
 
                 Card {
-                    title: "计算后端";
-                    subtitle: "全分辨率的遮罩与合成在哪里计算。运行中切换会自动重启。";
+                    title: root.is-en ? "Compute Backend" : "计算后端";
+                    subtitle: root.is-en ? "Where full-res matting & compositing run. Restarts automatically if changed while running." : "全分辨率的遮罩与合成在哪里计算。运行中切换会自动重启。";
                     BackendOption {
                         label: "NPU";
-                        tag: "推荐";
-                        hint: "Ryzen AI 融合内核 · 最快 · 不占用 GPU";
+                        tag: root.is-en ? "Recommended" : "推荐";
+                        hint: root.is-en ? "Ryzen AI fused kernel · Fastest · Zero GPU load" : "Ryzen AI 融合内核 · 最快 · 不占用 GPU";
                         selected: root.backend == 0;
                         available: root.npu-available;
                         locked: root.locked;
@@ -497,7 +514,7 @@ export component AppWindow inherits Window {
                     }
                     BackendOption {
                         label: "CPU";
-                        hint: "无需加速器 · 兼容性最好";
+                        hint: root.is-en ? "No accelerator · Best compatibility" : "无需加速器 · 兼容性最好";
                         selected: root.backend == 3;
                         locked: root.locked;
                         clicked => { root.backend = 3; root.settings-changed(); }
@@ -505,15 +522,15 @@ export component AppWindow inherits Window {
                 }
 
                 Card {
-                    title: "抠像模型";
-                    subtitle: "决定人物边缘的精细程度。运行中切换会自动重启。";
+                    title: root.is-en ? "Matting Model" : "抠像模型";
+                    subtitle: root.is-en ? "Edge quality & temporal stability. Restarts automatically if switched." : "决定人物边缘的精细程度。运行中切换会自动重启。";
                     BackendOption {
-                        label: "RVM · 硬件加速";
-                        tag: "推荐";
-                        hint: !root.rvm-gpu-available ? "需先生成 worker 和模型, 见 README"
-                            : root.backend == 0 ? "头发丝级边缘 · 不拖影 · 随上方后端跑在 NPU 上"
-                            : root.backend == 3 ? "头发丝级边缘 · 不拖影 · 将回退到 CPU"
-                            : "头发丝级边缘 · 不拖影 · 随上方后端跑在 780M 核显上";
+                        label: root.is-en ? "RVM · Hardware Accel" : "RVM · 硬件加速";
+                        tag: root.is-en ? "Recommended" : "推荐";
+                        hint: !root.rvm-gpu-available ? (root.is-en ? "Requires worker/model export (see README)" : "需先生成 worker 和模型, 见 README")
+                            : root.backend == 0 ? (root.is-en ? "Hair-level edges · No ghosting · Runs on NPU" : "头发丝级边缘 · 不拖影 · 随上方后端跑在 NPU 上")
+                            : root.backend == 3 ? (root.is-en ? "Hair-level edges · Falls back to CPU" : "头发丝级边缘 · 不拖影 · 将回退到 CPU")
+                            : (root.is-en ? "Hair-level edges · No ghosting · Runs on 780M iGPU" : "头发丝级边缘 · 不拖影 · 随上方后端跑在 780M 核显上");
                         selected: root.matting == 1;
                         available: root.rvm-gpu-available;
                         locked: root.locked;
@@ -521,14 +538,14 @@ export component AppWindow inherits Window {
                     }
                     BackendOption {
                         label: "MediaPipe";
-                        hint: "很轻, 边缘一般 · 动作大时会有拖影";
+                        hint: root.is-en ? "Lightweight · Fair edges · May ghost on fast motion" : "很轻, 边缘一般 · 动作大时会有拖影";
                         selected: root.matting == 0;
                         locked: root.locked;
                         clicked => { root.matting = 0; root.settings-changed(); }
                     }
                     BackendOption {
                         label: "RVM · CPU";
-                        hint: "效果同上, 但要占用 2 个多 CPU 核";
+                        hint: root.is-en ? "Same quality · Uses ~2+ CPU cores" : "效果同上, 但要占用 2 个多 CPU 核";
                         selected: root.matting == 2;
                         available: root.rvm-cpu-available;
                         locked: root.locked;
@@ -537,22 +554,22 @@ export component AppWindow inherits Window {
                 }
 
                 Card {
-                    title: "背景";
-                    subtitle: "人物之外的部分怎么处理。";
+                    title: root.is-en ? "Background" : "背景";
+                    subtitle: root.is-en ? "How pixels outside the person are rendered." : "人物之外的部分怎么处理。";
                     HorizontalLayout {
                         spacing: 4px;
                         Segment {
-                            text: "虚化";
+                            text: root.is-en ? "Blur" : "虚化";
                             selected: root.bg-mode == 0;
                             clicked => { root.bg-mode = 0; root.settings-changed(); }
                         }
                         Segment {
-                            text: "替换图片";
+                            text: root.is-en ? "Image" : "替换图片";
                             selected: root.bg-mode == 1;
                             clicked => { root.bg-mode = 1; root.settings-changed(); }
                         }
                         Segment {
-                            text: "绿幕";
+                            text: root.is-en ? "Green" : "绿幕";
                             selected: root.bg-mode == 2;
                             clicked => { root.bg-mode = 2; root.settings-changed(); }
                         }
@@ -581,14 +598,14 @@ export component AppWindow inherits Window {
                             horizontal-stretch: 1;
                         }
                         Button {
-                            text: "选择图片…";
+                            text: root.is-en ? "Choose Image…" : "选择图片…";
                             clicked => { root.pick-image(); }
                         }
                     }
                     if root.matting == 0: VerticalLayout {
                         spacing: 2px;
                         HorizontalLayout {
-                            Text { text: "边缘稳定 (时间平滑)"; font-size: 12px; }
+                            Text { text: root.is-en ? "Edge Stability (Temporal)" : "边缘稳定 (时间平滑)"; font-size: 12px; }
                             Rectangle { }
                             Text { text: round(root.smoothing * 100) + "%"; font-size: 12px; color: Theme.muted; }
                         }
@@ -601,14 +618,14 @@ export component AppWindow inherits Window {
                     }
                     if root.matting != 0: HorizontalLayout {
                         spacing: 6px;
-                        Text { text: "边缘稳定 (时间平滑)"; font-size: 12px; color: Theme.muted; vertical-alignment: center; }
-                        Tag { text: "RVM 已内置"; tint: Theme.ok; }
+                        Text { text: root.is-en ? "Edge Stability (Temporal)" : "边缘稳定 (时间平滑)"; font-size: 12px; color: Theme.muted; vertical-alignment: center; }
+                        Tag { text: root.is-en ? "Built into RVM" : "RVM 已内置"; tint: Theme.ok; }
                         Rectangle { }
                     }
                 }
 
                 Card {
-                    title: "摄像头";
+                    title: root.is-en ? "Camera" : "摄像头";
                     ComboBox {
                         model: root.cameras;
                         current-index <=> root.camera-index;
@@ -617,9 +634,9 @@ export component AppWindow inherits Window {
                     HorizontalLayout {
                         VerticalLayout {
                             alignment: center;
-                            Text { text: "高帧率模式"; font-weight: 600; }
+                            Text { text: root.is-en ? "High FPS Mode" : "高帧率模式"; font-weight: 600; }
                             Text {
-                                text: "关闭动态帧率, 稳定 30 fps (光线暗时画面会变暗)";
+                                text: root.is-en ? "Lock 30 fps (image gets darker in low light)" : "关闭动态帧率, 稳定 30 fps (光线暗时画面会变暗)";
                                 font-size: 11px;
                                 color: Theme.muted;
                                 wrap: word-wrap;
@@ -676,13 +693,13 @@ export component AppWindow inherits Window {
                     alignment: center;
                     spacing: 6px;
                     Text {
-                        text: root.running ? "等待画面…" : "点击「开启」后在这里预览";
+                        text: root.running ? (root.is-en ? "Waiting for frames…" : "等待画面…") : (root.is-en ? "Click Start to preview here" : "点击「开启」后在这里预览");
                         color: #ffffffaa;
                         font-size: 15px;
                         horizontal-alignment: center;
                     }
                     Text {
-                        text: "会议软件里选择摄像头「NPU Studio Camera」";
+                        text: root.is-en ? "Select \"NPU Studio Camera\" in your meeting app" : "会议软件里选择摄像头「NPU Studio Camera」";
                         color: #ffffff66;
                         font-size: 11px;
                         horizontal-alignment: center;
@@ -707,36 +724,38 @@ export component AppWindow inherits Window {
                 spacing: 8px;
                 Row {
                     StatTile {
-                        label: "帧率";
+                        label: root.is-en ? "Frame Rate" : "帧率";
                         value: root.running ? round(root.fps * 10) / 10 : "–";
                         unit: "fps";
                         accent: root.running ? Theme.ok : Palette.foreground;
                     }
                     StatTile {
-                        label: "人像分割";
+                        label: root.is-en ? "Matting" : "人像分割";
                         value: root.running ? round(root.seg-ms * 10) / 10 : "–";
                         unit: "ms";
                     }
                     StatTile {
-                        label: "遮罩与合成";
+                        label: root.is-en ? "Composite" : "遮罩与合成";
                         value: root.running ? round(root.fx-ms * 10) / 10 : "–";
                         unit: "ms";
                     }
                 }
                 Row {
                     StatTile {
-                        label: root.backend == 0 ? "其中 NPU" : root.backend == 3 ? "其中加速器" : "其中 GPU";
+                        label: root.backend == 0 ? (root.is-en ? "NPU Time" : "其中 NPU")
+                            : root.backend == 3 ? (root.is-en ? "Accel Time" : "其中加速器")
+                            : (root.is-en ? "GPU Time" : "其中 GPU");
                         value: root.running && root.backend != 3 ? round(root.accel-ms * 10) / 10 : "–";
                         unit: "ms";
                         accent: root.backend == 0 && root.running ? Theme.npu : Palette.foreground;
                     }
                     StatTile {
-                        label: "进程 CPU";
+                        label: root.is-en ? "Process CPU" : "进程 CPU";
                         value: root.running ? round(root.cpu-pct) : "–";
-                        unit: "% 单核";
+                        unit: root.is-en ? "% 1-core" : "% 单核";
                     }
                     StatTile {
-                        label: "画面中人物";
+                        label: root.is-en ? "Foreground" : "画面中人物";
                         value: root.running ? round(root.person-pct) : "–";
                         unit: "%";
                     }
@@ -753,15 +772,15 @@ export component AppWindow inherits Window {
                         horizontal-stretch: 1;
                         HorizontalLayout {
                             spacing: 6px;
-                            Text { text: "虚拟摄像头"; font-weight: 700; }
+                            Text { text: root.is-en ? "Virtual Camera" : "虚拟摄像头"; font-weight: 700; }
                             Tag {
-                                text: root.vcam-device != "" ? "已就绪 " + root.vcam-device : "未加载";
+                                text: root.vcam-device != "" ? ((root.is-en ? "Ready " : "已就绪 ") + root.vcam-device) : (root.is-en ? "Not Loaded" : "未加载");
                                 tint: root.vcam-device != "" ? Theme.ok : Theme.warn;
                             }
                             Rectangle { }
                         }
                         Text {
-                            text: root.vcam-autoload ? "开机会自动加载 (v4l2loopback)" : "每次开机需要加载一次 (v4l2loopback)";
+                            text: root.vcam-autoload ? (root.is-en ? "Autoloads on boot (v4l2loopback)" : "开机会自动加载 (v4l2loopback)") : (root.is-en ? "Load once per boot (v4l2loopback)" : "每次开机需要加载一次 (v4l2loopback)");
                             font-size: 11px;
                             color: Theme.muted;
                         }
@@ -770,7 +789,7 @@ export component AppWindow inherits Window {
                         alignment: center;
                         horizontal-stretch: 0;
                         Button {
-                            text: "加载";
+                            text: root.is-en ? "Load" : "加载";
                             enabled: !root.vcam-busy;
                             clicked => { root.load-vcam(); }
                         }
@@ -779,7 +798,7 @@ export component AppWindow inherits Window {
                         alignment: center;
                         horizontal-stretch: 0;
                         Button {
-                            text: "卸载";
+                            text: root.is-en ? "Unload" : "卸载";
                             enabled: !root.vcam-busy && !root.running && !root.locked;
                             clicked => { root.unload-vcam(); }
                         }
@@ -788,7 +807,7 @@ export component AppWindow inherits Window {
                         alignment: center;
                         horizontal-stretch: 0;
                         Button {
-                            text: "开机自动加载";
+                            text: root.is-en ? "Autoload on Boot" : "开机自动加载";
                             enabled: !root.vcam-busy;
                             clicked => { root.setup-autoload(); }
                         }
@@ -809,25 +828,25 @@ export component AppWindow inherits Window {
 
                 Button {
                     height: 44px;
-                    text: root.asr-active ? "停止监听" : "开始实时转写";
+                    text: root.asr-active ? (root.is-en ? "Stop Listening" : "停止监听") : (root.is-en ? "Start Live ASR" : "开始实时转写");
                     primary: !root.asr-active;
                     clicked => { root.asr-start-stop(); }
                 }
 
                 Card {
-                    title: "语音识别后端";
-                    subtitle: "可切换 NPU 或 CPU 实现，运行中切换会先停止当前监听。";
+                    title: root.is-en ? "ASR Backend" : "语音识别后端";
+                    subtitle: root.is-en ? "Switch between 4-core NPU or CPU reference. Stop listening before switching." : "可切换 NPU 或 CPU 实现，运行中切换会先停止当前监听。";
                     BackendOption {
-                        label: "NPU · 4 核四档 (C++)";
-                        tag: "推荐";
-                        hint: "2/3/5/7 秒自动分档 · 137–320 ms · 不占 CPU";
+                        label: root.is-en ? "NPU · 4-Core Buckets (C++)" : "NPU · 4 核四档 (C++)";
+                        tag: root.is-en ? "Recommended" : "推荐";
+                        hint: root.is-en ? "2/3/5/7s auto buckets · 137–320 ms · Zero CPU load" : "2/3/5/7 秒自动分档 · 137–320 ms · 不占 CPU";
                         selected: root.asr-backend == 0;
                         locked: root.asr-active;
                         clicked => { root.asr-backend = 0; }
                     }
                     BackendOption {
-                        label: "CPU · Python 参考";
-                        hint: "OpenBLAS 浮点参考 · 无需 NPU · 约 1.1 s";
+                        label: root.is-en ? "CPU · Python Reference" : "CPU · Python 参考";
+                        hint: root.is-en ? "OpenBLAS float32 · No NPU · ~1.1 s" : "OpenBLAS 浮点参考 · 无需 NPU · 约 1.1 s";
                         selected: root.asr-backend == 1;
                         locked: root.asr-active;
                         clicked => { root.asr-backend = 1; }
@@ -838,13 +857,13 @@ export component AppWindow inherits Window {
                     spacing: 8px;
                     Row {
                         StatTile {
-                            label: "当前档位";
+                            label: root.is-en ? "Active Bucket" : "当前档位";
                             value: root.asr-bucket;
                             unit: "";
                             accent: root.asr-active ? Theme.npu : Palette.foreground;
                         }
                         StatTile {
-                            label: "端到端耗时";
+                            label: root.is-en ? "End-to-End" : "端到端耗时";
                             value: root.asr-ms;
                             unit: "ms";
                             accent: root.asr-active ? Theme.ok : Palette.foreground;
@@ -859,7 +878,7 @@ export component AppWindow inherits Window {
                 horizontal-stretch: 1;
                 HorizontalLayout {
                     spacing: 8px;
-                    Text { text: "实时识别输出"; font-size: 15px; font-weight: 700; vertical-alignment: center; }
+                    Text { text: root.is-en ? "Live Transcript" : "实时识别输出"; font-size: 15px; font-weight: 700; vertical-alignment: center; }
                     VerticalLayout {
                         alignment: center;
                         Tag {
@@ -871,7 +890,7 @@ export component AppWindow inherits Window {
                     VerticalLayout {
                         alignment: center;
                         Button {
-                            text: "清空";
+                            text: root.is-en ? "Clear" : "清空";
                             clicked => { root.asr-clear(); }
                         }
                     }
@@ -892,7 +911,7 @@ export component AppWindow inherits Window {
                             wrap: word-wrap;
                         }
                         if root.asr-text == "" && root.asr-partial == "": Text {
-                            text: root.asr-active ? "请对着麦克风说话，识别结果会实时显示在这里…" : "点击左侧「开始实时转写」后，对着麦克风说话即可实时上屏。";
+                            text: root.asr-active ? (root.is-en ? "Speak into your microphone, live captions will appear here…" : "请对着麦克风说话，识别结果会实时显示在这里…") : (root.is-en ? "Click \"Start Live ASR\" on the left and speak into your microphone." : "点击左侧「开始实时转写」后，对着麦克风说话即可实时上屏。");
                             font-size: 13px;
                             color: Theme.muted;
                             wrap: word-wrap;

@@ -8,3 +8,5 @@ third_party/
 app/target/
 npu/rvm/*.npz
 models/*.ncnn.*
+models/rvm_mobilenetv3_*.onnx
+work/

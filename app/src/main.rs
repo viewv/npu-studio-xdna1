@@ -24,8 +24,11 @@ slint::include_modules!();
 struct FeatureDef {
     id: &'static str,
     title: &'static str,
+    title_en: &'static str,
     description: &'static str,
+    description_en: &'static str,
     tag: &'static str,
+    tag_en: &'static str,
     available: bool,
 }
 
@@ -33,22 +36,31 @@ const FEATURES: &[FeatureDef] = &[
     FeatureDef {
         id: "noise-suppression",
         title: "通话降噪",
+        title_en: "Noise Suppression",
         description: "在 NPU 上实时去除键盘声、风扇声等背景噪音",
+        description_en: "Real-time keyboard & fan noise removal on NPU",
         tag: "即将推出",
+        tag_en: "Coming Soon",
         available: false,
     },
     FeatureDef {
         id: "auto-framing",
         title: "自动构图",
+        title_en: "Auto Framing",
         description: "跟踪人脸位置, 自动裁剪让你保持在画面中央",
+        description_en: "Track face position and auto-crop to keep you centered",
         tag: "即将推出",
+        tag_en: "Coming Soon",
         available: false,
     },
     FeatureDef {
         id: "presence",
         title: "离开时关闭画面",
+        title_en: "Auto Blackout on Away",
         description: "检测到人离开座位后自动黑屏, 回来后恢复",
+        description_en: "Blank camera automatically when away and resume on return",
         tag: "即将推出",
+        tag_en: "Coming Soon",
         available: false,
     },
 ];
@@ -113,13 +125,21 @@ fn settings_to_ui(app: &App, ui: &AppWindow) {
     ui.set_cameras(ModelRc::new(VecModel::from(names)));
     let idx = app.cameras.iter().position(|(d, _)| *d == s.camera).unwrap_or(0);
     ui.set_camera_index(idx as i32);
+    let is_en = s.lang == "en";
+    ui.set_is_en(is_en);
+    if ui.get_run_state() == RUN_STOPPED {
+        ui.set_status_text(if is_en { "Stopped".into() } else { "未运行".into() });
+    }
+    if !ui.get_asr_active() {
+        ui.set_asr_status(if is_en { "Idle".into() } else { "未开启".into() });
+    }
     let feats: Vec<FeatureData> = FEATURES
         .iter()
         .map(|f| FeatureData {
             id: f.id.into(),
-            title: f.title.into(),
-            description: f.description.into(),
-            tag: f.tag.into(),
+            title: (if is_en { f.title_en } else { f.title }).into(),
+            description: (if is_en { f.description_en } else { f.description }).into(),
+            tag: (if is_en { f.tag_en } else { f.tag }).into(),
             available: f.available,
             enabled: f.available && *s.features.get(f.id).unwrap_or(&false),
         })
@@ -436,6 +456,14 @@ fn main() -> Result<(), slint::PlatformError> {
             ui.set_asr_partial("".into());
             ui.set_asr_bucket("–".into());
             ui.set_asr_ms("–".into());
+        });
+    });
+
+    ui.on_toggle_lang(|| {
+        with_app(|app, ui| {
+            app.settings.lang = if app.settings.lang == "en" { "zh".into() } else { "en".into() };
+            app.settings.save();
+            settings_to_ui(app, ui);
         });
     });
 
