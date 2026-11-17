@@ -26,6 +26,25 @@ impl OcrBackend {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum OcrEngineKind {
+    V4 = 0,
+    V6 = 1,
+}
+
+impl OcrEngineKind {
+    pub fn from_index(i: i32) -> Self {
+        if i == 1 { Self::V6 } else { Self::V4 }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::V4 => "v4",
+            Self::V6 => "v6",
+        }
+    }
+}
+
 pub struct OcrEngine {
     ui: slint::Weak<AppWindow>,
     child: Arc<Mutex<Option<Child>>>,
@@ -125,7 +144,7 @@ impl OcrEngine {
         }
     }
 
-    pub fn snip_and_recognize(&self, backend: OcrBackend) {
+    pub fn snip_and_recognize(&self, backend: OcrBackend, engine: OcrEngineKind) {
         self.ensure_started();
         {
             let mut b = self.busy.lock().unwrap();
@@ -178,6 +197,7 @@ impl OcrEngine {
                 "cmd": "ocr",
                 "path": tmp.to_string_lossy(),
                 "backend": backend.as_str(),
+                "engine": engine.as_str(),
             });
             let mut sent = false;
             if let Some(ref mut w) = *stdin.lock().unwrap() {

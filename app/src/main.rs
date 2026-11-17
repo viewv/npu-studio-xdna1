@@ -471,7 +471,8 @@ fn main() -> Result<(), slint::PlatformError> {
     ui.on_ocr_snip(|| {
         with_app(|app, ui| {
             let backend = ocr::OcrBackend::from_index(ui.get_ocr_backend());
-            app.ocr_engine.snip_and_recognize(backend);
+            let engine = ocr::OcrEngineKind::from_index(ui.get_ocr_engine());
+            app.ocr_engine.snip_and_recognize(backend, engine);
         });
     });
 

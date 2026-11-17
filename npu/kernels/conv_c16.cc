@@ -833,7 +833,7 @@ void convC16Chunk(int8_t *r0, int8_t *r1, int8_t *r2, int8_t *wts, uint8_t *out,
   const Desc d{h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], h[29], h[49], h[50],
                h[29] == 0 || h[29] == 4 ? 0 : -128};
   const uint16_t *pc = (const uint16_t *)(wts + 32 + 16 * core);
-  const int wvalid = pc[3];
+  const int wvalid = (pc[7] && r >= (int)pc[7]) ? 0 : pc[3];
   const int ocp = j / d.nxc, xc = j - ocp * d.nxc;
   const int px0 = xc * CW;
 #ifndef NO_LM

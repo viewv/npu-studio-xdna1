@@ -16,6 +16,8 @@ from . import det_npu, rec_npu
 CALIB_DIR = "/home/viewv/.npu/ocr"
 DET_CALIB_NPZ = os.path.join(CALIB_DIR, "det_480x640_calib.npz")
 REC_CALIB_NPZ = os.path.join(CALIB_DIR, "rec_48x320_calib.npz")
+V6_DET_CALIB_NPZ = os.path.join(CALIB_DIR, "v6_det_480x640_calib.npz")
+V6_REC_CALIB_NPZ = os.path.join(CALIB_DIR, "v6_rec_48x320_calib.npz")
 
 EXTRA_UI_SCREENSHOT = "/home/viewv/.gemini/antigravity/brain/ebe891b4-07e3-4c4e-8574-e2373d5f2b8d/.user_uploaded/media_1794928363070_edc7782c.png"
 FONTS = [p for p in rec_npu.FONT_CANDIDATES if os.path.exists(p)] + [
@@ -130,7 +132,49 @@ def load_calib(path: str) -> tuple[dict[str, np.ndarray], dict[str, int]]:
     return amax, accmax
 
 
+def save_v6_calib(path: str, ranges: dict[str, np.ndarray]):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    np.savez(path, **{f"rng::{k}": v for k, v in ranges.items()})
+
+
+def load_v6_calib(path: str) -> dict[str, np.ndarray]:
+    d = np.load(path)
+    return {k[5:]: d[k] for k in d.files if k.startswith("rng::")}
+
+
+def calibrate_v6():
+    from . import v6_det_npu, v6_rec_npu
+
+    t0 = time.perf_counter()
+    det_imgs = make_det_calib_images()
+    sess_d_stem = v6_det_npu.build_sub_ort(
+        v6_det_npu.V6_DET_ONNX, ["x"], ["p2o.pd_op.relu.3.0"], [[1, 3, 480, 640]], [[1, 64, 120, 160]]
+    )
+    d_ops = v6_det_npu.load_v6_det_backbone()
+    d_fl = [v6_det_npu.run_float_v6(d_ops, sess_d_stem.run(None, {"x": det_npu.preprocess_det(im)[None]})[0][0])
+            for im in det_imgs]
+    qd = v6_det_npu.QV6Det(d_ops, d_fl, pct=99.95)
+    save_v6_calib(V6_DET_CALIB_NPZ, qd.ranges)
+    print(f"v6 Det 校准完成 ({len(det_imgs)} 图) -> {V6_DET_CALIB_NPZ} ({time.perf_counter()-t0:.1f} s)")
+
+    t1 = time.perf_counter()
+    rec_strips = make_rec_calib_strips()
+    sess_r_stem = v6_det_npu.build_sub_ort(
+        v6_rec_npu.V6_REC_ONNX, ["x"], [v6_rec_npu.REC_STEM_OUT], [[1, 3, 48, 320]], [[1, 64, 12, 80]]
+    )
+    r_ops = v6_rec_npu.load_v6_rec_backbone()
+    r_fl = [v6_rec_npu.run_float_v6_rec(r_ops, sess_r_stem.run(None, {"x": rec_npu.preprocess_rec(st)[None]})[0][0])
+            for st in rec_strips]
+    qr = v6_rec_npu.QV6Rec(r_ops, r_fl, pct=99.95)
+    save_v6_calib(V6_REC_CALIB_NPZ, qr.ranges)
+    print(f"v6 Rec 校准完成 ({len(rec_strips)} 图) -> {V6_REC_CALIB_NPZ} ({time.perf_counter()-t1:.1f} s)")
+
+
 def main():
+    import sys
+    if "--v6" in sys.argv:
+        calibrate_v6()
+        return
     t0 = time.perf_counter()
     # 1. 校准 Det 主干 (49 层)
     det_imgs = make_det_calib_images()

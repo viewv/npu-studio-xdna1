@@ -363,6 +363,7 @@ export component AppWindow inherits Window {
 
     // ---- 屏幕框选 OCR ----
     in-out property <int> ocr-backend: 0; // 0 NPU+CPU 异构, 1 CPU float32
+    in-out property <int> ocr-engine: 0;  // 0 PP-OCRv4 Mobile, 1 PP-OCRv6 Medium
     in-out property <bool> ocr-busy: false;
     in-out property <string> ocr-status: "Idle";
     in-out property <string> ocr-det-ms: "–";
@@ -984,6 +985,27 @@ export component AppWindow inherits Window {
                         selected: root.ocr-backend == 1;
                         locked: root.ocr-busy;
                         clicked => { root.ocr-backend = 1; }
+                    }
+                }
+
+                Card {
+                    title: root.is-en ? "OCR Model" : "OCR 模型引擎";
+                    subtitle: root.is-en ? "PP-OCRv4 Mobile (fast) or PP-OCRv6 Medium (50 langs / high accuracy)." : "PP-OCRv4 轻量高速，或 PP-OCRv6 Medium 高精度（50 语种）。";
+                    BackendOption {
+                        label: "PP-OCRv4 Mobile";
+                        tag: root.is-en ? "Fast" : "高速";
+                        hint: root.is-en ? "49L Det + 50L Rec · 6,625 classes" : "轻量检测+识别 · 6,625 字符集";
+                        selected: root.ocr-engine == 0;
+                        locked: root.ocr-busy;
+                        clicked => { root.ocr-engine = 0; }
+                    }
+                    BackendOption {
+                        label: "PP-OCRv6 Medium";
+                        tag: root.is-en ? "High Acc" : "高精度";
+                        hint: root.is-en ? "HGNetV2 + GELU LUT + SVTR · 18,710 classes" : "HGNetV2 + GELU 查表 + SVTR · 18,710 字符集";
+                        selected: root.ocr-engine == 1;
+                        locked: root.ocr-busy;
+                        clicked => { root.ocr-engine = 1; }
                     }
                 }
 
