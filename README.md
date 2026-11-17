@@ -18,6 +18,10 @@ It turns out it can — here are two working end-to-end tools built directly on 
 
 ## Implemented Modules
 
+| Video Blur & Virtual Camera | Live Speech Recognition (ASR) |
+|---|---|
+| ![Video Blur](docs/images/video-blur.png) | ![Speech ASR](docs/images/speech-asr.png) |
+
 ### 1. Background Blur & Virtual Camera (`studio/` + `npu/rvm/`)
 - Real-time portrait segmentation (**RVM MobileNetV3 int8** or **MediaPipe**) + background blur / custom image / green screen.
 - Outputs to `v4l2loopback` (`NPU Studio Camera`) for Zoom, OBS, and browsers (tested with Flatpak Zoom; supports one-click **Load / Unload / Autoload** in the UI).

@@ -18,6 +18,10 @@
 
 ## 已实现的功能模块
 
+| 视频背景虚化与虚拟摄像头 | 实时语音转写 (ASR) |
+|---|---|
+| ![视频背景虚化](docs/images/video-blur.png) | ![实时语音转写](docs/images/speech-asr.png) |
+
 ### 1. 视频背景虚化与虚拟摄像头（`studio/` + `npu/rvm/`）
 - 实时人像抠图（**RVM MobileNetV3 int8** 或 **MediaPipe**）+ 背景虚化 / 自定义背景图 / 绿幕。
 - 通过 `v4l2loopback` 输出 `NPU Studio Camera` 虚拟摄像头，可用于 Zoom（实测 Flatpak 版 Zoom 可用，建议先在 NPU Studio 加载并开启推流再打开 Zoom）、OBS 和浏览器；界面支持一键 **加载 / 卸载 / 开机自动加载**。
