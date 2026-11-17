@@ -51,6 +51,7 @@ def _cases(quick: bool):
     yield "chain_c16 attn15 短窗注意力", lambda: chain_c16.selftest("attn15", 10)  # 每行 15 token (3 s 档)
     yield "chain_c16 attn13 短窗注意力", lambda: chain_c16.selftest("attn13", 10)  # 行宽不是 4 / 8 的倍数
     yield "chain_c16 lm15 短窗 LayerNorm", lambda: chain_c16.selftest("lm15", 10)
+    yield "chain_c16 dw_asym 非对称步长", lambda: chain_c16.selftest("dw_asym", 10)
     if not quick:
         yield "chain_c16 low 25 层", lambda: chain_c16.selftest("low", 10)
         yield "chain_c16 deep 13 层", lambda: chain_c16.selftest("deep", 10)   # OC / IC 分块

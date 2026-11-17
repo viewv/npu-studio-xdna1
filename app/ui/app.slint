@@ -1,5 +1,5 @@
 // NPU Studio — 主界面
-import { Button, Switch, ComboBox, Slider, ScrollView, Palette } from "std-widgets.slint";
+import { Button, Switch, ComboBox, Slider, ScrollView, TextEdit, Palette } from "std-widgets.slint";
 
 export struct FeatureData {
     id: string,
@@ -361,6 +361,17 @@ export component AppWindow inherits Window {
     in-out property <string> asr-text;
     in-out property <string> asr-partial;
 
+    // ---- 屏幕框选 OCR ----
+    in-out property <int> ocr-backend: 0; // 0 NPU+CPU 异构, 1 CPU float32
+    in-out property <bool> ocr-busy: false;
+    in-out property <string> ocr-status: "Idle";
+    in-out property <string> ocr-det-ms: "–";
+    in-out property <string> ocr-rec-ms: "–";
+    in-out property <string> ocr-boxes: "–";
+    in-out property <string> ocr-text;
+    in-out property <image> ocr-preview;
+    in-out property <bool> ocr-has-preview: false;
+
     callback start-stop();
     callback settings-changed();
     callback pick-image();
@@ -370,6 +381,10 @@ export component AppWindow inherits Window {
     callback feature-toggled(int, bool);
     callback asr-start-stop();
     callback asr-clear();
+    callback ocr-init();
+    callback ocr-snip();
+    callback ocr-clear();
+    callback ocr-copy();
     callback toggle-lang();
 
     property <bool> locked: root.run-state == 1 || root.run-state == 3;
@@ -414,6 +429,11 @@ export component AppWindow inherits Window {
                     selected: root.active-tab == 2;
                     clicked => { root.active-tab = 2; }
                 }
+                Segment {
+                    text: root.ocr-busy ? (root.is-en ? "Screen OCR ●" : "屏幕 OCR ●") : (root.is-en ? "Screen OCR" : "屏幕 OCR");
+                    selected: root.active-tab == 3;
+                    clicked => { root.active-tab = 3; root.ocr-init(); }
+                }
             }
             VerticalLayout {
                 alignment: center;
@@ -451,6 +471,16 @@ export component AppWindow inherits Window {
                     status-tint: root.asr-active ? Theme.ok : Theme.muted;
                     open-label: root.is-en ? "Open →" : "进入 →";
                     clicked => { root.active-tab = 2; }
+                }
+                ToolCard {
+                    horizontal-stretch: 1;
+                    title: root.is-en ? "Screen Snip OCR" : "屏幕框选 OCR";
+                    subtitle: root.is-en ? "Drag a screen region to recognize Chinese & English text with PP-OCRv4 on NPU+CPU." : "框选屏幕区域识别中英文文本，NPU 跑主干卷积 + CPU 跑检测/解码头。";
+                    tech-tag: "NPU + CPU";
+                    status-tag: root.ocr-status;
+                    status-tint: root.ocr-busy ? Theme.warn : Theme.muted;
+                    open-label: root.is-en ? "Open →" : "进入 →";
+                    clicked => { root.active-tab = 3; root.ocr-init(); }
                 }
             }
 
@@ -917,6 +947,123 @@ export component AppWindow inherits Window {
                             wrap: word-wrap;
                         }
                     }
+                }
+            }
+        }
+
+        if root.active-tab == 3: HorizontalLayout {
+            vertical-stretch: 1;
+            spacing: 16px;
+
+            VerticalLayout {
+                width: 360px;
+                spacing: 12px;
+
+                Button {
+                    height: 44px;
+                    text: root.ocr-busy ? (root.is-en ? "Working…" : "处理中…") : (root.is-en ? "Snip & Recognize" : "框选屏幕识别");
+                    primary: !root.ocr-busy;
+                    enabled: !root.ocr-busy;
+                    clicked => { root.ocr-snip(); }
+                }
+
+                Card {
+                    title: root.is-en ? "OCR Backend" : "OCR 推理后端";
+                    subtitle: root.is-en ? "Heterogeneous NPU+CPU (PP-OCRv4 INT8 backbones on NPU) or full CPU float32." : "NPU 跑密集卷积主干 + CPU 跑 FPN/SVTR 头，或切换全 CPU 参考。";
+                    BackendOption {
+                        label: root.is-en ? "NPU + CPU Heterogeneous" : "NPU + CPU 异构加速";
+                        tag: root.is-en ? "Recommended" : "推荐";
+                        hint: root.is-en ? "PP-OCRv4 INT8 backbones on NPU · Zero conv load on CPU" : "PP-OCRv4 主干跑 NPU INT8 · 大幅卸载主干卷积";
+                        selected: root.ocr-backend == 0;
+                        locked: root.ocr-busy;
+                        clicked => { root.ocr-backend = 0; }
+                    }
+                    BackendOption {
+                        label: root.is-en ? "CPU · Reference (float32)" : "CPU · 浮点参考";
+                        hint: root.is-en ? "ONNX Runtime float32 · 4 threads" : "ONNX Runtime 浮点参考 · 4 线程";
+                        selected: root.ocr-backend == 1;
+                        locked: root.ocr-busy;
+                        clicked => { root.ocr-backend = 1; }
+                    }
+                }
+
+                GridLayout {
+                    spacing: 8px;
+                    Row {
+                        StatTile {
+                            label: root.is-en ? "Det Time" : "检测耗时";
+                            value: root.ocr-det-ms;
+                            unit: "ms";
+                            accent: Theme.npu;
+                        }
+                        StatTile {
+                            label: root.is-en ? "Rec Time" : "识别耗时";
+                            value: root.ocr-rec-ms;
+                            unit: "ms";
+                            accent: Theme.ok;
+                        }
+                        StatTile {
+                            label: root.is-en ? "Lines" : "检出行数";
+                            value: root.ocr-boxes;
+                            unit: "";
+                            accent: Palette.foreground;
+                        }
+                    }
+                }
+
+                if root.ocr-has-preview: Card {
+                    title: root.is-en ? "Captured Region" : "框选截图预览";
+                    Rectangle {
+                        height: 150px;
+                        border-radius: 8px;
+                        clip: true;
+                        background: #00000018;
+                        Image {
+                            width: 100%;
+                            height: 100%;
+                            source: root.ocr-preview;
+                            image-fit: contain;
+                        }
+                    }
+                }
+
+                Rectangle { vertical-stretch: 1; }
+            }
+
+            Card {
+                horizontal-stretch: 1;
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text { text: root.is-en ? "Recognized Text" : "识别文本输出"; font-size: 15px; font-weight: 700; vertical-alignment: center; }
+                    VerticalLayout {
+                        alignment: center;
+                        Tag {
+                            text: root.ocr-status;
+                            tint: root.ocr-busy ? Theme.warn : Theme.ok;
+                        }
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                    VerticalLayout {
+                        alignment: center;
+                        Button {
+                            text: root.is-en ? "Copy All" : "复制全部";
+                            enabled: root.ocr-text != "";
+                            clicked => { root.ocr-copy(); }
+                        }
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        Button {
+                            text: root.is-en ? "Clear" : "清空";
+                            clicked => { root.ocr-clear(); }
+                        }
+                    }
+                }
+                TextEdit {
+                    vertical-stretch: 1;
+                    text <=> root.ocr-text;
+                    font-size: 14px;
+                    wrap: word-wrap;
                 }
             }
         }

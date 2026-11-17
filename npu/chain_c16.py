@@ -126,15 +126,20 @@ class Layer:
     oh: int = 0     # op = 2 (双线性 ×2 上采样) 的输出高度 (0 = 2h; 2h − 1 = 裁掉最后一行, 如 12 → 23)
     nx: int = 0     # ≠ 0: 本层输出放在张量 (k+1+nx) 的存储里、紧跟在它后面 (可以指向后面的层; 拼接的通用写法)
     al: int = 0     # ≠ 0: 本层输出就地写进张量 (k+1+al) 的位置 (GRU 状态更新); 之后读那个张量读到的是新值
+    sy: int = 0     # ≠ 0: 垂直步长 (非对称 stride=(sy, s), 如 OCR 的 (2,1)/(1,2)); 0 = 与 s 相同
 
+    @property
+    def stride_y(self): return self.sy or self.s
+    @property
+    def stride_x(self): return self.s
     @property
     def pad(self): return 0 if self.op else self.d * (self.k - 1) // 2
     @property
     def ho(self):
         return 1 if self.op == 1 else (self.oh or 2 * self.h) if self.op == 2 else self.h if self.op == 3 \
-            else cdiv(self.h, self.s)
+            else cdiv(self.h, self.stride_y)
     @property
-    def wo(self): return 1 if self.op == 1 else 2 * self.w if self.op == 2 else self.w if self.op == 3 else cdiv(self.w, self.s)
+    def wo(self): return 1 if self.op == 1 else 2 * self.w if self.op == 2 else self.w if self.op == 3 else cdiv(self.w, self.stride_x)
     @property
     def icp(self): return self.ic // 16
     @property
@@ -179,6 +184,8 @@ R = {
     "attn10": Layer(1536, 512, 1, 1, 4, 10, op=6),
     "attn13": Layer(1536, 512, 1, 1, 4, 13, op=6),
     "lm15": Layer(512, 512, 1, 1, 4, 15, op=5),
+    "dw_asym1": Layer(32, 32, 3, 1, 24, 160, dw=1, sy=2),
+    "dw_asym2": Layer(32, 32, 5, 2, 12, 160, dw=1, sy=1),
 }
 # RVM 编码器 12×20 段的真实形状 (跳过 depthwise 和 SE; 200/184 补到 208/192), 输入 240 通道
 _T = [(240, 80, 1, "Conv_67"), (80, 208, 1, "Conv_68"), (208, 80, 1, "Conv_74"), (80, 480, 1, "Conv_92"),
@@ -259,6 +266,7 @@ CHAINS = {
     "attn": ["attn1"],                                   # 多头自注意力 (op 6)
     "attn15": ["attn15"], "attn10": ["attn10"], "attn13": ["attn13"],   # 短窗口注意力
     "lm15": ["lm15"],
+    "dw_asym": ["dw_asym1", "dw_asym2"],
     "enc": ENC,
     "head": ENC[:3],
     "low": ENC + ["e11", "e12", "e13"] * 4,           # 12×20 的三层重复
@@ -337,7 +345,7 @@ def chain_layers(spec: str) -> list[Layer]:
 
 def spec_str(layers) -> str:
     return ";".join(f"{l.ic},{l.oc},{l.k},{l.s},{l.h},{l.w},{l.dw},{l.d},{l.op},{l.act},{l.src},{l.sc},{l.cat},{l.oh},"
-                    f"{l.nx},{l.al}" for l in layers)
+                    f"{l.nx},{l.al},{l.sy}" for l in layers)
 
 
 def from_spec_str(s: str) -> list[Layer]:
@@ -763,7 +771,7 @@ class Plan:
         elif tl.mode == "attn":
             per = 2
         else:
-            per = 1 if tl.mode == "ict" else (0 if l.s == 1 else cdiv(max(tl.band_rows), 64))
+            per = 1 if tl.mode == "ict" else (0 if l.stride_y == 1 else cdiv(max(tl.band_rows), 64))
         if per == 0:
             return [(0, tl.n_ob)]
         g = min(max(1, FILLS_PER_TG // per), wmax)
@@ -823,11 +831,11 @@ class Plan:
             o0 = base + (BR - 1 + y0) * ti.frow + t * (tl.wt // 2) * 16
             return [(o0 + tl.steps[o][0] * ti.cplane, [1, rr + 2, tl.icp_pad, tl.plane], [0, ti.frow, ti.cplane, 1])
                     for o in range(ob0, ob1)]
-        off = base + (BR - 1 + l.s * tl.band_y0[b]) * ti.frow + t * l.s * tl.wt * 16   # 窗口第一行 = 真实行 s·y0-1
+        off = base + (BR - 1 + l.stride_y * tl.band_y0[b]) * ti.frow + t * l.stride_x * tl.wt * 16   # 窗口第一行 = 真实行 sy·y0-1
         if tl.mode == "dw":      # 每步 (m 个通道组) 每 64 个输出行一个 BD: [输出行][ky][m 组][PLANE]
-            o0 = base + (BR + l.s * tl.band_y0[b] - l.pad) * ti.frow + t * l.s * tl.wt * 16
-            return [(o0 + tl.steps[o][0] * ti.cplane + l.s * r0 * ti.frow,
-                     [min(64, rows - r0), l.k, tl.icp_pad, tl.plane], [l.s * ti.frow, l.d * ti.frow, ti.cplane, 1])
+            o0 = base + (BR + l.stride_y * tl.band_y0[b] - l.pad) * ti.frow + t * l.stride_x * tl.wt * 16
+            return [(o0 + tl.steps[o][0] * ti.cplane + l.stride_y * r0 * ti.frow,
+                     [min(64, rows - r0), l.k, tl.icp_pad, tl.plane], [l.stride_y * ti.frow, l.d * ti.frow, ti.cplane, 1])
                     for o in range(ob0, ob1) for r0 in range(0, rows, 64)]
         if tl.mode == "lm":      # 每步一个 BD: [行][m 组][PLANE]; 第二遍的步重读同一段
             o0 = base + (BR + tl.band_y0[b]) * ti.frow
@@ -1311,7 +1319,7 @@ def conv_acc(l: Layer, x_i8: np.ndarray, Wq: np.ndarray) -> np.ndarray:
     for ky in range(l.k):
         for kx in range(l.k):
             y0, x0 = ky * l.d, kx * l.d
-            patch = xp[:, y0:y0 + l.s * (l.ho - 1) + 1:l.s, x0:x0 + l.s * (l.wo - 1) + 1:l.s]
+            patch = xp[:, y0:y0 + l.stride_y * (l.ho - 1) + 1:l.stride_y, x0:x0 + l.stride_x * (l.wo - 1) + 1:l.stride_x]
             if l.dw:
                 acc += Wi[:, 0, ky, kx][:, None] * patch.reshape(l.ic, -1)
             else:

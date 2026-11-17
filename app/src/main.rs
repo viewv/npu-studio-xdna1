@@ -5,6 +5,7 @@
 
 mod asr;
 mod engine;
+mod ocr;
 mod preview;
 mod settings;
 mod system;
@@ -77,6 +78,7 @@ struct App {
     cameras: Vec<(String, String)>,
     engine: Option<Engine>,
     asr_engine: Option<asr::AsrEngine>,
+    ocr_engine: ocr::OcrEngine,
     next_id: u64,
     restart_pending: bool,
     restart_timer: slint::Timer,
@@ -392,6 +394,7 @@ fn main() -> Result<(), slint::PlatformError> {
         cameras,
         engine: None,
         asr_engine: None,
+        ocr_engine: ocr::OcrEngine::new(ui.as_weak()),
         next_id: 0,
         restart_pending: false,
         restart_timer: slint::Timer::default(),
@@ -456,6 +459,36 @@ fn main() -> Result<(), slint::PlatformError> {
             ui.set_asr_partial("".into());
             ui.set_asr_bucket("–".into());
             ui.set_asr_ms("–".into());
+        });
+    });
+
+    ui.on_ocr_init(|| {
+        with_app(|app, _| {
+            app.ocr_engine.ensure_started();
+        });
+    });
+
+    ui.on_ocr_snip(|| {
+        with_app(|app, ui| {
+            let backend = ocr::OcrBackend::from_index(ui.get_ocr_backend());
+            app.ocr_engine.snip_and_recognize(backend);
+        });
+    });
+
+    ui.on_ocr_clear(|| {
+        with_app(|_, ui| {
+            ui.set_ocr_text("".into());
+            ui.set_ocr_det_ms("–".into());
+            ui.set_ocr_rec_ms("–".into());
+            ui.set_ocr_boxes("–".into());
+            ui.set_ocr_has_preview(false);
+        });
+    });
+
+    ui.on_ocr_copy(|| {
+        with_app(|_, ui| {
+            let txt = ui.get_ocr_text();
+            ocr::copy_to_clipboard(&txt);
         });
     });
 
